@@ -2652,6 +2652,9 @@ step_core_power(void)
 #define UCHE_WRITE_THRU_BASE    GPU_WORD(0x0e07)
 #define UCHE_TRAP_BASE          GPU_WORD(0x0e09)
 #define UCHE_CACHE_WAYS         GPU_WORD(0x0e17)
+#define UCHE_GMEM_RANGE_MIN     GPU_WORD(0x0e0b)
+#define UCHE_GMEM_RANGE_MAX     GPU_WORD(0x0e0d)
+#define RBBM_VBIF_CLIENT_QOS_CNTL GPU_WORD(0x0010)
 #define UCHE_FILTER_CNTL        GPU_WORD(0x0e18)
 #define UCHE_CLIENT_PF          GPU_WORD(0x0e19)
 #define RB_DBG_ECO_CNTL         GPU_WORD(0x8e04)
@@ -3001,6 +3004,15 @@ step_core_start(void)
 	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
 	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
 	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
+	/*
+	 * Where GMEM is in the GPU's own address space: Linux's hw_init sets it for every a6xx but the
+	 * 650 family, ["0x100000, 0x100000 + gmem - 1"]. Without it a binning pass (which every 3D draw
+	 * does before it renders) has no memory to write its tiles into and the pipeline never goes
+	 * idle -- a draw that hangs with no fault and no SMMU report, which is what malmo does.
+	 */
+	put64(&gpu, "uche_gmem_range_min", UCHE_GMEM_RANGE_MIN, 0x00100000);
+	put64(&gpu, "uche_gmem_range_max", UCHE_GMEM_RANGE_MAX, 0x00100000 + 512 * 1024 - 1);
+	put(&gpu, "rbbm_vbif_client_qos_cntl", RBBM_VBIF_CLIENT_QOS_CNTL, 3);
 	put(&gpu, "uche_filter_cntl", UCHE_FILTER_CNTL, 0x804);
 	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
 	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, is_malmo ? 0x010000c0 : 0x02000140);
@@ -4040,6 +4052,17 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 }
 
 /*
+ * The command buffers of the last submission, as the kernel can see them: where each one is in memory,
+ * its address, and its length in words. Kept so that a submission that does not come back can be read
+ * at the word it stopped on (see hakios_gpu_report): a hang is a fact about one instruction.
+ */
+#define HAKIOS_GPU_IBS 128               /* (GPU_SUBMIT_CMDS of the service) */
+uint8_t *hakios_gpu_ib_kernel[HAKIOS_GPU_IBS];
+uint64_t hakios_gpu_ib_address[HAKIOS_GPU_IBS];
+uint32_t hakios_gpu_ib_words[HAKIOS_GPU_IBS];
+uint32_t hakios_gpu_ib_count;
+
+/*
  * Command buffers for the 3D core to run, in order: each an address and a count of words. As
  * Linux's a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is
  * full and the core is not reading it.
@@ -4047,6 +4070,12 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
+	hakios_gpu_ib_count = count < HAKIOS_GPU_IBS ? count : HAKIOS_GPU_IBS;
+	for (uint32_t i = 0; i < hakios_gpu_ib_count; i++) {
+		hakios_gpu_ib_address[i] = addresses[i];
+		hakios_gpu_ib_words[i] = words[i];
+	}
+
 	uint32_t wanted = 26 + 4 * count, room = 0;
 
 	for (int i = 0; i < 20000; i++) {
@@ -4102,6 +4131,27 @@ hakios_gpu_report(const char *why)
 	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
 	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
 	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
+	/* How far into the first command buffer it got, and the words around there: the one it is on is the
+	 * one that does not finish. Written as the register reads them (a packet header says its length). */
+	{
+		uint32_t left = rd(gpu.base + CP_IB1_REM_SIZE);
+		uint32_t total = hakios_gpu_ib_words[0];
+
+		printf("adreno: gpu: %u of %u words into the first buffer, %u to go, it is %s\n",
+		    total - left, total, left, hakios_gpu_ib_kernel[0] != NULL ? "readable" : "NOT handed over");
+		if (hakios_gpu_ib_kernel[0] != NULL && total <= hakios_gpu_ib_words[0]) {
+			uint32_t at = total - left;
+			const uint32_t *w = (const uint32_t *)hakios_gpu_ib_kernel[0];
+
+			for (int i = -8; i < 24; i++) {
+				int32_t k = (int32_t)at + i;
+
+				if (k >= 0 && (uint32_t)k < total) {
+					printf("adreno: gpu: %c%u %08x\n", i == 0 ? '>' : ' ', k, w[k]);
+				}
+			}
+		}
+	}
 	step = 0;
 	if (space_faulted(&core_space)) {
 		wr(smmu.base + context + SMMU_CB_FSR, SMMU_FSR_ALL);    /* so that the next one shows */
@@ -4305,12 +4355,15 @@ start_by_itself(void)
 {
 	static const char *const files_redwood[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
 	static const char *const files_malmo[] = { "a630_sqe.fw" };
-	const char *const *files = is_malmo ? files_malmo : files_redwood;
-	unsigned file_count = is_malmo ? 1 : 4;
+	const char *const *files;
+	unsigned file_count;
 	const char *missing = NULL;
 	uint64_t size;
 	vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
+	adreno_init_blocks();                   /* decides is_malmo, and so which phone's files are needed */
+	files = is_malmo ? files_malmo : files_redwood;
+	file_count = is_malmo ? 1 : 4;
 	if (soc_base != HAKIOS_SOC_BASE_REDWOOD && soc_base != HAKIOS_SOC_BASE_MALMO) {
 		printf("adreno: THE GPU IS NOT STARTED: gpu=1 is for the phone, and this is not it\n");
 		return false;

@@ -40,6 +40,9 @@
 #include <mach/vm_param.h>
 #include <sys/systm.h>
 
+/* bsd/dev/hakios.adreno.c: the command buffers of the last submission, for a hang's own account */
+extern uint8_t *hakios_gpu_ib_kernel[128];   /* (GPU_SUBMIT_CMDS) */
+
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
@@ -938,6 +941,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 			IOLockUnlock(gGPULock);
 			goto out;
 		}
+		hakios_gpu_ib_kernel[count] = b->kernel + cmds[i].submit_offset;
 		addresses[count] = b->address + cmds[i].submit_offset;
 		words[count++] = cmds[i].size / 4;
 	}
