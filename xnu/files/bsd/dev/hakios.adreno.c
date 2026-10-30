@@ -3162,12 +3162,29 @@ step_core_commands(void)
 #define RB_2D_DST               0x8c18
 #define RB_2D_DST_PITCH         0x8c1a
 #define VFD_MODE_CNTL           0xa007
+#define GRAS_BIN_CONTROL        0x80a1
+#define RB_BIN_CONTROL          0x8800
+#define RB_BIN_CONTROL2         0x88d3
+#define RB_MRT0_CONTROL         0x8820
+#define RB_MRT0_BUF_INFO        0x8822
+#define RB_MRT0_PITCH           0x8823
+#define RB_MRT0_ARRAY_PITCH     0x8824
+#define RB_MRT0_BASE            0x8825
+#define RB_MRT0_BASE_GMEM       0x8827
+#define RB_MRT0_FLAG_BUFFER     0x8903
+#define SP_FS_MRT0              0xa996
+#define RB_SRGB_CNTL            0x880f
+#define RB_BLEND_CNTL           0x8865
 #define RB_2D_SRC_SOLID_C0      0x8c2c
 #define SP_2D_DST_FORMAT        0xacc0
+#define SP_PS_2D_SRC_INFO       0xb4c0
+#define COPY_SRC_ADDRESS        0x14000000u
 #define FORMAT_8888             0x30
 #define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24) /* one colour; all channels; 8-bit */
 #define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)        /* rows of pixels, blue first in memory */
 #define EVENT_FLUSH_COLOR       0x1d
+#define EVENT_CCU_CLEAN_DEPTH   0x1c            /* PC_CCU_FLUSH_DEPTH_TS */
+#define EVENT_WRITE_TIMESTAMP   (1u << 30)
 #define TARGET_WIDTH            1080
 #define TARGET_HEIGHT           2400
 #define TARGET_ROW              4352            /* 1088 pixels: the next multiple of 64 bytes */
@@ -3177,6 +3194,8 @@ extern void MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, u
 static uint32_t blit_wfi, blit_inv;             /* off: tried (adreno_wfi=1 adreno_inv=1) and the 3D core stalls at the wait */
 static uint32_t bad_dst;                        /* adreno_bad=1: point the fill at memory the core cannot reach */
 static uint32_t blit5;                          /* adreno_blit5=1: give the blit packet its own rectangles */
+static uint32_t copy_mode;                      /* adreno_copy=1: draw the first band by copying, not filling */
+static struct gpu_block core_src;
 
 static void
 ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue, uint32_t idx)
@@ -3195,8 +3214,27 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	uint32_t solid_color[4] = { red, green, blue, 255 };
 	ring_registers(RB_2D_SRC_SOLID_C0, 4, solid_color);
 
-	ring_register(RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
-	ring_register(GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
+	/* A copy instead of a fill for the first band: same engine, same destination, but the pixels come
+	 * from a surface of ours rather than from the solid colour register. */
+	bool by_copy = copy_mode && idx == 0;
+	if (by_copy) {
+		/* Only as many rows as the source has (16), and the source rectangle within them. */
+		uint32_t copy_dst[2] = { top << 16, (TARGET_WIDTH - 1) | ((top + 15) << 16) };
+		ring_registers(GRAS_2D_DST_TL, 2, copy_dst);
+		uint32_t copy_src[4] = { 0, (TARGET_WIDTH - 1) << 8, 0, 15 << 8 };
+		ring_registers(GRAS_2D_SRC_TL_X, 4, copy_src);
+		uint32_t src_info[5] = {
+			FORMAT_8888 | (1u << 10) | (1u << 20) | (1u << 22),
+			TARGET_WIDTH | (16u << 15),
+			COPY_SRC_ADDRESS,
+			0,
+			(TARGET_ROW >> 6) << 9
+		};
+		src_info[0] = src_info[0] & 0xffffu;
+		ring_registers(SP_PS_2D_SRC_INFO, 5, src_info);
+	}
+	ring_register(RB_2D_BLIT_CNTL, BLIT_SOLID_8888 & ~(by_copy ? 1u << 7 : 0u));
+	ring_register(GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888 & ~(by_copy ? 1u << 7 : 0u));
 	ring_register(SP_2D_DST_FORMAT, 1 | (FORMAT_8888 << 3) | (0xfu << 12));   /* bit 0: as the frame that works on the other phone */
 	ring_register(RB_2D_PIXEL_CNTL, 0);
 
@@ -3209,6 +3247,25 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	};
 	ring_registers(RB_2D_DST_INFO, 4, dst_info);
 
+	/*
+	 * In a render pass the pixels are written to "the render target", which is RB_MRT[0], not
+	 * RB_2D_DST: Mesa's blitter batch carries the destination as its framebuffer and writes both
+	 * (fd6_gmem.cc: emit_mrt next to fd6_blitter.cc: emit_blit_dst). With RB_MRT[0] still at its
+	 * power-on value of zero there is no target to write to, and the blit reads its source, runs,
+	 * and leaves memory alone.
+	 */
+	ring_register(RB_MRT0_BUF_INFO, FORMAT_8888);
+	ring_register(RB_MRT0_PITCH, TARGET_ROW >> 6);
+	ring_register(RB_MRT0_ARRAY_PITCH, TARGET_ROW >> 6);
+	ring_register(RB_MRT0_BASE, (uint32_t)dst);
+	ring_register(RB_MRT0_BASE + 1, 0);
+	ring_register(RB_MRT0_BASE_GMEM, 0);
+	ring_registers(RB_MRT0_FLAG_BUFFER, 3, (uint32_t[3]){ 0, 0, 0 });
+	ring_register(RB_MRT0_CONTROL, 0);
+	ring_register(SP_FS_MRT0, FORMAT_8888);
+	ring_register(RB_SRGB_CNTL, 0);
+	ring_register(RB_BLEND_CNTL, 0);
+
 	ring_mark(12 + idx * 4 + 1, 0x2002 | (idx << 8));
 	ring_mark(12 + idx * 4 + 2, 0x2003 | (idx << 8));
 	/* Mesa's emit_blit_fini: a label, a wait for idle, then the blit and another wait. The wait
@@ -3220,6 +3277,10 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 		ring(EVENT_LABEL);
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
+	/* Mesa's emit_blit_fini: the blit's own ECO value in the ring right before it, and zero right after.
+	 * It is a context register, so the copy written by the processor at step 20 may not be the one the
+	 * core is using by now. */
+	ring_register(RB_DBG_ECO_CNTL, 0x04100000);
 	if (blit5) {
 		ring_command(CP_BLIT, 5);
 		ring(0);                        /* BLIT_OP_FILL: the solid colour, no source */
@@ -3231,9 +3292,26 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 		ring_command(CP_BLIT, 1);
 		ring(3);                        /* "scale": the 2D engine's one operation */
 	}
+	/*
+	 * CP_BLIT leaves its result in the colour cache, not in memory (Mesa, fd6_resolve_tile: "CP_BLIT
+	 * writes to the CCU, unlike CP_EVENT_WRITE::BLIT which writes to sysmem, so we need to flush
+	 * manually here"). This was the missing half of the frame: the blit was running all along and the
+	 * picture was sitting in the cache, so memory still read back as the zeros it held before.
+	 */
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_FLUSH_COLOR | EVENT_WRITE_TIMESTAMP);
+	ring(CORE_SCRATCH_ADDRESS + 240);
+	ring(0);
+	ring(1 + idx);
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_CCU_CLEAN_DEPTH | EVENT_WRITE_TIMESTAMP);
+	ring(CORE_SCRATCH_ADDRESS + 244);
+	ring(0);
+	ring(4 + idx);
 	if (blit_wfi) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
+	ring_register(RB_DBG_ECO_CNTL, 0);
 	ring_mark(12 + idx * 4 + 3, 0x2004 | (idx << 8));
 }
 
@@ -3252,6 +3330,24 @@ step_frame(void)
 	if (!block_new(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, PTE_CORE)) {
 		return false;
 	}
+	PE_parse_boot_argn("adreno_copy", &copy_mode, sizeof(copy_mode));
+	if (copy_mode) {
+		/* Through the same commit as the picture: a block added after the SMMU tables are written
+		 * out has no translation, and the 2D engine's read of it is refused. */
+		if (!block_new(&core_space, &core_src, COPY_SRC_ADDRESS, TARGET_ROW * 16, PTE_CORE)) {
+			return false;
+		}
+		for (uint32_t i = 0; i < 16; i++) {
+			uint8_t *row = (uint8_t *)core_src.memory + i * TARGET_ROW;
+			for (uint32_t x = 0; x < TARGET_WIDTH; x++) {
+				row[x * 4 + 0] = 0x00;
+				row[x * 4 + 1] = 0x80;
+				row[x * 4 + 2] = 0xff;
+				row[x * 4 + 3] = 0xff;
+			}
+		}
+		to_memory(core_src.memory, core_src.size);
+	}
 	/* tables that the SMMU has in use have grown: it has not seen these addresses, so nothing stale to forget */
 	for (uint32_t i = 0; i < core_space.table_count; i++) {
 		to_memory((vm_offset_t)core_space.tables[i].table, 4096);
@@ -3265,21 +3361,54 @@ step_frame(void)
 	}
 	bzero((void *)core_scratch.memory, 256);
 	to_memory(core_scratch.memory, 256);
+	/*
+	 * Before the 2D engine is asked to write there: can the GPU reach the picture's page at all? The word
+	 * goes in by the command processor's own path, which is known to work (step 21), at the same address
+	 * the blit uses. If this does not land, the page is not mapped for the GPU and the blit is writing
+	 * into nothing, which would look exactly like an engine that does not run.
+	 */
+	ring_command(CP_MEM_WRITE, 3);
+	ring(CORE_TARGET_ADDRESS);
+	ring(0);
+	ring(0x600dc0de);
+	if (!ring_run("write a word into the picture's page")) {
+		return false;
+	}
+	to_memory(core_target.memory, 64);
+	printf("adreno: %u: the picture's page reads %#x: %s\n", step, *(volatile uint32_t *)core_target.memory,
+	    *(volatile uint32_t *)core_target.memory == 0x600dc0de ? "the GPU reaches it" : "THE GPU CANNOT REACH IT");
+	if (*(volatile uint32_t *)core_target.memory != 0x600dc0de) {
+		return false;
+	}
+	*(volatile uint32_t *)core_target.memory = 0;
+	to_memory(core_target.memory, 64);
 	ring_mark(0, 0x11110000);
 	/* The render mode the PC reads: 0 = straight into memory, 1 = binning (into GMEM). A 2D blit in
 	 * binning mode draws no pixels anywhere, which is what a quiet GPU and an untouched picture
 	 * look like. adreno_mode=1 leaves it at the old "2D blits follow" marker to compare. */
-	uint32_t marker = 1, render_mode = 0;
+	uint32_t marker = 1, render_mode = ~0u;
 	PE_parse_boot_argn("adreno_marker", &marker, sizeof(marker));
 	PE_parse_boot_argn("adreno_mode", &render_mode, sizeof(render_mode));
 	ring_command(CP_SET_MARKER, 1);
 	ring(marker);                           /* 1: RM6_DIRECT_RENDER, 12: RM6_BLIT2DSCALE */
-	ring_register(VFD_MODE_CNTL, render_mode);
+	/*
+	 * Where the result of a draw goes. Both registers default to "into GMEM" (the tiled on-chip
+	 * buffer), and a 2D blit in that mode reads its source and writes the pixels into a GMEM that
+	 * nothing has set up: the engine runs, no fault, no interrupt, and memory stays as it was.
+	 * Mesa's sysmem path (fd6_gmem.cc, fd6_emit_tile_init) writes exactly these three:
+	 * RENDERING_PASS (0) with BUFFERS_IN_SYSMEM (3) at bit 22.
+	 */
+	uint32_t bin_cntl = (3u << 22);
+	ring_register(GRAS_BIN_CONTROL, bin_cntl);
+	ring_register(RB_BIN_CONTROL, bin_cntl);
+	ring_register(RB_BIN_CONTROL2, 0);
+	ring_register(VFD_MODE_CNTL, render_mode == ~0u ? 0 : render_mode);
 	ring_mark(1, 0x11110001);
 	PE_parse_boot_argn("adreno_wfi", &blit_wfi, sizeof(blit_wfi));
 	PE_parse_boot_argn("adreno_inv", &blit_inv, sizeof(blit_inv));
 	PE_parse_boot_argn("adreno_bad", &bad_dst, sizeof(bad_dst));
 	PE_parse_boot_argn("adreno_blit5", &blit5, sizeof(blit5));
+	PE_parse_boot_argn("adreno_copy", &copy_mode, sizeof(copy_mode));
 	if (blit_inv) {
 		/* Mesa's fd6_cache_inv() at the start of every command stream, then a wait: after
 		 * power-on the CCU and UCHE hold nothing this kernel has written, and the 2D path
@@ -3297,6 +3426,9 @@ step_frame(void)
 	uint32_t ccu_cntl = is_malmo ? 0x08000004 : 0x10000004;
 	PE_parse_boot_argn("adreno_ccu", &ccu_cntl, sizeof(ccu_cntl));
 	printf("adreno: %u: RB_CCU_CNTL = %#x\n", step, ccu_cntl);
+	/* Mesa puts a wait here for every a6xx before an older one: "early a6xx (a630?) needed this".
+	 * Writing this register while the core is still busy loses it silently. */
+	ring_command(CP_WAIT_FOR_IDLE, 0);
 	ring_register(RB_CCU_CNTL, ccu_cntl); /* Mesa's for this GPU when it draws straight into memory */
 	ring_mark(2, 0x11110002);
 	ring_fill(0, 800, 255, 128, 0, 0);         /* orange */
@@ -3357,6 +3489,21 @@ step_frame(void)
 	    step, sc[42], sc[43], sc[44], sc[45], sc[46], sc[47]);
 	to_memory(core_target.memory, core_target.size);
 	pixel = (const volatile uint8_t *)core_target.memory;
+	{
+		/* Did the pixels land anywhere at all, just not where we look? Any offset of our blue. */
+		const uint8_t *m = (const uint8_t *)core_target.memory;
+		uint32_t hits = 0, first = 0;
+		for (uint32_t i = 0; i + 4 <= core_target.size; i += 4) {
+			if (m[i] == 0x00 && m[i + 1] == 0x80 && m[i + 2] == 0xff && m[i + 3] == 0xff) {
+				if (!hits) {
+					first = i;
+				}
+				hits++;
+			}
+		}
+		printf("adreno: %u: the colour we asked for is in the picture %u times (row of 1080 would be 1080), "
+		    "first at byte %#x\n", step, hits, first);
+	}
 	/* Whether the 2D engine ran at all: a blit aimed at memory the core cannot reach must leave a
 	 * mark (an SMMU stall, a fault, a command processor interrupt). Nothing at all means the draw
 	 * call never reached it. */
