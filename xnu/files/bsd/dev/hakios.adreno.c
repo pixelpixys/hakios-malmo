@@ -2815,9 +2815,16 @@ ring_run(const char *what)
 	/* Which packet the processor stopped on: decoded from the ring itself, so a hang names its cause. */
 	if (taken != ring_at) {
 		to_memory(core_ring.memory, 4 * RING_WORDS);
-		/* The ring holds this one frame from word 0 (each run starts it over), so decode it whole and
-		 * name the packet the read pointer is inside. */
-		pm4_nearby((const uint8_t *)core_ring.memory, taken, taken);
+		/* The words around where the read pointer stopped, as they are in the ring: the packet that
+		 * does not finish is one of them, and reading it is more reliable than decoding it. */
+		const uint32_t *rw = (const uint32_t *)core_ring.memory;
+		printf("adreno: %u: ring around %u:", step, taken);
+		for (int32_t k = (int32_t)taken - 14; k < (int32_t)taken + 6; k++) {
+			if (k >= 0 && (uint32_t)k < RING_WORDS) {
+				printf(" %c%u=%08x", k == (int32_t)taken ? '>' : ' ', (uint32_t)k, rw[k]);
+			}
+		}
+		printf("\n");
 	}
 	printf("adreno: %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
 	    "command processor: fault %#x, interrupts %#x (sqe: %#x %#x %#x %#x), protection %#x, px0 %#x\n",
