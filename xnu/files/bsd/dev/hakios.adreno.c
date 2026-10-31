@@ -3398,6 +3398,14 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	ring_register(RB_SRGB_CNTL, 0);
 	ring_register(RB_BLEND_CNTL, 0);
 
+	/* Mesa's emit_setup, which runs before every blit it does (fd6_blitter.cc): clean both caches out
+	 * to memory, then invalidate them. Only the colour half is sent here; the depth half and the
+	 * invalidations are the next thing to try if the colour alone does not reach memory. */
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_CLEAN_COLOR);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_CCU_CLEAN_DEPTH);
+	ring_command(CP_WAIT_FOR_IDLE, 0);
 	ring_mark(12 + idx * 4 + 1, 0x2002 | (idx << 8));
 	ring_mark(12 + idx * 4 + 2, 0x2003 | (idx << 8));
 	/* Mesa's emit_blit_fini: a label, a wait for idle, then the blit and another wait. The wait
@@ -3655,6 +3663,28 @@ step_frame(void)
 	printf("adreno: %u: colour %#x %#x %#x %#x, sp fmt %#x, ccu %#x\n",
 	    step, sc[42], sc[43], sc[44], sc[45], sc[46], sc[47]);
 	to_memory(core_target.memory, core_target.size);
+	{
+		/* Did anything at all land in the picture, anywhere? Zeros everywhere means the engine never
+		 * wrote; a scatter of other values means it wrote somewhere other than where we look. */
+		const uint8_t *m = (const uint8_t *)core_target.memory;
+		uint32_t non_zero = 0, first_non_zero = 0;
+		for (uint32_t i = 0; i < core_target.size; i++) {
+			if (m[i] != 0) {
+				if (!non_zero) {
+					first_non_zero = i;
+				}
+				non_zero++;
+			}
+		}
+		printf("adreno: %u: of %u bytes of picture, %u are not zero (the first at %#x)\n",
+		    step, (uint32_t)core_target.size, non_zero, first_non_zero);
+		if (non_zero) {
+			const uint32_t *w = (const uint32_t *)core_target.memory;
+			uint32_t at = first_non_zero & ~3u;
+			printf("adreno: %u: the first words there: %08x %08x %08x %08x\n",
+			    step, w[at / 4], w[at / 4 + 1], w[at / 4 + 2], w[at / 4 + 3]);
+		}
+	}
 	pixel = (const volatile uint8_t *)core_target.memory;
 	{
 		/* Did the pixels land anywhere at all, just not where we look? Any offset of our blue. */
