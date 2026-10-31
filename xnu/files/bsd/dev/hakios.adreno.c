@@ -3616,6 +3616,28 @@ step_frame(void)
 	    rd(gpu.base + GPU_WORD(0x0016)), rd(gpu.base + GPU_WORD(0x0018)),
 	    rd(gpu.base + GPU_WORD(0x0043)), rd(gpu.base + RBBM_STATUS3));
 	ring_mark(2, 0x11110002);
+	/*
+	 * The vendor driver's own power-up sequence for this chip, read out of msm_kgsl.ko's a6xx_start
+	 * (it is not stripped, so the writes are all there). The parts this port never did are the ones
+	 * added here: the UCHE/GBIF configuration, CP_CHICKEN_DBG, and the RB/VSC sizing pair.
+	 */
+	static const struct { uint32_t reg, value; } vendor[] = {
+		{ 0x0e3a, 0x000000f9 },         /* UCHE_GBIF_GX_CONFIG */
+		{ 0x0e19, 0x00000080 },         /* UCHE_CLIENT_PF */
+		{ 0x0534, 0x00000001 },         /* CP_APRIV_CNTL: the ring may touch privileged registers */
+		{ 0x0841, 0x01000000 },         /* CP_CHICKEN_DBG */
+		{ 0x0b34, 0x00000020 },         /* TPL1_CHICKEN_BITS */
+		{ 0x08c3, 0x00000080 },         /* RB_BUFFER_CNTL */
+		{ 0x090e, 0x0000003f },         /* GRAS_SC_CNTL */
+		{ 0x098d, 0x00000001 },         /* PC_DRAW_CNTL */
+		{ 0x8e50, 0x00000001 },         /* RB_CONTEXT_SWITCH_GMEM_SAVE_RESTORE */
+		{ 0x0e17, 0x00000004 },         /* UCHE_CACHE_WAYS */
+		{ 0x0e18, 0x00000804 },         /* UCHE_CLIENT_PF */
+	};
+	for (unsigned i = 0; i < sizeof(vendor) / sizeof(vendor[0]); i++) {
+		ring_register(vendor[i].reg, vendor[i].value);
+	}
+	ring_command(CP_WAIT_FOR_IDLE, 0);
 	/* Access protection: Linux writes CP_PROTECT_CNTL and a whole CP_PROTECT table; this port has
 	 * never touched either, so whatever the bootloader left is in force. A protected register is
 	 * dropped silently, with no fault and no status, which is exactly what the blit looks like. */
