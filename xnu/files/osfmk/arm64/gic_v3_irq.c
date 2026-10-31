@@ -72,7 +72,9 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+#define GIC_INTID_VTIMER_QC     19          /* EL1 virtual timer PPI on Qualcomm (PPI 3) */
+#define GIC_INTID_VTIMER_QEMU   27          /* EL1 virtual timer PPI on QEMU virt (PPI 11) */
+#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI default */
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_SPI_MOST            48          /* attached at a time */
@@ -296,6 +298,8 @@ gic_v3_spi_count(uint32_t intid)
 	return 0;
 }
 
+static uint32_t gic_timer_irq_count = 0;
+
 static void
 gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
 {
@@ -310,9 +314,12 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
 
-		if (intid == GIC_INTID_VTIMER) {
+		if (intid == GIC_INTID_VTIMER_QC || intid == GIC_INTID_VTIMER_QEMU) {
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
+			if (++gic_timer_irq_count <= 3 || (gic_timer_irq_count % 1000) == 0) {
+				kprintf("vtimer_irq #%u (intid %u)\n", gic_timer_irq_count, intid);
+			}
 			rtclock_intr(TRUE);
 		} else if (intid == GIC_SGI_SIGNAL) {
 			cpu_signal_handler();
@@ -323,6 +330,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			/* a driver's */
 		} else {
 			/* nobody owns this interrupt yet: keep it from storming */
+			kprintf("gic: unhandled intid %u\n", intid);
 			gic_mask(intid);
 			gic_unhandled_count++;
 			gic_last_unhandled = intid;
@@ -418,7 +426,7 @@ gic_v3_irq_cpu_init(void)
 {
 	int cpu = cpu_number();
 	vm_offset_t gicr;
-	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint32_t mine = (1u << GIC_INTID_VTIMER_QC) | (1u << GIC_INTID_VTIMER_QEMU);
 
 	if (gicd_base == 0) {
 		DTEntry entry;
@@ -459,15 +467,18 @@ gic_v3_irq_cpu_init(void)
 	}
 
 	/*
-	 * The interrupts between processors, where there is more than one. A core that an earlier
-	 * kernel switched off in the middle of one (a return to the boot loader, started again
-	 * since) may still have it marked active, and would then never see another.
+	 * Clear any pending or active state left by firmware/bootloader so that
+	 * interrupts are not blocked on this core.
+	 */
+	gic_write32(gicr + GICR_ICACTIVER0, 0xffffffffu);
+	gic_write32(gicr + GICR_ICPENDR0, 0xffffffffu);
+
+	/*
+	 * The interrupts between processors, where there is more than one.
 	 */
 	if (ml_get_cpu_count() > 1) {
 		uint32_t sgis = (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
 
-		gic_write32(gicr + GICR_ICACTIVER0, sgis);
-		gic_write32(gicr + GICR_ICPENDR0, sgis);        /* ... or one that it never took */
 		*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_SGI_SIGNAL)) = GIC_PRIORITY_DEFAULT;
 		*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_SGI_STOP)) = GIC_PRIORITY_DEFAULT;
 		mine |= sgis;
@@ -476,7 +487,8 @@ gic_v3_irq_cpu_init(void)
 	/* Virtual timer PPI (and those): Group 1 (IRQ), default priority, enabled */
 	gic_write32(gicr + GICR_IGROUPR0, gic_read32(gicr + GICR_IGROUPR0) | mine);
 	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
-	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER_QC)) = GIC_PRIORITY_DEFAULT;
+	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER_QEMU)) = GIC_PRIORITY_DEFAULT;
 	gic_write32(gicr + GICR_ISENABLER0, mine);
 
 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
@@ -493,7 +505,13 @@ gic_v3_irq_cpu_init(void)
 	 * active: a core that the firmware switches off and on again need not lose that, and a
 	 * kernel that left in the middle of an interrupt without ending it would leave this one
 	 * waiting for an end that never comes.
+	 *
+	 * Set EOImode = 0 so that ICC_EOIR1_EL1 both drops priority and deactivates the interrupt.
 	 */
+	uint64_t icc_ctlr = __builtin_arm_rsr64("ICC_CTLR_EL1");
+	icc_ctlr &= ~(1ULL << 1); /* EOImode = 0 */
+	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
+
 	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
 	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
@@ -501,8 +519,8 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_isb(ISB_SY);
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
-	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
-	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d/%d\n",
+	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER_QC, GIC_INTID_VTIMER_QEMU);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */

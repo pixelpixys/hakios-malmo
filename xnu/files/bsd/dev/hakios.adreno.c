@@ -104,6 +104,10 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void ml_io_unmap(vm_offset_t va);
+void hakios_gpu_buffer_note(uint64_t address, uint8_t *kernel, uint64_t size);
+uint8_t *hakios_gpu_buffer_at(uint64_t address, uint32_t *words);
+uint32_t hakios_gpu_buffer_notes(void);
+uint32_t hakios_gpu_map_calls_made(void);
 static void pm4_nearby(const uint8_t *buffer, uint32_t total, uint32_t at);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
@@ -3880,15 +3884,26 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
-	case 0x06:                              /* GMEM_BASE */
 	case 0x08:                              /* PP_PGTABLE */
 	case 0x09:                              /* FAULTS */
 	case 0x0a:                              /* SUSPENDS */
 	case 0x11:                              /* RAYTRACING */
 		*value = 0;
 		return true;
+	case 0x06:                              /* GMEM_BASE */
+		/* Linux (adreno_gpu.c): 0 only from ADRENO_6XX_GEN3 on; a619 is gen1, and there the on-chip
+		 * memory sits at 0x100000. Told zero, Mesa gives every tile an address of its own in the GPU's
+		 * space, the binning pass runs and the draw is issued, and nothing is written anywhere. */
+		*value = 0x100000;
+		if (gpu_log) {
+			printf("adreno: gpu: asked for GMEM_BASE, said %#llx\n", *value);
+		}
+		return true;
 	case 0x02:                              /* GMEM_SIZE */
 		*value = 512 * 1024;
+		if (gpu_log) {
+			printf("adreno: gpu: asked for GMEM_SIZE, said %#llx\n", *value);
+		}
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
@@ -3961,9 +3976,88 @@ hakios_gpu_address_free(uint64_t address, uint64_t size)
 }
 
 /* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, hakios_gpu_mapped(). */
+/*
+ * Where the buffers the program mapped are in the kernel, by the GPU address they were given: a
+ * submission's command buffer can point at another one (CP_INDIRECT_BUFFER_PFE), the draw is often in
+ * that one, and reading it back is how a hang or a missing draw is explained.
+ */
+#define GPU_BUFFER_NOTES        512
+static struct {
+	uint64_t address;
+	uint8_t *kernel;
+	uint64_t size;
+} gpu_notes[GPU_BUFFER_NOTES];
+static uint32_t gpu_note_count;
+static volatile uint32_t gpu_note_busy;    /* one writer at a time; the calls are rare */
+static uint32_t gpu_map_calls;
+
+void
+hakios_gpu_buffer_note(uint64_t address, uint8_t *kernel, uint64_t size)
+{
+	while (__atomic_test_and_set(&gpu_note_busy, __ATOMIC_ACQUIRE)) {
+		sleep_us(20);
+	}
+	for (uint32_t i = 0; i < gpu_note_count; i++) {
+		if (gpu_notes[i].address == address) {
+			gpu_notes[i].kernel = kernel;
+			gpu_notes[i].size = size;
+			__atomic_clear(&gpu_note_busy, __ATOMIC_RELEASE);
+			return;
+		}
+	}
+	if (gpu_note_count < GPU_BUFFER_NOTES) {
+		gpu_notes[gpu_note_count].address = address;
+		gpu_notes[gpu_note_count].kernel = kernel;
+		gpu_notes[gpu_note_count].size = size;
+		gpu_note_count++;
+	} else {
+		gpu_notes[address % GPU_BUFFER_NOTES].address = address;
+		gpu_notes[address % GPU_BUFFER_NOTES].kernel = kernel;
+		gpu_notes[address % GPU_BUFFER_NOTES].size = size;
+	}
+	__atomic_clear(&gpu_note_busy, __ATOMIC_RELEASE);
+}
+
+uint32_t
+hakios_gpu_map_calls_made(void)
+{
+	return gpu_map_calls;
+}
+
+uint32_t
+hakios_gpu_buffer_notes(void)
+{
+	return gpu_note_count;
+}
+
+uint8_t *
+hakios_gpu_buffer_at(uint64_t address, uint32_t *words)
+{
+	uint8_t *found = NULL;
+
+	while (__atomic_test_and_set(&gpu_note_busy, __ATOMIC_ACQUIRE)) {
+		sleep_us(20);
+	}
+	for (uint32_t i = 0; i < gpu_note_count; i++) {
+		if (address >= gpu_notes[i].address && address < gpu_notes[i].address + gpu_notes[i].size) {
+			found = gpu_notes[i].kernel + (address - gpu_notes[i].address);
+			if (words != NULL) {
+				*words = (uint32_t)((gpu_notes[i].address + gpu_notes[i].size - address) / 4);
+			}
+			break;
+		}
+	}
+	__atomic_clear(&gpu_note_busy, __ATOMIC_RELEASE);
+	return found;
+}
+
 bool
 hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
+	if (gpu_map_calls < 8) {
+		printf("adreno: gpu: mapping %#llx to %#llx\n", address, phys);
+	}
+	gpu_map_calls++;
 	return space_map(&core_space, address, phys, CORE_ATTRIBUTES | (read_only ? PTE_READ_ONLY : 0));
 }
 
@@ -4179,6 +4273,7 @@ uint8_t *hakios_gpu_ib_kernel[HAKIOS_GPU_IBS];
 uint64_t hakios_gpu_ib_address[HAKIOS_GPU_IBS];
 uint32_t hakios_gpu_ib_words[HAKIOS_GPU_IBS];
 uint32_t hakios_gpu_ib_count;
+static uint32_t gpu_quiet_ibs;      /* from the third submission on, no packet dumps */
 
 /*
  * Command buffers for the 3D core to run, in order: each an address and a count of words. As
@@ -4189,9 +4284,132 @@ uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	hakios_gpu_ib_count = count < HAKIOS_GPU_IBS ? count : HAKIOS_GPU_IBS;
-	for (uint32_t i = 0; i < hakios_gpu_ib_count; i++) {
-		if (hakios_gpu_ib_kernel[i] != NULL) {
-			ib_show_packets(hakios_gpu_ib_kernel[i], words[i], i == 0 ? "first" : "next");
+	if (gpu_fence > 2) {
+		gpu_quiet_ibs = 1;                      /* the first two say what the driver is handed */
+	}
+	if (!gpu_quiet_ibs) {
+		printf("adreno: gpu: submission %u: %u buffers", gpu_fence + 1, count);
+		for (uint32_t i = 0; i < count && i < 8; i++) {
+			printf(" %u/%u", i, words[i]);
+		}
+		printf("\n");
+		for (uint32_t i = 0; i < hakios_gpu_ib_count; i++) {
+			if (hakios_gpu_ib_kernel[i] != NULL) {
+				ib_show_packets(hakios_gpu_ib_kernel[i], words[i], i == 0 ? "first" : "next");
+				/* What operations the buffer holds, as a count each: a draw that never arrives shows up
+				 * here as an opcode that is missing. */
+				{
+					const uint32_t *w = (const uint32_t *)hakios_gpu_ib_kernel[i];
+					uint32_t n = 0, at = 0, ops[160], hits[160];
+
+					while (at < words[i] && n < 160) {
+						uint32_t h = w[at], len;
+
+						if ((h & 0xf0000000) == 0x70000000) {
+							len = 1 + (h & 0x3fff);         /* (payload words, the header says the count) */
+						} else if ((h & 0xf0000000) == 0x40000000) {
+							len = 1 + (h & 0x7f);
+						} else if ((h & 0xc0000000) == 0xc0000000) {
+							len = 1 + (((h >> 16) & 0x3fff) + 1);
+						} else {
+							len = 1 + (((h >> 16) & 0x3fff) + 1);    /* type0: a register and its values */
+						}
+						uint32_t op = (h & 0xf0000000) == 0x70000000 ? (h >> 16) & 0x7f : 0x100 + ((h >> 8) & 0x7ffff);
+						uint32_t j;
+						for (j = 0; j < n && ops[j] != op; j++) {
+						}
+						if (j == n) {
+							ops[n] = op;
+							hits[n++] = 0;
+						}
+						hits[j]++;
+						at += len;
+					}
+					/* Every nested command buffer it points at, with its own operations: the draw may be
+					 * one level in, and a buffer list that stops at the top would say "no draw at all". */
+					for (uint32_t k = 0; k + 3 < words[i] && i < 1; k++) {
+						if (((w[k] >> 16) & 0x7f) == 0x3f && (w[k] & 0xf0000000) == 0x70000000) {
+							uint64_t to = (uint64_t)w[k + 1] | (uint64_t)w[k + 2] << 32;
+							uint32_t len = w[k + 3];
+							uint64_t from = addresses[i];
+							uint32_t made = 0;
+							uint8_t *where = hakios_gpu_buffer_at(to, &made);
+							printf("adreno: gpu:   (%u mappings, %u noted) nested at word %u: %#llx, %u words (%s)\n",
+							    hakios_gpu_map_calls_made(), hakios_gpu_buffer_notes(), k, to, len,
+							    where != NULL ? "in a buffer of ours" : "not mapped");
+							if (where != NULL) {
+								const uint32_t *n = (const uint32_t *)where;
+								if (made != 0 && made < len) {
+									len = made;
+								}
+								uint32_t at2 = 0, o2[60], h2[60], m = 0;
+								while (at2 < len && m < 60) {
+									uint32_t hh = n[at2], l2;
+									if ((hh & 0xf0000000) == 0x70000000) {
+										l2 = 1 + (hh & 0x3fff);
+									} else {
+										l2 = 1 + (((hh >> 16) & 0x3fff) + 1);
+									}
+									/* type0: the register is bits 8..30, so the kinds are counted by register */
+									uint32_t op2 = (hh & 0xf0000000) == 0x70000000 ? (hh >> 16) & 0x7f : 0x100 | ((hh >> 8) & 0x1ffff);
+									uint32_t j;
+									for (j = 0; j < m && o2[j] != op2; j++) {
+									}
+									if (j == m) {
+										o2[m] = op2;
+										h2[m++] = 0;
+									}
+									h2[j]++;
+									at2 += l2;
+								}
+								printf("adreno: gpu:   nested starts %08x %08x %08x %08x %08x %08x\n",
+								    n[0], n[1], n[2], n[3], n[4], n[5]);
+								if (len > 100) {
+									printf("adreno: gpu:   nested [20..27]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+									    n[20], n[21], n[22], n[23], n[24], n[25], n[26], n[27]);
+									printf("adreno: gpu:   nested [100..105]: %08x %08x %08x %08x %08x %08x\n",
+									    n[100], n[101], n[102], n[103], n[104], n[105]);
+								}
+								if (0) {
+									uint32_t seen = 0;
+									printf("adreno: gpu:   nested packet heads:");
+									for (uint32_t kk = 0; kk < len && seen < 24; kk++) {
+										uint32_t hh = n[kk];
+										uint32_t hi = hh >> 28;
+										if (hi == 0x7 || hi == 0x4 || hi == 0xc) {
+											printf(" [%u]=%08x", kk, hh);
+											seen++;
+										}
+									}
+									printf("\n");
+								}
+								printf("adreno: gpu:   nested ops:");
+								for (uint32_t j = 0; j < m; j++) {
+									uint32_t shown = o2[j] > 0x100 ? o2[j] - 0x100 : o2[j];
+									printf(" %s%x x%u", o2[j] > 0x100 ? "r" : "op", shown, h2[j]);
+								}
+								printf("\n");
+							}
+						}
+					}
+					printf("adreno: gpu: buffer %u starts %08x %08x %08x %08x, %u words, %u kinds of packet:", i,
+					    w[0], words[i] > 1 ? w[1] : 0, words[i] > 2 ? w[2] : 0, words[i] > 3 ? w[3] : 0,
+					    words[i], n);
+					for (uint32_t j = 0; j < n; j++) {
+						printf(" %s%x x%u", ops[j] > 0x100 ? "reg" : "op", ops[j] > 0x100 ? ops[j] - 0x100 : ops[j], hits[j]);
+					}
+					printf("\n");
+				}
+				/* A short buffer with no draw in it: what is it? */
+				if (words[i] <= 100) {
+					const uint32_t *w = (const uint32_t *)hakios_gpu_ib_kernel[i];
+					printf("adreno: gpu: buffer %u is %u words, whole:", i, words[i]);
+					for (uint32_t k = 0; k < words[i] && k < 70; k++) {
+						printf(" %08x", w[k]);
+					}
+					printf("\n");
+				}
+			}
 		}
 	}
 	for (uint32_t i = 0; i < hakios_gpu_ib_count; i++) {

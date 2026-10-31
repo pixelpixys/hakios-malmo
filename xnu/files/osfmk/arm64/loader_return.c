@@ -105,6 +105,11 @@ loader_log_putc(char c)
 		os_atomic_store(&loader_log_lock, 0, release);
 	}
 	__builtin_arm_wsr64("DAIF", daif);
+	if (c == '\n') {
+		__asm__ volatile ("dc cvac, %0" : : "r" (&loader_log_len) : "memory");
+		uintptr_t cur = ((uintptr_t)loader_log + loader_log_len - 1) & ~63UL;
+		__asm__ volatile ("dc cvac, %0\n\tdsb sy" : : "r" (cur) : "memory");
+	}
 }
 
 /*
@@ -133,6 +138,7 @@ loader_log_line(const char *line)
 		os_atomic_store(&loader_log_lock, 0, release);
 	}
 	__builtin_arm_wsr64("DAIF", daif);
+	__asm__ volatile ("dc cvac, %0\n\tdsb sy" : : "r" (&loader_log_len) : "memory");
 }
 
 static void
@@ -581,6 +587,7 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
 		memory_report();
 	}
+	__asm__ volatile ("dc cvac, %0\n\tdsb sy" : : "r" (&loader_live) : "memory");
 
 	clock_interval_to_deadline(HV_WDT_PET_SECONDS, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(hv_wdt_call, deadline);

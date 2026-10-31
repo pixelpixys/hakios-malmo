@@ -38,6 +38,26 @@
 
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 
+extern void loader_log_putc(char c);
+
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#define printf say
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
@@ -70,23 +90,29 @@ sleep_ms(uint32_t ms)
 
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
-#define TLMM_PHYS               0x0f100000UL
+#define TLMM_PHYS_REDWOOD       0x0f100000UL
+#define TLMM_PHYS_SM6375        0x00500000UL
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define PULL_NONE               0
 #define PULL_UP                 3
 
-#define PIN_MISO                52
-#define PIN_MOSI                53
-#define PIN_CLK                 54
-#define PIN_CS                  55
-#define PIN_INT                 81      /* low = the chip has a report */
-#define PIN_RESET               105     /* low = in reset */
-#define PIN_AVDD                107     /* high = analog supply on */
-#define PIN_FOCALTECH_ID        68      /* FocalTech if this reads 0 ... */
-#define PIN_GOODIX_ID           96      /* ... and this reads 1 (sm8350-kernel-OKX convention) */
-#define PIN_FUNCTION_SPI        1       /* "qup15" */
+/* Default pinout: Moto G85 5G (SM6375 / Blair) */
+static vm_offset_t tlmm_phys = TLMM_PHYS_SM6375;
+static vm_size_t tlmm_size = TLMM_SIZE;
+static unsigned pin_miso = 0;
+static unsigned pin_mosi = 1;
+static unsigned pin_clk = 2;
+static unsigned pin_cs = 3;
+static unsigned pin_int = 22;      /* low = the chip has a report */
+static unsigned pin_reset = 21;    /* low = in reset */
+static unsigned pin_avdd = 84;     /* high = analog supply on */
+static unsigned pin_ft_id = 68;
+static unsigned pin_gx_id = 96;
+static unsigned pin_func_spi = 1;
+static bool is_redwood = false;
+static uint32_t bb_delay_us = 0;
 
 static void
 gpio_configure(unsigned pin, unsigned function, unsigned pull, unsigned ma, bool output)
@@ -557,13 +583,13 @@ geni_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 
 /* ---- SPI by hand, on the same pins ----------------------------------------------------------------- */
 
-static unsigned bitbang_in = PIN_MISO, bitbang_out = PIN_MOSI;
+static unsigned bitbang_in, bitbang_out;
 
 static void
 bitbang_init(void)
 {
-	gpio_output(PIN_CS, true, PULL_NONE, 6);
-	gpio_output(PIN_CLK, false, PULL_NONE, 6);
+	gpio_output(pin_cs, true, PULL_NONE, 6);
+	gpio_output(pin_clk, false, PULL_NONE, 6);
 	gpio_output(bitbang_out, false, PULL_NONE, 6);
 	gpio_configure(bitbang_in, 0, PULL_NONE, 2, false);
 }
@@ -571,21 +597,36 @@ bitbang_init(void)
 static bool
 bitbang_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 {
-	gpio_set(PIN_CS, false);
+	gpio_set(pin_cs, false);
+	if (bb_delay_us) {
+		sleep_us(bb_delay_us);
+	}
 	for (uint32_t i = 0; i < length; i++) {
 		uint8_t out = tx ? tx[i] : 0, in = 0;
 
 		for (int bit = 7; bit >= 0; bit--) {
 			gpio_set(bitbang_out, out >> bit & 1);
-			gpio_set(PIN_CLK, true);
+			if (bb_delay_us) {
+				sleep_us(bb_delay_us);
+			}
+			gpio_set(pin_clk, true);
+			if (bb_delay_us) {
+				sleep_us(bb_delay_us);
+			}
 			in = (uint8_t)(in << 1 | gpio_get(bitbang_in));
-			gpio_set(PIN_CLK, false);
+			gpio_set(pin_clk, false);
+			if (bb_delay_us) {
+				sleep_us(bb_delay_us);
+			}
 		}
 		if (rx) {
 			rx[i] = in;
 		}
 	}
-	gpio_set(PIN_CS, true);
+	gpio_set(pin_cs, true);
+	if (bb_delay_us) {
+		sleep_us(bb_delay_us);
+	}
 	return true;
 }
 
@@ -673,9 +714,9 @@ le32(const uint8_t *p)
 static void
 touch_reset(void)
 {
-	gpio_set(PIN_RESET, false);
-	sleep_ms(2);
-	gpio_set(PIN_RESET, true);
+	gpio_set(pin_reset, false);
+	sleep_ms(10);
+	gpio_set(pin_reset, true);
 	sleep_ms(100);
 }
 
@@ -686,11 +727,17 @@ goodix_probe(bool verbose)
 	static uint8_t info[GOODIX_MAX_READ];
 	uint8_t version[28];
 	uint32_t length, offset;
+	bool ok = false;
 
-	if (!goodix_read(GOODIX_FW_VERSION, version, sizeof(version))) {
-		return false;
+	for (int retry = 0; retry < 10; retry++) {
+		if (goodix_read(GOODIX_FW_VERSION, version, sizeof(version)) &&
+		    goodix_checksum_ok(version, sizeof(version))) {
+			ok = true;
+			break;
+		}
+		sleep_ms(20);
 	}
-	if (!goodix_checksum_ok(version, sizeof(version))) {
+	if (!ok) {
 		if (verbose) {
 			printf("goodix: no valid firmware version: %02x %02x %02x %02x %02x %02x %02x %02x ... %02x %02x\n",
 			    version[0], version[1], version[2], version[3], version[4], version[5], version[6], version[7],
@@ -1079,9 +1126,9 @@ focaltech_enter_boot_rom(void)
 	uint8_t boot_high = 0, boot_low = 0;
 
 	for (int cnt = 0; cnt < 3; cnt++) {
-		gpio_set(PIN_RESET, false);
+		gpio_set(pin_reset, false);
 		sleep_ms(1);
-		gpio_set(PIN_RESET, true);
+		gpio_set(pin_reset, true);
 		sleep_ms(FTS_CMD_START_DELAY + cnt * 8);
 		if (focaltech_read_boot_id(&boot_high, &boot_low) &&
 		    boot_high == 0x56 && boot_low == 0x62) {
@@ -1303,10 +1350,16 @@ static enum touch_chip touch_chip;
 static enum touch_chip
 touch_chip_detect(void)
 {
-	gpio_configure(PIN_FOCALTECH_ID, 0, PULL_NONE, 2, false);
-	gpio_configure(PIN_GOODIX_ID, 0, PULL_NONE, 2, false);
-	if (gpio_get(PIN_GOODIX_ID) && !gpio_get(PIN_FOCALTECH_ID)) {
+	uint32_t force_ft = 0;
+	if (PE_parse_boot_argn("touch_focaltech", &force_ft, sizeof(force_ft)) && force_ft) {
 		return TOUCH_FOCALTECH;
+	}
+	if (is_redwood) {
+		gpio_configure(pin_ft_id, 0, PULL_NONE, 2, false);
+		gpio_configure(pin_gx_id, 0, PULL_NONE, 2, false);
+		if (gpio_get(pin_gx_id) && !gpio_get(pin_ft_id)) {
+			return TOUCH_FOCALTECH;
+		}
 	}
 	return TOUCH_GOODIX;
 }
@@ -1336,33 +1389,52 @@ chip_poll(void)
 static void
 show_state(const char *when)
 {
-	printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
-	    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
-	    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(PIN_CS)),
-	    rd(GPIO_CFG(PIN_CLK)), rd(GPIO_CFG(PIN_MOSI)), rd(GPIO_CFG(PIN_MISO)), rd(GPIO_CFG(PIN_RESET)),
-	    rd(GPIO_IO(PIN_RESET)), rd(GPIO_CFG(PIN_INT)), rd(GPIO_IO(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_IO(PIN_AVDD)),
-	    gpio_get(68), gpio_get(96));
+	if (is_redwood && gcc) {
+		printf("goodix: %s: votes %#x, clocks %#x %#x %#x, rate cfg %#x dfs %#x; pins cs/clk/mosi/miso cfg %#x %#x %#x %#x,"
+		    " reset %#x/%u, int %#x/%u, avdd %#x/%u, straps %u %u\n", when, rd(GCC_VOTE), rd(GCC_QUP1_M_AHB_CBCR),
+		    rd(GCC_QUP1_S_AHB_CBCR), rd(GCC_QUP1_SE5_CBCR), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFSR), rd(GPIO_CFG(pin_cs)),
+		    rd(GPIO_CFG(pin_clk)), rd(GPIO_CFG(pin_mosi)), rd(GPIO_CFG(pin_miso)), rd(GPIO_CFG(pin_reset)),
+		    rd(GPIO_IO(pin_reset)), rd(GPIO_CFG(pin_int)), rd(GPIO_IO(pin_int)), rd(GPIO_CFG(pin_avdd)), rd(GPIO_IO(pin_avdd)),
+		    gpio_get(pin_ft_id), gpio_get(pin_gx_id));
+	} else {
+		printf("goodix: %s: pins cs(%u) cfg %#x, clk(%u) cfg %#x, mosi(%u) cfg %#x, miso(%u) cfg %#x; "
+		    "reset(%u) cfg %#x/io %u, int(%u) cfg %#x/io %u, avdd(%u) cfg %#x/io %u\n",
+		    when, pin_cs, rd(GPIO_CFG(pin_cs)), pin_clk, rd(GPIO_CFG(pin_clk)),
+		    pin_mosi, rd(GPIO_CFG(pin_mosi)), pin_miso, rd(GPIO_CFG(pin_miso)),
+		    pin_reset, rd(GPIO_CFG(pin_reset)), rd(GPIO_IO(pin_reset)),
+		    pin_int, rd(GPIO_CFG(pin_int)), rd(GPIO_IO(pin_int)),
+		    pin_avdd, rd(GPIO_CFG(pin_avdd)), rd(GPIO_IO(pin_avdd)));
+	}
 }
 
 /* Power the chip up from nothing, in the vendor driver's order. */
 static void
 power_on(void)
 {
-	gpio_output(PIN_RESET, false, PULL_UP, 8);
-	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
-	io_supply_on();
-	sleep_ms(3);
-	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	gpio_output(pin_reset, false, PULL_UP, 8);
+	gpio_configure(pin_int, 0, PULL_UP, 8, false);
+
+	/* Set SPI bus pins idle: CS high, CLK low, MOSI low, MISO input */
+	gpio_output(pin_cs, true, PULL_NONE, 6);
+	gpio_output(pin_clk, false, PULL_NONE, 6);
+	gpio_output(pin_mosi, false, PULL_NONE, 6);
+	gpio_configure(pin_miso, 0, PULL_NONE, 2, false);
+
+	if (is_redwood) {
+		io_supply_on();
+		sleep_ms(3);
+	}
+	gpio_output(pin_avdd, true, PULL_NONE, 8);
 	sleep_ms(15);
 }
 
 static void
 use_engine_pins(void)
 {
-	gpio_configure(PIN_MISO, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
-	gpio_configure(PIN_MOSI, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
-	gpio_configure(PIN_CLK, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
-	gpio_configure(PIN_CS, PIN_FUNCTION_SPI, PULL_NONE, 6, false);
+	gpio_configure(pin_miso, pin_func_spi, PULL_NONE, 6, false);
+	gpio_configure(pin_mosi, pin_func_spi, PULL_NONE, 6, false);
+	gpio_configure(pin_clk, pin_func_spi, PULL_NONE, 6, false);
+	gpio_configure(pin_cs, pin_func_spi, PULL_NONE, 6, false);
 }
 
 static const char *
@@ -1378,11 +1450,15 @@ bring_up(void)
 
 	show_state("as found");
 	touch_chip = touch_chip_detect();
-	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
-	    gpio_get(PIN_FOCALTECH_ID), chip_name());
+	if (is_redwood) {
+		printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(pin_gx_id),
+		    gpio_get(pin_ft_id), chip_name());
+	} else {
+		printf("goodix: selected %s\n", chip_name());
+	}
 	power_on();
 
-	if (clocks_on()) {
+	if (is_redwood && clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
 		uint32_t spi_hz = 1000000;
@@ -1395,7 +1471,7 @@ bring_up(void)
 		printf("goodix: the bus at %u Hz\n", spi_hz);
 		problem = geni_spi_init(spi_hz);
 	}
-	if (problem == NULL) {
+	if (is_redwood && problem == NULL) {
 		use_engine_pins();
 		spi_transfer = geni_transfer;
 		show_state("powered, on the serial engine");
@@ -1403,15 +1479,17 @@ bring_up(void)
 			return true;
 		}
 		printf("goodix: %s did not answer through the serial engine; trying the pins by hand\n", chip_name());
-	} else {
+	} else if (is_redwood) {
 		printf("goodix: %s; driving the pins by hand\n", problem);
+	} else {
+		printf("goodix: driving pins by hand (bitbang SPI)\n");
 	}
 
 	/* by hand; which of the two data pins is the input is not written down anywhere, so try both */
 	spi_transfer = bitbang_transfer;
 	for (int attempt = 0; attempt < 2; attempt++) {
-		bitbang_in = attempt == 0 ? PIN_MISO : PIN_MOSI;
-		bitbang_out = attempt == 0 ? PIN_MOSI : PIN_MISO;
+		bitbang_in = attempt == 0 ? pin_miso : pin_mosi;
+		bitbang_out = attempt == 0 ? pin_mosi : pin_miso;
 		bitbang_init();
 		if (chip_probe(true)) {
 			printf("goodix: %s answers on pins driven by hand (data in on gpio%u)\n", chip_name(), bitbang_in);
@@ -1437,6 +1515,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	unsigned idle = 0, idle_looks;
 	uint32_t poll_us = 8000, latency = 0, reads = 0;
 	uint64_t before = 0, reading = 0;
+	uint32_t val = 0;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
@@ -1445,11 +1524,58 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	idle_looks = 80000 / poll_us;   /* a report read every 80 ms even with the line high, in case it is missed */
 
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
-	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
-	se = ml_io_map(SE_PHYS, SE_SIZE);
-	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
-	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
+	/* Platform selection: default is Moto G85 (SM6375) */
+	if (PE_parse_boot_argn("touch_redwood", &val, sizeof(val)) && val) {
+		is_redwood = true;
+		tlmm_phys = TLMM_PHYS_REDWOOD;
+		tlmm_size = TLMM_SIZE;
+		pin_miso = 52;
+		pin_mosi = 53;
+		pin_clk = 54;
+		pin_cs = 55;
+		pin_int = 81;
+		pin_reset = 105;
+		pin_avdd = 107;
+		pin_ft_id = 68;
+		pin_gx_id = 96;
+		pin_func_spi = 1;
+		max_x = 10800;
+		max_y = 24000;
+	} else {
+		is_redwood = false;
+		tlmm_phys = TLMM_PHYS_SM6375;
+		tlmm_size = TLMM_SIZE;
+		pin_miso = 0;
+		pin_mosi = 1;
+		pin_clk = 2;
+		pin_cs = 3;
+		pin_int = 22;
+		pin_reset = 21;
+		pin_avdd = 84;
+		pin_func_spi = 1;
+		max_x = 17280;
+		max_y = 38400;
+	}
+
+	/* Optional pin and coordinate overrides */
+	PE_parse_boot_argn("touch_miso", &pin_miso, sizeof(pin_miso));
+	PE_parse_boot_argn("touch_mosi", &pin_mosi, sizeof(pin_mosi));
+	PE_parse_boot_argn("touch_clk", &pin_clk, sizeof(pin_clk));
+	PE_parse_boot_argn("touch_cs", &pin_cs, sizeof(pin_cs));
+	PE_parse_boot_argn("touch_int", &pin_int, sizeof(pin_int));
+	PE_parse_boot_argn("touch_reset", &pin_reset, sizeof(pin_reset));
+	PE_parse_boot_argn("touch_avdd", &pin_avdd, sizeof(pin_avdd));
+	PE_parse_boot_argn("touch_max_x", &max_x, sizeof(max_x));
+	PE_parse_boot_argn("touch_max_y", &max_y, sizeof(max_y));
+	PE_parse_boot_argn("touch_bb_delay", &bb_delay_us, sizeof(bb_delay_us));
+
+	tlmm = ml_io_map(tlmm_phys, tlmm_size);
+	if (is_redwood) {
+		gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
+		se = ml_io_map(SE_PHYS, SE_SIZE);
+		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+		cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
+	}
 
 	if (!bring_up()) {
 		printf("goodix: no %s touch screen\n", chip_name());
@@ -1473,7 +1599,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 		uint64_t looked = micros_now(), read_at;
 
 		/* the interrupt line is low while a report waits; look anyway every 80 ms in case it is missed */
-		if (!gpio_get(PIN_INT)) {
+		if (!gpio_get(pin_int)) {
 			idle = 0;
 			chip_poll();
 			read_at = micros_now();
@@ -1493,7 +1619,7 @@ goodix_thread(__unused void *parameter, __unused wait_result_t result)
 			printf("%s: so far %u reports in %u looks (%u bad), %u finger positions, the last at %u, %u; "
 			    "interrupt line %s; a report takes %llu us to read; the line looked at every %u us, reports %s a second\n",
 			    chip_name(), seen.reports, seen.polls, seen.bad, seen.touches, seen.last_x, seen.last_y,
-			    gpio_get(PIN_INT) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
+			    gpio_get(pin_int) ? "high" : "low", reads ? reading / reads : 0, poll_us, report_rate);
 		}
 		sleep_us(poll_us);
 	}

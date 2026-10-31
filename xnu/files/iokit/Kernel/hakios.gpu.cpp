@@ -42,7 +42,7 @@
 
 /* bsd/dev/hakios.adreno.c: the command buffers of the last submission, for a hang's own account */
 extern uint8_t *hakios_gpu_ib_kernel[128];   /* (GPU_SUBMIT_CMDS) */
-
+extern "C" void hakios_gpu_buffer_note(uint64_t address, uint8_t *kernel, uint64_t size);
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
@@ -726,6 +726,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 			bzero(b, sizeof(*b));
 			b->memory = found->memory;
 			b->kernel = found->kernel;
+			hakios_gpu_buffer_note(b->address, b->kernel, size);
 			b->address = found->address;
 			b->size = found->size;
 			b->flags = found->flags;
@@ -761,6 +762,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
 	if (b != NULL) {
 		b->memory = memory;
 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
+		hakios_gpu_buffer_note(b->address, b->kernel, size);
 		gGPUStat.made++;
 		gGPUStat.making += mach_absolute_time() - began;
 	}
@@ -830,6 +832,7 @@ HakiosGPUUserClient::surfaceBuffer(struct hakios_surface * request)
 	} else if ((b = newBuffer(s->memory, PAGE_SIZE, size, 0, &request->handle)) != NULL) {
 		b->memory = memory;
 		b->kernel = s->kbase + PAGE_SIZE;
+		hakios_gpu_buffer_note(b->address, b->kernel, size);
 		b->surface = s;
 		gGPUStat.surfaces++;
 	}

@@ -357,7 +357,7 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..4a6e0ccfc590 100644
+index 4df41ba1f61b..04a6a275a64e 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
 @@ -147,6 +147,13 @@
@@ -374,7 +374,7 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +497,7 @@ bsd_init(void)
+@@ -490,10 +497,10 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -382,8 +382,30 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
 +#define DEBUG_BSDINIT 1 /* bring-up: trace bsd_init steps (only visible with -enable_kprintf_spam) */
  
  #if DEBUG_BSDINIT
- #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+-#define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
++#define bsd_init_kprintf(x, ...) printf("bsd_init: " x, ## __VA_ARGS__)
+ #else
+ #define bsd_init_kprintf(x, ...)
+ #endif
+@@ -887,7 +894,9 @@ bsd_init(void)
+ 		printf("cannot mount root, errno = %d\n", err);
+ 	}
+ 
++	printf("bsd_init: calling IOSecureBSDRoot\n");
+ 	IOSecureBSDRoot(rootdevice);
++	printf("bsd_init: IOSecureBSDRoot finished\n");
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
+@@ -896,6 +905,7 @@ bsd_init(void)
+ 	if (VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel())) {
+ 		panic("bsd_init: cannot find root vnode: %s", PE_boot_args());
+ 	}
++	printf("bsd_init: VFS_ROOT succeeded\n");
+ 	(void)vnode_ref(init_rootvnode);
+ 	(void)vnode_put(init_rootvnode);
+ 
+@@ -976,6 +986,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -398,6 +420,24 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
  	}
  #endif /* DEVFS */
  
+@@ -1108,6 +1126,7 @@ setconf(void)
+ 	u_int32_t       flags;
+ 	kern_return_t   err;
+ 
++	printf("setconf: calling IOFindBSDRoot...\n");
+ 	err = IOFindBSDRoot(rootdevice, sizeof(rootdevice), &rootdev, &flags);
+ 	if (err) {
+ 		printf("setconf: IOFindBSDRoot returned an error (%d);"
+@@ -1115,6 +1134,9 @@ setconf(void)
+ 		rootdev = makedev( 6, 0 );
+ 		strlcpy(rootdevice, "sd0a", sizeof(rootdevice));
+ 		flags = 0;
++	} else {
++		printf("setconf: IOFindBSDRoot succeeded, rootdevice='%s', rootdev=%d,%d\n",
++		    rootdevice, major(rootdev), minor(rootdev));
+ 	}
+ 
+ #if CONFIG_NETBOOT
 diff --git a/bsd/kern/decmpfs.c b/bsd/kern/decmpfs.c
 index 95192dd62449..b00da803b5b4 100644
 --- a/bsd/kern/decmpfs.c
@@ -1684,26 +1724,34 @@ index 2b14eda8f68f..09337bad5b01 100644
 +#endif
      ")";
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 5219fb0d9ed6..29978e9cff43 100644
+index 5219fb0d9ed6..dfa675ffad89 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -683,7 +683,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -683,10 +683,19 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	assert(matching);
  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
  
 -	if ((service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale))) {
+-		OSSafeReleaseNULL(service);
+-	} else {
+-		IOLog("!BSD\n");
 +	// A memory-device root needs no filesystem kext, so do not sit out the timeout for one
 +	char rdEarly[kMaxBootVar];
 +	uint64_t bsdWait = 30ULL * kSecondScale;
 +	if (PE_parse_boot_argn("rd", rdEarly, sizeof(rdEarly)) && rdEarly[0] == 'm' && rdEarly[1] == 'd') {
-+		bsdWait = kSecondScale / 10;
++		bsdWait = 0;
 +	}
 +
-+	if ((service = IOService::waitForMatchingService(matching, bsdWait))) {
- 		OSSafeReleaseNULL(service);
- 	} else {
- 		IOLog("!BSD\n");
-@@ -762,6 +769,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++	if (bsdWait > 0) {
++		if ((service = IOService::waitForMatchingService(matching, bsdWait))) {
++			OSSafeReleaseNULL(service);
++		} else {
++			IOLog("!BSD\n");
++		}
+ 	}
+ 	matching->release();
+ 	matching = NULL;
+@@ -762,6 +771,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  #endif /* __LP64__ */
  				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
  			}
@@ -1721,6 +1769,40 @@ index 5219fb0d9ed6..29978e9cff43 100644
  			regEntry->release();                                                            /* Toss the entry */
  		}
  	}
+@@ -792,6 +812,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 				rootName[2] = (char) dchar;                                                     /* Build root name */
+ 				rootName[3] = 0;                                                                /* Build root name */
+ 				IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++				printf("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
+ 				*oflags = 0;                                                                    /* Show that this is not network */
+ 
+ #if CONFIG_KDP_INTERACTIVE_DEBUGGING
+@@ -1012,6 +1033,10 @@ void
+ IOSecureBSDRoot(const char * rootName)
+ {
+ #if CONFIG_SECURE_BSD_ROOT
++	if (rootName && strncmp(rootName, "md", 2) == 0) {
++		printf("IOSecureBSDRoot: skipping for ramdisk root '%s'\n", rootName);
++		return;
++	}
+ 	IOReturn         result;
+ 	IOPlatformExpert *pe;
+ 	OSDictionary     *matching;
+@@ -1019,9 +1044,12 @@ IOSecureBSDRoot(const char * rootName)
+ 
+ 	matching = IOService::serviceMatching("IOPlatformExpert");
+ 	assert(matching);
+-	pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
++	pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 0);
+ 	matching->release();
+-	assert(pe);
++	if (!pe) {
++		printf("IOSecureBSDRoot: IOPlatformExpert not found, skipping\n");
++		return;
++	}
+ 	// Returns kIOReturnNotPrivileged is the root device is not secure.
+ 	// Returns kIOReturnUnsupported if "SecureRootName" is not implemented.
+ 	result = pe->callPlatformFunction(functionName, false, (void *)rootName, (void *)NULL, (void *)NULL, (void *)NULL);
 diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52062e0..c07be8d9e0b0 100644
 --- a/iokit/conf/files
@@ -2183,7 +2265,7 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..828a51171c7e 100644
+index e76e7e70ab9c..b8b21d04c6d2 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
 @@ -734,6 +734,9 @@ ml_get_machine_mem(void)
@@ -2369,10 +2451,19 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -2028,6 +2141,7 @@ ml_set_decrementer(uint32_t dec_value)
+ 		cdp->cpu_set_decrementer_func(dec_value);
+ 	} else {
+ 		__builtin_arm_wsr64("CNTV_TVAL_EL0", (uint64_t)dec_value);
++		__builtin_arm_isb(ISB_SY);
+ 	}
+ }
+ 
+@@ -2237,8 +2351,17 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
++	__builtin_arm_isb(ISB_SY);
 +#if defined(APPLE_ARM64_ARCH_FAMILY)
  	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
  	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
@@ -2757,6 +2848,27 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index e5b23f2a2fbf..89e3fab6c77c 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -242,6 +242,8 @@ get_cons_ops_index(void)
+  * @param poll Whether or not this call should poll instead of going to sleep
+  *             waiting for an interrupt when the hardware device isn't ready
+  */
++extern void loader_log_putc(char c);
++
+ static inline void
+ _cnputc(char c, bool poll)
+ {
+@@ -254,6 +256,7 @@ _cnputc(char c, bool poll)
+ 		_cnputc('\r', poll);
+ 	}
+ 
++	loader_log_putc(c);
+ 	cons_ops[idx].putc(c, poll);
+ }
+ 
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
 index 384118e8d7a9..2573d2ebd4e6 100644
 --- a/osfmk/console/video_console.c
@@ -2775,6 +2887,32 @@ index 384118e8d7a9..2573d2ebd4e6 100644
  				 * Framebuffers would normally use VM_WIMG_RT, which
  				 * io_map doesn't support.  However this buffer is set up
  				 * by the bootloader and doesn't require D$ cleaning, so
+diff --git a/osfmk/console/video_scroll.c b/osfmk/console/video_scroll.c
+index 439787daa518..32c09d63667b 100644
+--- a/osfmk/console/video_scroll.c
++++ b/osfmk/console/video_scroll.c
+@@ -32,7 +32,11 @@
+ void
+ video_scroll_up(void * start, void * end, void * dest)
+ {
+-	bcopy(start, dest, ((char *)end - (char *)start) << 2);
++	/* Qualcomm MDSS does not support CPU readback from framebuffer memory (0x85200000).
++	 * Reading hangs the bus on line 60 of verbose boot. We bypass reading to keep the console alive. */
++	(void)start;
++	(void)end;
++	(void)dest;
+ }
+ 
+ void
+@@ -40,5 +44,7 @@ video_scroll_down(void * start,      /* HIGH addr */
+     void * end,                      /* LOW addr */
+     void * dest)                     /* HIGH addr */
+ {
+-	bcopy(end, dest, ((char *)start - (char *)end) << 2);
++	(void)start;
++	(void)end;
++	(void)dest;
+ }
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
 index 0a00656a0fdd..bfad3cbca5bc 100644
 --- a/osfmk/kern/debug.c
@@ -3121,7 +3259,7 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  void
  pe_init_fiq()
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
-index 65144c74239c..ab6260d52d84 100644
+index 65144c74239c..c18acab945c3 100644
 --- a/pexpert/arm/pe_kprintf.c
 +++ b/pexpert/arm/pe_kprintf.c
 @@ -29,6 +29,7 @@ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
@@ -3132,7 +3270,19 @@ index 65144c74239c..ab6260d52d84 100644
  
  __startup_func
  static void
-@@ -159,6 +160,7 @@ serial_putc_crlf(char c)
+@@ -45,10 +46,7 @@ PE_init_kprintf_config(void)
+ #if DEBUG
+ 	disable_kprintf_output = false;
+ #elif DEVELOPMENT
+-	bool enable_kprintf_spam = false;
+-	if (PE_parse_boot_argn("-enable_kprintf_spam", &enable_kprintf_spam, sizeof(enable_kprintf_spam))) {
+-		disable_kprintf_output = false;
+-	}
++	disable_kprintf_output = false;
+ #endif
+ }
+ // Do this early, so other code can depend on whether kprintf is enabled.
+@@ -159,6 +157,7 @@ serial_putc_crlf(char c)
  	if (c == '\n') {
  		uart_putc('\r');
  	}

@@ -93,12 +93,19 @@ wr(vm_offset_t address, uint32_t value)
 
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* "core": the version, and which peripheral each channel is */
+/* Redwood (SM7325) */
+#define ARB_CORE_PHYS_REDWOOD       0x0c440000UL    /* "core": the version, and which peripheral each channel is */
+#define ARB_CNFG_PHYS_REDWOOD       0x0c40a000UL    /* "cnfg": which system owns each channel */
+#define ARB_OBSERVER_PHYS_REDWOOD   0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
+
+/* Moto G85 (SM6375) */
+#define ARB_CORE_PHYS_SM6375        0x01c40000UL
+#define ARB_CNFG_PHYS_SM6375        0x01c0a000UL
+#define ARB_OBSERVER_PHYS_SM6375    0x03e00000UL
+
 #define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
-#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
+#define ARB_CNFG_SIZE           0x2000UL
+#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first (EE 0) */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
 #define ARB_VERSION             0x000
@@ -121,6 +128,10 @@ wr(vm_offset_t address, uint32_t value)
 #define COMMAND_READ            (1u << 27)      /* "extended register read long"; [11:4] register, [2:0] bytes - 1 */
 #define READ_TIMEOUT_US         2000            /* a read takes some tens of microseconds */
 
+static bool is_redwood = false;
+static vm_offset_t arb_core_phys = ARB_CORE_PHYS_SM6375;
+static vm_offset_t arb_cnfg_phys = ARB_CNFG_PHYS_SM6375;
+static vm_offset_t arb_observer_phys = ARB_OBSERVER_PHYS_SM6375;
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
 
 /*
@@ -149,8 +160,8 @@ struct peripheral {
 	uint16_t        channel;
 	bool            found;
 };
-static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
-static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+static struct peripheral pon = { .name = "the PM6125's power-on block", .id = 0x008 };          /* registers 0x0800 of slave 0 */
+static struct peripheral pin = { .name = "GPIO1 of the PMR735A", .id = 0x488 };                 /* registers 0x8800 of slave 4 */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -386,15 +397,14 @@ pon_inputs(void)
 	const char *problem;
 	uint8_t r[8], more[2];
 
-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
+	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n",
+	    pon.name, pon.id & 0xff, pon.id & 0xff);
 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
-	if (problem == NULL) {
-		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
-	}
 	if (problem != NULL) {
 		printf("buttons: %s: %s\n", pon.name, problem);
 		return;
 	}
+	spmi_read(&pon, REG_INT_LATCHED, more, 2);
 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
 	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
 	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
@@ -412,7 +422,8 @@ pin_input(void)
 	uint8_t c[8], status = 0;
 	unsigned mode, pull;
 
-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
+	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n",
+	    pin.name, pin.id & 0xff, pin.id & 0xff, pin.id & 0xff);
 	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
@@ -451,13 +462,38 @@ static void
 buttons_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
+	uint32_t val = 0;
 	bool pon_known, pin_known;
 
-	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
-	    ARB_OBSERVER_PHYS);
-	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	if (PE_parse_boot_argn("buttons_redwood", &val, sizeof(val)) && val) {
+		is_redwood = true;
+		arb_core_phys = ARB_CORE_PHYS_REDWOOD;
+		arb_cnfg_phys = ARB_CNFG_PHYS_REDWOOD;
+		arb_observer_phys = ARB_OBSERVER_PHYS_REDWOOD;
+		pon.name = "the PMK8350's power-on block";
+		pon.id = 0x013;
+		pin.name = "GPIO6 of the PM7325";
+		pin.id = 0x18d;
+	} else {
+		is_redwood = false;
+		arb_core_phys = ARB_CORE_PHYS_SM6375;
+		arb_cnfg_phys = ARB_CNFG_PHYS_SM6375;
+		arb_observer_phys = ARB_OBSERVER_PHYS_SM6375;
+		pon.name = "the PM6125's power-on block";
+		pon.id = 0x008;
+		pin.name = "GPIO1 of the PMR735A";
+		pin.id = 0x488;
+	}
+
+	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", arb_core_phys, arb_cnfg_phys,
+	    arb_observer_phys);
+	arb_core = ml_io_map(arb_core_phys, ARB_CORE_SIZE);
+	arb_cnfg = ml_io_map(arb_cnfg_phys, ARB_CNFG_SIZE);
+	arb_observer = ml_io_map(arb_observer_phys, ARB_OBSERVER_SIZE);
+	if (!arb_core || !arb_cnfg || !arb_observer) {
+		printf("buttons: ml_io_map failed for PMIC arbiter\n");
+		goto out;
+	}
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
@@ -475,13 +511,28 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
 	find_channel(&pon, channels);
 	find_channel(&pin, channels);
+	if (!pin.found && !is_redwood && pin.id == 0x488) {
+		pin.id = 0x489;
+		find_channel(&pin, channels);
+	}
+	if (!pon.found || !pin.found) {
+		printf("buttons: arbiter channels dump for slave %u and %u:\n", pon.id >> 8, pin.id >> 8);
+		for (uint32_t n = 0; n < channels; n++) {
+			uint32_t map = rd(arb_core + ARB_CHANNEL(n));
+			uint32_t sid = (map >> 16) & 0xf;
+			uint32_t periph = (map >> 8) & 0xff;
+			if (map != 0 && (sid == (pon.id >> 8) || sid == (pin.id >> 8))) {
+				printf("buttons:   channel %u: slave %u, periph %#04x (map %#x)\n", n, sid, periph, map);
+			}
+		}
+	}
 	if (steps < 3) {
 		goto out;
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
-	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
+	pon_known = identify(&pon, PON_TYPE, 0x01, 0x09);
+	pin_known = identify(&pin, GPIO_TYPE, 0x00, 0x30);
 	if (steps < 4) {
 		goto out;
 	}
@@ -538,15 +589,10 @@ hakios_buttons_init(void)
 	thread_t thread;
 
 	/*
-	 * On with the touch screen (the phone, somebody at it) unless buttons=0 says otherwise: a hand
-	 * has pressed all three keys and each press and release was read as it was made.
+	 * Only run if explicitly requested via boot-arg buttons=1.
+	 * (Avoid probing Redwood SPMI on other platforms when only touchscreen=1 is set)
 	 */
-	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled))) {
-		uint32_t touch_screen = 0;
-
-		enabled = PE_parse_boot_argn("touchscreen", &touch_screen, sizeof(touch_screen)) && touch_screen != 0;
-	}
-	if (!enabled) {
+	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
