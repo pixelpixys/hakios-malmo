@@ -3616,6 +3616,13 @@ step_frame(void)
 	    rd(gpu.base + GPU_WORD(0x0016)), rd(gpu.base + GPU_WORD(0x0018)),
 	    rd(gpu.base + GPU_WORD(0x0043)), rd(gpu.base + RBBM_STATUS3));
 	ring_mark(2, 0x11110002);
+	/* Access protection: Linux writes CP_PROTECT_CNTL and a whole CP_PROTECT table; this port has
+	 * never touched either, so whatever the bootloader left is in force. A protected register is
+	 * dropped silently, with no fault and no status, which is exactly what the blit looks like. */
+	printf("adreno: %u: cp protect cntl %#x, status %#x (before)\n", step,
+	    rd(gpu.base + GPU_WORD(0x084f)), rd(gpu.base + CP_PROTECT_STATUS));
+	ring_register(0x084f, 0);                       /* CP_PROTECT_CNTL: no protection at all */
+	ring_command(CP_WAIT_FOR_IDLE, 0);
 	/* Mesa opens fd6_emit_restore with CP_SET_MODE 0, before any state: it decides which
 	 * CP_SET_DRAW_STATE groups run and whether RB-directed work is handed on. */
 	ring_command(CP_SET_MODE, 1);
