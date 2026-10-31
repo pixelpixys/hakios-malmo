@@ -3604,7 +3604,9 @@ step_frame(void)
 	/* Mesa puts a wait here for every a6xx before an older one: "early a6xx (a630?) needed this".
 	 * Writing this register while the core is still busy loses it silently. */
 	ring_command(CP_WAIT_FOR_IDLE, 0);
-	ring_register(RB_CCU_CNTL, ccu_cntl); /* Mesa's for this GPU when it draws straight into memory */
+	/* Straight from here: sent through the ring it reads back as zero, like the vendor's privileged
+	 * registers - the command processor drops it. */
+	put(&gpu, "rb_ccu_cntl", GPU_WORD(0x8e07), ccu_cntl);
 	/* Linux turns the block clocks on with this value for a6xx (a619 is none of a610/a612/a702, so
 	 * 0x8aa8aa82): a6xx_set_hwcg in a6xx_gpu.c. This port only ever read the register, and the
 	 * renderer's busy counter reads zero, which is what a block with no clock looks like. */
@@ -3643,6 +3645,11 @@ step_frame(void)
 	/* Written straight from here, not through the ring: the vendor's own user-mode library refuses
 	 * these ("User mode driver cannot write to RBBM registers"), and through the ring they read back
 	 * unchanged, so the command processor drops them. */
+	printf("adreno: %u: 2D read direct: ccu %#x clk %#x, blit %#x dst_info %#x dst %#x pitch %#x, tl %#x br %#x, sp_fmt %#x\n", step,
+	    rd(gpu.base + GPU_WORD(0x8e07)), rd(gpu.base + RBBM_CLOCK_CNTL),
+	    rd(gpu.base + GPU_WORD(0x8c00)), rd(gpu.base + GPU_WORD(0x8c17)), rd(gpu.base + GPU_WORD(0x8c18)),
+	    rd(gpu.base + GPU_WORD(0x8c1a)), rd(gpu.base + GPU_WORD(0x8405)), rd(gpu.base + GPU_WORD(0x8406)),
+	    rd(gpu.base + GPU_WORD(0xacc0)));
 	printf("adreno: %u: read back: apriv %#x, chicken %#x, uche_gx %#x, rb_buf %#x\n", step,
 	    rd(gpu.base + GPU_WORD(0x0534)), rd(gpu.base + GPU_WORD(0x0841)),
 	    rd(gpu.base + GPU_WORD(0x0e3a)), rd(gpu.base + GPU_WORD(0x08c3)));
