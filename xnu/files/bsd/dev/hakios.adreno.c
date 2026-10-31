@@ -2717,6 +2717,7 @@ static bool core_space_is_on, core_runs, zap_is_loaded;
 #define RING_WORDS              (CORE_RING_SIZE / 4)
 static uint32_t ring_at;                /* where the next word goes: the ring goes round */
 static uint32_t ring_start;             /* where the last run of words began in it */
+static uint32_t perf_mode;              /* adreno_perf=1: watch the renderer's counters around a blit */
 static uint32_t ring_sent;              /* up to where the core has been told to read */
 
 static uint32_t
@@ -3497,6 +3498,7 @@ step_frame(void)
 	PE_parse_boot_argn("adreno_copy", &copy_mode, sizeof(copy_mode));
 	PE_parse_boot_argn("adreno_resolve", &resolve_mode, sizeof(resolve_mode));
 	PE_parse_boot_argn("adreno_static", &static_regs_mode, sizeof(static_regs_mode));
+	PE_parse_boot_argn("adreno_perf", &perf_mode, sizeof(perf_mode));
 	if (copy_mode) {
 		/* Through the same commit as the picture: a block added after the SMMU tables are written
 		 * out has no translation, and the 2D engine's read of it is refused. */
@@ -3602,7 +3604,45 @@ step_frame(void)
 	ring_command(CP_WAIT_FOR_IDLE, 0);
 	ring_register(RB_CCU_CNTL, ccu_cntl); /* Mesa's for this GPU when it draws straight into memory */
 	ring_mark(2, 0x11110002);
+	/*
+	 * Do the renderer block's counters move at all when a blit runs? Eight counters sit at 0x04d6,
+	 * two words apart; RBBM_PERFCTR_CNTL at 0x0500 lets them count. Read before and after one blit:
+	 * if they do not move, the work never reaches RB and no register of the 2D engine can be the
+	 * cause; if they do, RB runs and the destination is what is wrong.
+	 */
+	if (perf_mode) {
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+		ring_register(0x0500, 0x00000001);              /* RBBM_PERFCTR_CNTL: count */
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+		for (uint32_t i = 0; i < 8; i++) {
+			ring_command(CP_REG_TO_MEM, 3);
+			ring(0x04d6 + 2 * i | 1u << 18 | 1u << 30);  /* one counter, 32-bit */
+			ring(CORE_SCRATCH_ADDRESS + 320 + 4 * i);
+			ring(0);
+		}
+		/* The command processor's own counters, as a control: if these are zero too, the counters
+		 * are simply not counting and this says nothing about the renderer. */
+		ring_command(CP_REG_TO_MEM, 3);
+		ring(0x0400 | 1u << 18 | 1u << 30);
+		ring(CORE_SCRATCH_ADDRESS + 384);
+		ring(0);
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+	}
 	ring_fill(0, 800, 255, 128, 0, 0);         /* orange */
+	if (perf_mode) {
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+		for (uint32_t i = 0; i < 8; i++) {
+			ring_command(CP_REG_TO_MEM, 3);
+			ring(0x04d6 + 2 * i | 1u << 18 | 1u << 30);
+			ring(CORE_SCRATCH_ADDRESS + 352 + 4 * i);
+			ring(0);
+		}
+		ring_command(CP_REG_TO_MEM, 3);
+		ring(0x0400 | 1u << 18 | 1u << 30);
+		ring(CORE_SCRATCH_ADDRESS + 388);
+		ring(0);
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+	}
 	ring_fill(800, 1600, 255, 255, 255, 1);
 	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255, 2);
 	/* What the core thinks it was told to draw with: its own words, copied back into our memory. */
@@ -3655,6 +3695,14 @@ step_frame(void)
 	    step, sc[8], sc[9], sc[10], sc[11], sc[12], sc[13], sc[14], sc[15]);
 	printf("adreno: %u: markers sc[16..23]: %#x %#x %#x %#x %#x %#x %#x %#x\n",
 	    step, sc[16], sc[17], sc[18], sc[19], sc[20], sc[21], sc[22], sc[23]);
+	if (perf_mode) {
+		const volatile uint32_t *pf = (const volatile uint32_t *)core_scratch.memory;
+		printf("adreno: %u: RB counters before the blit: %u %u %u %u %u %u %u %u\n", step,
+		    pf[80], pf[81], pf[82], pf[83], pf[84], pf[85], pf[86], pf[87]);
+		printf("adreno: %u: RB counters after the blit:  %u %u %u %u %u %u %u %u\n", step,
+		    pf[88], pf[89], pf[90], pf[91], pf[92], pf[93], pf[94], pf[95]);
+		printf("adreno: %u: the command processor's counter, before %u after %u\n", step, pf[96], pf[97]);
+	}
 	printf("adreno: %u: markers sc[24..31]: %#x %#x %#x %#x %#x %#x %#x %#x\n",
 	    step, sc[24], sc[25], sc[26], sc[27], sc[28], sc[29], sc[30], sc[31]);
 	printf("adreno: %u: the 2D state it holds: tl %#x br %#x, blit %#x %#x %#x %#x, dst info %#x %#x %#x pitch %#x\n",
