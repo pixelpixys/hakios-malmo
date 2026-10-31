@@ -3243,6 +3243,7 @@ step_core_commands(void)
 #define RB_BLIT_INFO            0x88e3
 #define CP_SET_MODE             0x63            /* which CP_SET_DRAW_STATE groups run (Mesa sends 0) */
 #define EVENT_BLIT              0x1e            /* (FLD_BLIT: RB reads GMEM, writes memory) */
+#define EVENT_CLEAN_COLOR       0x21            /* CCU_CLEAN_COLOR: writes the cache's colour out (0x1d is only a flush) */
 #define EVENT_FLUSH_COLOR       0x1d
 #define EVENT_INVALIDATE_DEPTH  0x18            /* PC_CCU_INVALIDATE_DEPTH */
 #define EVENT_INVALIDATE_COLOR  0x19            /* PC_CCU_INVALIDATE_COLOR */
@@ -3455,16 +3456,14 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	 * manually here"). This was the missing half of the frame: the blit was running all along and the
 	 * picture was sitting in the cache, so memory still read back as the zeros it held before.
 	 */
-	ring_command(CP_EVENT_WRITE, 4);
-	ring(EVENT_FLUSH_COLOR | EVENT_WRITE_TIMESTAMP);
-	ring(CORE_SCRATCH_ADDRESS + 240);
-	ring(0);
-	ring(1 + idx);
-	ring_command(CP_EVENT_WRITE, 4);
-	ring(EVENT_CCU_CLEAN_DEPTH | EVENT_WRITE_TIMESTAMP);
-	ring(CORE_SCRATCH_ADDRESS + 244);
-	ring(0);
-	ring(4 + idx);
+	/* Mesa's fd6_emit_flushes: CCU_CLEAN_COLOR is what writes the colour cache out to memory -
+	 * CCU_FLUSH_COLOR (0x1d), which was here, only flushes the pipeline. Depth is cleaned only when
+	 * there is depth to clean, and this frame has none. */
+	/* The event is sent without a timestamp: with EVENT_WRITE_TIMESTAMP the command processor stops on
+	 * the address word of the packet on this chip (seen at ring word 416, CP_OPCODE_ERROR), and the
+	 * rest of the frame - including the marker after the blit - is never reached. */
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_CLEAN_COLOR);
 	if (blit_wfi) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
@@ -3582,7 +3581,12 @@ step_frame(void)
 	if (blit_inv && blit_wfi) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
-	uint32_t ccu_cntl = is_malmo ? 0x08000004 : 0x10000004;
+	/* Mesa's fd6_emit_ccu_cntl for sysmem, with the values gen1 gives (fd6_screen_init and
+	 * a6xx_gen1 in freedreno_devices.py): both caches at CCU_CACHE_SIZE_FULL (3), depth at 0, colour
+	 * at 64 KB >> 12, and GMEM fast clear disabled because gen1 has none. What was here before
+	 * (0x10000004) had both cache sizes at 0 - colour and depth caches switched off - and the 2D
+	 * engine never finished a blit under it. */
+	uint32_t ccu_cntl = (1u << 0) | (3u << 10) | (3u << 21) | (0x10u << 23);
 	PE_parse_boot_argn("adreno_ccu", &ccu_cntl, sizeof(ccu_cntl));
 	printf("adreno: %u: RB_CCU_CNTL = %#x\n", step, ccu_cntl);
 	/* Mesa puts a wait here for every a6xx before an older one: "early a6xx (a630?) needed this".
