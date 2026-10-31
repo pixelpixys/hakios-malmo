@@ -2667,7 +2667,8 @@ static uint32_t core_uncached;
 #define RBBM_VBIF_CLIENT_QOS_CNTL GPU_WORD(0x0010)
 #define UCHE_FILTER_CNTL        GPU_WORD(0x0e18)
 #define UCHE_CLIENT_PF          GPU_WORD(0x0e19)
-#define RB_DBG_ECO_CNTL         GPU_WORD(0x8e04)
+#define RB_DBG_ECO_CNTL         GPU_WORD(0x8e04)                    /* (read and written as a register block) */
+#define RB_DBG_ECO_CNTL_WORD    0x8e04                              /* (the same, as the ring numbers registers) */
 #define PC_DBG_ECO_CNTL         GPU_WORD(0x9e00)
 #define RBBM_SECVID_TRUST_CNTL  GPU_WORD(0xf400)
 #define RBBM_SECVID_TSB_TRUSTED_BASE GPU_WORD(0xf800)
@@ -2715,6 +2716,7 @@ static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
 static bool core_space_is_on, core_runs, zap_is_loaded;
 #define RING_WORDS              (CORE_RING_SIZE / 4)
 static uint32_t ring_at;                /* where the next word goes: the ring goes round */
+static uint32_t ring_start;             /* where the last run of words began in it */
 static uint32_t ring_sent;              /* up to where the core has been told to read */
 
 static uint32_t
@@ -2786,6 +2788,7 @@ ring_run(const char *what)
 
 	printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
 	snprintf(last_write, sizeof(last_write), "step %u had the 3D core %s", step, what);
+	ring_start = ring_sent;                 /* (the ring goes round, so a window means one run of words) */
 	hold(true);
 	ring_send();
 	for (int i = 0; i < 20000 && (taken != ring_at || (status & busy_mask)); i++) {
@@ -2818,13 +2821,25 @@ ring_run(const char *what)
 		/* The words around where the read pointer stopped, as they are in the ring: the packet that
 		 * does not finish is one of them, and reading it is more reliable than decoding it. */
 		const uint32_t *rw = (const uint32_t *)core_ring.memory;
-		printf("adreno: %u: ring around %u:", step, taken);
-		for (int32_t k = (int32_t)taken - 14; k < (int32_t)taken + 6; k++) {
-			if (k >= 0 && (uint32_t)k < RING_WORDS) {
-				printf(" %c%u=%08x", k == (int32_t)taken ? '>' : ' ', (uint32_t)k, rw[k]);
+		printf("adreno: %u: this run began at %u, the core is at %u:", step, ring_start, taken);
+		{
+			int32_t k;
+			for (k = (int32_t)ring_start; k < (int32_t)taken; k++) {
+				uint32_t h = rw[k];
+				if ((h & 0xf0000000) == 0x70000000) {
+					printf(" %u:%s%x", (uint32_t)k, (h >> 16) & 0x7f >= 0x40 ? "op" : "op",
+					    (h >> 16) & 0x7f);
+				}
 			}
+			printf("\n");
+			printf("adreno: %u: around %u:", step, taken);
+			for (k = (int32_t)taken - 10; k < (int32_t)taken + 20; k++) {
+				if (k >= 0 && (uint32_t)k < RING_WORDS) {
+					printf(" %c%u=%08x", k == (int32_t)taken ? '>' : ' ', (uint32_t)k, rw[k]);
+				}
+			}
+			printf("\n");
 		}
-		printf("\n");
 	}
 	printf("adreno: %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
 	    "command processor: fault %#x, interrupts %#x (sqe: %#x %#x %#x %#x), protection %#x, px0 %#x\n",
@@ -3396,7 +3411,7 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	/* Mesa's emit_blit_fini: the blit's own ECO value in the ring right before it, and zero right after.
 	 * It is a context register, so the copy written by the processor at step 20 may not be the one the
 	 * core is using by now. */
-	ring_register(RB_DBG_ECO_CNTL, 0x04100000);
+	ring_register(RB_DBG_ECO_CNTL_WORD, 0x04100000);
 	if (resolve_mode) {
 		/*
 		 * The GMEM resolve, as Mesa does it in emit_blit (fd6_gmem.cc): describe the tile in GMEM, the
@@ -3453,7 +3468,7 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	if (blit_wfi) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
-	ring_register(RB_DBG_ECO_CNTL, 0);
+	ring_register(RB_DBG_ECO_CNTL_WORD, 0);
 	ring_mark(12 + idx * 4 + 3, 0x2004 | (idx << 8));
 }
 
