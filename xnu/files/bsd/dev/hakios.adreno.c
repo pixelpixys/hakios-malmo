@@ -2813,15 +2813,6 @@ ring_run(const char *what)
 		to_memory(core_ring.memory, 4 * RING_WORDS);
 		/* The ring holds this one frame from word 0 (each run starts it over), so decode it whole and
 		 * name the packet the read pointer is inside. */
-		{
-			const uint32_t *rw = (const uint32_t *)core_ring.memory;
-			for (uint32_t k = 0; k < 12 && k < taken; k++) {
-				printf("adreno: gpu: ring %u %08x\n", k, rw[k]);
-			}
-			for (uint32_t k = (taken > 6 ? taken - 6 : 0); k < taken; k++) {
-				printf("adreno: gpu: near %u %08x\n", k, rw[k]);
-			}
-		}
 		pm4_nearby((const uint8_t *)core_ring.memory, taken, taken);
 	}
 	printf("adreno: %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
@@ -3532,38 +3523,6 @@ step_frame(void)
 	printf("adreno: %u: colour %#x %#x %#x %#x, sp fmt %#x, ccu %#x\n",
 	    step, sc[42], sc[43], sc[44], sc[45], sc[46], sc[47]);
 	to_memory(core_target.memory, core_target.size);
-	/*
-	 * Past the CPU cache, one page at a time: if the engine wrote the picture and this processor is only
-	 * reading its own stale lines, the colour shows up here. Read page by page because the block is not
-	 * one piece of physical memory (mapping all 10 MB at once takes the kernel down).
-	 */
-	{
-		const uint8_t want[4] = { 0x00, 0x80, 0xff, 0xff };
-		uint32_t hits = 0, first = 0, pages = 0;
-		for (uint32_t off = 0; off + 4 <= core_target.size; off += 4096) {
-			vm_offset_t va = ml_io_map_wcomb(kvtophys((vm_offset_t)core_target.memory + off), 4096);
-			if (va == 0) {
-				continue;
-			}
-			const volatile uint8_t *q = (const volatile uint8_t *)va;
-			for (uint32_t i = 0; i + 4 <= 4096; i += 4) {
-				if (q[i] == want[0] && q[i + 1] == want[1] && q[i + 2] == want[2] && q[i + 3] == want[3]) {
-					if (!hits) {
-						first = off + i;
-					}
-					hits++;
-				}
-			}
-			if (off == 0) {
-				printf("adreno: %u: past the cache, page 0 starts %02x %02x %02x %02x\n", step,
-				    q[0], q[1], q[2], q[3]);
-			}
-			ml_io_unmap(va);
-			pages++;
-		}
-		printf("adreno: %u: past the cache the colour is there %u times over %u pages, first at %#x\n",
-		    step, hits, pages, first);
-	}
 	pixel = (const volatile uint8_t *)core_target.memory;
 	{
 		/* Did the pixels land anywhere at all, just not where we look? Any offset of our blue. */
