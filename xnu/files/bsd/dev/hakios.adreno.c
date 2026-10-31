@@ -2615,6 +2615,10 @@ step_core_power(void)
 #define CORE_STREAM             0
 #define CORE_MATCH              0
 #define PTE_CORE                (PTE_GMU | PTE_UNPRIVILEGED)
+/* adreno_uncached=1: map the core's memory as "device" (MAIR attribute 2) instead of cached, so what the
+ * GPU writes is in memory at once and no line of it can stay behind in a cache this processor cannot see. */
+static uint32_t core_uncached;
+#define CORE_ATTRIBUTES         (core_uncached ? (PTE_CORE & ~PTE_CACHED) | (2ull << 2) : PTE_CORE)
 #define PTE_READ_ONLY           (1ull << 7)     /* Linux gives the core its microcode so (MSM_BO_GPU_READONLY) */
 #define CORE_RING_ADDRESS       0x01000000u
 #define CORE_RING_SIZE          0x8000u         /* Linux's; 8192 words */
@@ -3195,7 +3199,9 @@ step_core_commands(void)
 #define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24) /* one colour; all channels; 8-bit */
 #define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)        /* rows of pixels, blue first in memory */
 #define EVENT_FLUSH_COLOR       0x1d
-#define EVENT_CCU_CLEAN_DEPTH   0x1c            /* PC_CCU_FLUSH_DEPTH_TS */
+#define EVENT_INVALIDATE_DEPTH  0x18            /* PC_CCU_INVALIDATE_DEPTH */
+#define EVENT_INVALIDATE_COLOR  0x19            /* PC_CCU_INVALIDATE_COLOR */
+#define EVENT_CCU_CLEAN_DEPTH   0x20            /* CCU_CLEAN_DEPTH (0x1c is FLUSH_DEPTH) */
 #define EVENT_WRITE_TIMESTAMP   (1u << 30)
 #define TARGET_WIDTH            1080
 #define TARGET_HEIGHT           2400
@@ -3247,17 +3253,25 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	}
 	ring_register(RB_2D_BLIT_CNTL, BLIT_SOLID_8888 & ~(by_copy ? 1u << 7 : 0u));
 	ring_register(GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888 & ~(by_copy ? 1u << 7 : 0u));
-	ring_register(SP_2D_DST_FORMAT, 1 | (FORMAT_8888 << 3) | (0xfu << 12));   /* bit 0: as the frame that works on the other phone */
+	ring_register(SP_2D_DST_FORMAT, (FORMAT_8888 << 3) | (0xfu << 12));     /* as Mesa's blitter: no bit 0 */
 	ring_register(RB_2D_PIXEL_CNTL, 0);
 
 	uint32_t dst = bad_dst ? 0x20000000u : CORE_TARGET_ADDRESS;
+	/* Do not put PC_CCU_INVALIDATE_COLOR (0x19) here: as a CP_EVENT_WRITE payload it stops the command
+	 * processor dead (ring at 288 of 374, status 0x800005) whether it comes before or after the
+	 * destination registers, though Mesa's own stream carries it. So it needs the form Mesa uses, which
+	 * this port does not emit yet. */
 	uint32_t dst_info[4] = {
 		DST_BGRA_LINEAR,
 		(uint32_t)(dst & 0xffffffff),
 		(uint32_t)(dst >> 32),
-		TARGET_ROW >> 6
+		(TARGET_ROW + 63) >> 6                            /* Mesa writes 68 for 4352: rounded up */
 	};
 	ring_registers(RB_2D_DST_INFO, 4, dst_info);
+	/* Mesa sets the destination's flags group before every blit; left at its power-on value it may say the
+	 * surface is already cleared, and the engine then writes no pixels at all. */
+	uint32_t no_flags[6] = { 0, 0, 0, 0, 0, 0 };
+	ring_registers(0x8c20, 6, no_flags);
 
 	/*
 	 * In a render pass the pixels are written to "the render target", which is RB_MRT[0], not
@@ -3339,14 +3353,14 @@ step_frame(void)
 	/* Before the frame: is the core at rest? HLSQ_BUSY (bit 21) or PC_DCALL_BUSY (bit 12) still set here
 	 * would mean the steps before this one left work unfinished, and the 2D blit then queues behind it. */
 	printf("adreno: 22: before the frame: status %#x, status3 %#x\n", rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_STATUS3));
-	if (!block_new(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, PTE_CORE)) {
+	if (!block_new(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, CORE_ATTRIBUTES)) {
 		return false;
 	}
 	PE_parse_boot_argn("adreno_copy", &copy_mode, sizeof(copy_mode));
 	if (copy_mode) {
 		/* Through the same commit as the picture: a block added after the SMMU tables are written
 		 * out has no translation, and the 2D engine's read of it is refused. */
-		if (!block_new(&core_space, &core_src, COPY_SRC_ADDRESS, TARGET_ROW * 16, PTE_CORE)) {
+		if (!block_new(&core_space, &core_src, COPY_SRC_ADDRESS, TARGET_ROW * 16, CORE_ATTRIBUTES)) {
 			return false;
 		}
 		for (uint32_t i = 0; i < 16; i++) {
@@ -3783,8 +3797,6 @@ hakios_adreno_quiesce(void)
 #define CP_REG_TO_MEM           0x3e
 #define CP_SCRATCH_REG2         0x0885
 #define CP_INDIRECT_BUFFER      0x3f
-#define EVENT_INVALIDATE_DEPTH  0x18
-#define EVENT_INVALIDATE_COLOR  0x19
 
 static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
@@ -3943,7 +3955,7 @@ hakios_gpu_address_free(uint64_t address, uint64_t size)
 bool
 hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
 {
-	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
+	return space_map(&core_space, address, phys, CORE_ATTRIBUTES | (read_only ? PTE_READ_ONLY : 0));
 }
 
 void
@@ -4052,10 +4064,106 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
 }
 
 /*
+ * Names for the packets Mesa's a6xx driver emits. Printed next to each packet in a hang so that the
+ * instruction the core stopped on can be read off the screen instead of by hand-decoding hex.
+ */
+static const struct {
+	uint8_t op;
+	const char *name;
+} pm4_names[] = {
+	{ 0x43, "CP_SET_DRAW_STATE" }, { 0x65, "CP_SET_MARKER" }, { 0x3f, "CP_INDIRECT_BUFFER_PFE" },
+	{ 0x37, "CP_INDIRECT_BUFFER_PFD" }, { 0x3d, "CP_MEM_WRITE" }, { 0x3e, "CP_REG_TO_MEM" },
+	{ 0x26, "CP_WAIT_FOR_IDLE" }, { 0x2c, "CP_BLIT" }, { 0x46, "CP_EVENT_WRITE7" },
+	{ 0x3c, "CP_WAIT_REG_MEM" }, { 0x14, "CP_WAIT_TIMESTAMP" }, { 0x44, "CP_COND_EXEC" },
+	{ 0x45, "CP_COND_WRITE5" }, { 0x21, "CP_REG_RMW" }, { 0x38, "CP_DRAW_INDX_OFFSET" },
+	{ 0x36, "CP_LOAD_STATE6" }, { 0x32, "CP_LOAD_STATE6_GEOM" }, { 0x34, "CP_LOAD_STATE6_FRAG" },
+	{ 0x1d, "CP_SKIP_IB2_ENABLE_GLOBAL" }, { 0x23, "CP_SKIP_IB2_ENABLE_LOCAL" },
+	{ 0x2f, "CP_SET_BIN_DATA5" }, { 0x33, "CP_EXEC_CS" }, { 0x3b, "CP_INVALIDATE_STATE" },
+	{ 0x64, "CP_SET_VISIBILITY_OVERRIDE" }, { 0x5c, "CP_CONTEXT_REG_BUNCH" },
+	{ 0x35, "CP_SET_SUBDRAW_SIZE" },
+};
+
+static void
+pm4_name(uint32_t h, char *out, size_t size)
+{
+	if ((h & 0xf0000000) == 0x70000000 && (h & 0x0f000000) == 0) {
+		uint32_t op = (h >> 16) & 0x7f;
+
+		snprintf(out, size, "?%#x", op);
+		for (unsigned k = 0; k < sizeof(pm4_names) / sizeof(pm4_names[0]); k++) {
+			if (pm4_names[k].op == op) {
+				snprintf(out, size, "%s", pm4_names[k].name);
+			}
+		}
+	} else if ((h & 0xf0000000) == 0x40000000) {
+		snprintf(out, size, "REGWRITE reg %#x", ((h >> 8) & 0x7ffff) << 2);
+	} else if ((h & 0xc0000000) == 0xc0000000) {
+		snprintf(out, size, "T3 op %#x", (h >> 8) & 0xff);
+	} else {
+		snprintf(out, size, "type0 reg %#x", (h & 0x7fff) << 2);
+	}
+}
+
+/*
+ * The packet the core stopped inside, and the ones just before it: a stream is only readable from its
+ * start (each packet says its own length), so the walk always begins at word zero. A "draw" is a long
+ * packet whose payload is a pile of register values, so the useful answer is not a word but a packet.
+ */
+static void
+pm4_nearby(const uint8_t *buffer, uint32_t total, uint32_t at)
+{
+	const uint32_t *w = (const uint32_t *)buffer;
+	uint32_t recent_at[10], recent_hdr[10], recent_n = 0, i = 0;
+
+	while (i < total) {
+		uint32_t h = w[i], step;
+
+		if ((h & 0xf0000000) == 0x70000000 && (h & 0x0f000000) == 0) {
+			step = 1 + ((h & 0x3fff) + 1);
+		} else if ((h & 0xf0000000) == 0x40000000) {
+			step = 1 + (h & 0x7f);
+		} else if ((h & 0xc0000000) == 0xc0000000) {
+			step = 1 + (((h >> 16) & 0x3fff) + 1);
+		} else if ((h & 0xc0000000) == 0) {
+			step = 1 + (((h >> 16) & 0x3fff) + 1);
+		} else {
+			printf("adreno: gpu: word %u is not a packet (%08x)\n", i, h);
+			return;
+		}
+		if (i + step > at) {
+			/* this is the one it is in */
+			char name[40];
+
+			pm4_name(h, name, sizeof(name));
+			printf("adreno: gpu: it is inside the packet at %u, %s, %u words long; from its payload:\n",
+			    i, name, step - 1);
+			for (uint32_t k = i + 1; k < i + step && k < i + 9; k++) {
+				printf("adreno: gpu: %c%4u %08x\n", k == at ? '>' : ' ', k, w[k]);
+			}
+			for (uint32_t k = 0; k < recent_n; k++) {
+				pm4_name(recent_hdr[k], name, sizeof(name));
+				printf("adreno: gpu: before: %4u %s %08x\n", recent_at[k], name, w[recent_at[k] + 1]);
+			}
+			return;
+		}
+		if (recent_n == 10) {
+			memmove(recent_at, recent_at + 1, sizeof(recent_at) - sizeof(recent_at[0]));
+			memmove(recent_hdr, recent_hdr + 1, sizeof(recent_hdr) - sizeof(recent_hdr[0]));
+			recent_n--;
+		}
+		recent_at[recent_n] = i;
+		recent_hdr[recent_n] = h;
+		recent_n++;
+		i += step;
+	}
+}
+
+/*
  * The command buffers of the last submission, as the kernel can see them: where each one is in memory,
  * its address, and its length in words. Kept so that a submission that does not come back can be read
  * at the word it stopped on (see hakios_gpu_report): a hang is a fact about one instruction.
  */
+static void ib_show_packets(const uint8_t *buffer, uint32_t words, const char *which);
 #define HAKIOS_GPU_IBS 128               /* (GPU_SUBMIT_CMDS of the service) */
 uint8_t *hakios_gpu_ib_kernel[HAKIOS_GPU_IBS];
 uint64_t hakios_gpu_ib_address[HAKIOS_GPU_IBS];
@@ -4071,6 +4179,11 @@ uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
 	hakios_gpu_ib_count = count < HAKIOS_GPU_IBS ? count : HAKIOS_GPU_IBS;
+	for (uint32_t i = 0; i < hakios_gpu_ib_count; i++) {
+		if (hakios_gpu_ib_kernel[i] != NULL) {
+			ib_show_packets(hakios_gpu_ib_kernel[i], words[i], i == 0 ? "first" : "next");
+		}
+	}
 	for (uint32_t i = 0; i < hakios_gpu_ib_count; i++) {
 		hakios_gpu_ib_address[i] = addresses[i];
 		hakios_gpu_ib_words[i] = words[i];
@@ -4118,6 +4231,46 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 }
 
 /* A submission does not come back: what the 3D core and its SMMU context say. */
+/*
+ * Mesa's own version of the packets this driver has been writing by hand: the first blit and the first
+ * draw in each submission, with the words just before them. The registers it sets are the answer to
+ * "what is missing here", without guessing from a specification.
+ */
+static void
+ib_show_packets(const uint8_t *buffer, uint32_t words, const char *which)
+{
+	const uint32_t *w = (const uint32_t *)buffer;
+	bool shown_blit = false, shown_draw = false;
+
+	for (uint32_t i = 0; i + 1 < words; i++) {
+		uint32_t h = w[i];
+		bool blit, draw;
+
+		if ((h & 0xf0000000) != 0x70000000) {
+			continue;
+		}
+		blit = ((h >> 16) & 0x7f) == 0x2c;
+		draw = ((h >> 16) & 0x7f) == 0x38;
+		if ((!blit || shown_blit) && (!draw || shown_draw)) {
+			continue;
+		}
+		if (blit) {
+			shown_blit = true;
+		} else {
+			shown_draw = true;
+		}
+		printf("adreno: gpu: %s: %s at %u, before it:\n", which, blit ? "CP_BLIT" : "CP_DRAW_INDX_OFFSET", i);
+		for (int32_t k = (int32_t)i - 44; k < (int32_t)i + 4; k++) {
+			if (k >= 0 && (uint32_t)k < words) {
+				printf("adreno: gpu:   %c%u %08x\n", k == (int32_t)i ? '>' : ' ', k, w[k]);
+			}
+		}
+		if (shown_blit && shown_draw) {
+			return;
+		}
+	}
+}
+
 void
 hakios_gpu_report(const char *why)
 {
@@ -4141,13 +4294,55 @@ hakios_gpu_report(const char *why)
 		    total - left, total, left, hakios_gpu_ib_kernel[0] != NULL ? "readable" : "NOT handed over");
 		if (hakios_gpu_ib_kernel[0] != NULL && total <= hakios_gpu_ib_words[0]) {
 			uint32_t at = total - left;
-			const uint32_t *w = (const uint32_t *)hakios_gpu_ib_kernel[0];
 
-			for (int i = -8; i < 24; i++) {
-				int32_t k = (int32_t)at + i;
+			{
+				const uint32_t *w = (const uint32_t *)hakios_gpu_ib_kernel[0];
 
-				if (k >= 0 && (uint32_t)k < total) {
-					printf("adreno: gpu: %c%u %08x\n", i == 0 ? '>' : ' ', k, w[k]);
+				printf("adreno: gpu: raw from the start:\n");
+				for (uint32_t k = 0; k < 32 && k < total; k++) {
+					printf("adreno: gpu: %4u %08x\n", k, w[k]);
+				}
+				printf("adreno: gpu: raw around %u:\n", at);
+				for (int32_t k = (int32_t)at - 40; k < (int32_t)at + 8; k++) {
+					if (k >= 0 && (uint32_t)k < total) {
+						printf("adreno: gpu: %c%4d %08x\n", k == (int32_t)at ? '>' : ' ', k, w[k]);
+					}
+				}
+			}
+		}
+	}
+	/*
+	 * The second command buffer the core stopped following: what the tables say for it, and what it
+	 * holds. A hang on an indirect buffer is either "no translation" or "the instructions in it", and
+	 * these two lines tell which.
+	 */
+	{
+		uint64_t ttbr = (uint64_t)rd(smmu.base + smmu_context(&core_space) + SMMU_CB_TTBR0 + 4) << 32 |
+		    rd(smmu.base + smmu_context(&core_space) + SMMU_CB_TTBR0);
+		uint64_t address = (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE);
+		uint64_t level = ttbr & PTE_ADDRESS, phys = 0;
+
+		for (int depth = 0; depth < 3 && level != 0; depth++) {
+			uint64_t *table = (uint64_t *)ml_io_map(level & PTE_ADDRESS, 4096);
+			uint64_t entry;
+
+			if (table == NULL) {
+				break;
+			}
+			entry = table[address >> (30 - depth * 9) & 0x1ff];
+			level = entry;
+			if (depth == 2) {
+				phys = entry & 1 ? (entry & PTE_ADDRESS) | (address & 0xfff) : 0;
+			}
+		}
+		printf("adreno: gpu:   %#llx is at %#llx%s\n", address, phys, phys ? "" : " (NO ENTRY)");
+		if (phys != 0) {
+			const uint32_t *w = (const uint32_t *)ml_io_map(phys & ~0xfffull, 4096);
+			uint32_t at_word = (uint32_t)(phys & 0xfff) >> 2;
+
+			if (w != NULL) {
+				for (uint32_t k = 0; k < 40; k++) {
+					printf("adreno: gpu:   ib2 %2u %08x\n", k, w[at_word + k]);
 				}
 			}
 		}
