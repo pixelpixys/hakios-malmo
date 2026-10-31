@@ -3634,10 +3634,18 @@ step_frame(void)
 		{ 0x0e17, 0x00000004 },         /* UCHE_CACHE_WAYS */
 		{ 0x0e18, 0x00000804 },         /* UCHE_CLIENT_PF */
 	};
+	/* Some of these are special registers and are dropped silently unless protected mode is off -
+	 * CP_CHICKEN_DBG read back as 0x1 after 0x1000000 was written, UCHE_GBIF_GX_CONFIG as 0x10200e1
+	 * after 0xf9. Linux turns it off around such writes. */
 	for (unsigned i = 0; i < sizeof(vendor) / sizeof(vendor[0]); i++) {
-		ring_register(vendor[i].reg, vendor[i].value);
+		put(&gpu, "vendor power-up", GPU_WORD(vendor[i].reg), vendor[i].value);
 	}
-	ring_command(CP_WAIT_FOR_IDLE, 0);
+	/* Written straight from here, not through the ring: the vendor's own user-mode library refuses
+	 * these ("User mode driver cannot write to RBBM registers"), and through the ring they read back
+	 * unchanged, so the command processor drops them. */
+	printf("adreno: %u: read back: apriv %#x, chicken %#x, uche_gx %#x, rb_buf %#x\n", step,
+	    rd(gpu.base + GPU_WORD(0x0534)), rd(gpu.base + GPU_WORD(0x0841)),
+	    rd(gpu.base + GPU_WORD(0x0e3a)), rd(gpu.base + GPU_WORD(0x08c3)));
 	/* Access protection: Linux writes CP_PROTECT_CNTL and a whole CP_PROTECT table; this port has
 	 * never touched either, so whatever the bootloader left is in force. A protected register is
 	 * dropped silently, with no fault and no status, which is exactly what the blit looks like. */
