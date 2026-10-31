@@ -3645,11 +3645,22 @@ step_frame(void)
 	/* Written straight from here, not through the ring: the vendor's own user-mode library refuses
 	 * these ("User mode driver cannot write to RBBM registers"), and through the ring they read back
 	 * unchanged, so the command processor drops them. */
-	printf("adreno: %u: 2D read direct: ccu %#x clk %#x, blit %#x dst_info %#x dst %#x pitch %#x, tl %#x br %#x, sp_fmt %#x\n", step,
+	/* Does the ring write this block at all? A value nobody would confuse with anything. */
+	ring_register(0x8e04, 0xdeadbeef);
+	ring_command(CP_WAIT_FOR_IDLE, 0);
+	ring_send();
+	for (int i = 0; i < 200 && (rd(gpu.base + CP_RB_RPTR) != ring_at); i++) {
+		sleep_us(100);
+	}
+	printf("adreno: %u: ring wrote 0xdeadbeef to RB_DBG_ECO_CNTL, it reads %#x\n", step,
+	    rd(gpu.base + GPU_WORD(0x8e04)));
+	printf("adreno: %u: after the frame: ccu %#x clk %#x blit %#x dstinfo %#x dst %#x tl %#x spfmt %#x "
+	    "mrt0 %#x vfd %#x gras %#x rb %#x\n", step,
 	    rd(gpu.base + GPU_WORD(0x8e07)), rd(gpu.base + RBBM_CLOCK_CNTL),
 	    rd(gpu.base + GPU_WORD(0x8c00)), rd(gpu.base + GPU_WORD(0x8c17)), rd(gpu.base + GPU_WORD(0x8c18)),
-	    rd(gpu.base + GPU_WORD(0x8c1a)), rd(gpu.base + GPU_WORD(0x8405)), rd(gpu.base + GPU_WORD(0x8406)),
-	    rd(gpu.base + GPU_WORD(0xacc0)));
+	    rd(gpu.base + GPU_WORD(0x8405)), rd(gpu.base + GPU_WORD(0xacc0)),
+	    rd(gpu.base + GPU_WORD(0x8822)), rd(gpu.base + GPU_WORD(0xa007)),
+	    rd(gpu.base + GPU_WORD(0x8400)), rd(gpu.base + GPU_WORD(0x8e04)));
 	printf("adreno: %u: read back: apriv %#x, chicken %#x, uche_gx %#x, rb_buf %#x\n", step,
 	    rd(gpu.base + GPU_WORD(0x0534)), rd(gpu.base + GPU_WORD(0x0841)),
 	    rd(gpu.base + GPU_WORD(0x0e3a)), rd(gpu.base + GPU_WORD(0x08c3)));
