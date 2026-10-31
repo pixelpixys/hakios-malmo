@@ -3611,8 +3611,10 @@ step_frame(void)
 	ring_register(0x00ae, 0x8aa8aa82);              /* RBBM_CLOCK_CNTL */
 	ring_command(CP_WAIT_FOR_IDLE, 0);
 	/* Read them the plain way instead: CP_REG_TO_MEM answered nonsense for these two. */
-	printf("adreno: %u: clock cntl %#x (told 0x8aa8aa82), rbbm status %#x\n", step,
-	    rd(gpu.base + RBBM_CLOCK_CNTL), rd(gpu.base + RBBM_STATUS));
+	printf("adreno: %u: clock cntl %#x (told 0x8aa8aa82), rbbm status %#x, gbif halt %#x, gpr0 %#x, "
+	    "sw reset %#x, status3 %#x\n", step, rd(gpu.base + RBBM_CLOCK_CNTL), rd(gpu.base + RBBM_STATUS),
+	    rd(gpu.base + GPU_WORD(0x0016)), rd(gpu.base + GPU_WORD(0x0018)),
+	    rd(gpu.base + GPU_WORD(0x0043)), rd(gpu.base + RBBM_STATUS3));
 	ring_mark(2, 0x11110002);
 	/* Mesa opens fd6_emit_restore with CP_SET_MODE 0, before any state: it decides which
 	 * CP_SET_DRAW_STATE groups run and whether RB-directed work is handed on. */
@@ -3653,9 +3655,16 @@ step_frame(void)
 		ring(0xffffffff);
 		ring(0);
 		ring(0);
+		/* The select registers are special: Linux turns protected mode off before writing them
+		 * (CP_SET_PROTECTED_MODE), otherwise the write is dropped and the counter stays unselected -
+		 * which reads as a clean zero and says nothing. */
+		ring_command(CP_SET_PROTECTED_MODE, 1);
+		ring(0);
 		for (uint32_t i = 0; i < 8; i++) {
 			ring_register(0x8e10 + i, events[i]);
 		}
+		ring_command(CP_SET_PROTECTED_MODE, 1);
+		ring(1);
 		ring_register(0x0500, 0x00000001);              /* RBBM_PERFCTR_CNTL: count */
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 		/* The whole block: each counter is two registers (select and value), so read both halves of
