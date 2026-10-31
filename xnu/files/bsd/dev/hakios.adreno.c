@@ -3211,6 +3211,16 @@ step_core_commands(void)
 #define FORMAT_8888             0x30
 #define BLIT_SOLID_8888         (1u << 7 | FORMAT_8888 << 8 | 0xfu << 20 | 0x10u << 24) /* one colour; all channels; 8-bit */
 #define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)        /* rows of pixels, blue first in memory */
+/* The GMEM resolve: RB writes the tile it holds out to the address it is given. Mesa's emit_blit
+ * (fd6_gmem.cc) sets these up and then sends the BLIT event, not the CP_BLIT packet. */
+#define RB_BLIT_GMEM_MSAA_CNTL  0x88d5
+#define RB_BLIT_BASE_GMEM       0x88d6
+#define RB_BLIT_DST_INFO        0x88d7
+#define RB_BLIT_DST             0x88d8
+#define RB_BLIT_DST_PITCH       0x88da
+#define RB_BLIT_INFO            0x88e3
+#define CP_SET_MODE             0x63            /* which CP_SET_DRAW_STATE groups run (Mesa sends 0) */
+#define EVENT_BLIT              0x1e            /* (FLD_BLIT: RB reads GMEM, writes memory) */
 #define EVENT_FLUSH_COLOR       0x1d
 #define EVENT_INVALIDATE_DEPTH  0x18            /* PC_CCU_INVALIDATE_DEPTH */
 #define EVENT_INVALIDATE_COLOR  0x19            /* PC_CCU_INVALIDATE_COLOR */
@@ -3226,6 +3236,7 @@ static uint32_t blit_wfi, blit_inv;             /* off: tried (adreno_wfi=1 adre
 static uint32_t bad_dst;                        /* adreno_bad=1: point the fill at memory the core cannot reach */
 static uint32_t blit5;                          /* adreno_blit5=1: give the blit packet its own rectangles */
 static uint32_t copy_mode;                      /* adreno_copy=1: draw the first band by copying, not filling */
+static uint32_t resolve_mode;                   /* adreno_resolve=1: take the picture out of GMEM instead of filling */
 static struct gpu_block core_src;
 
 static void
@@ -3320,6 +3331,32 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	 * It is a context register, so the copy written by the processor at step 20 may not be the one the
 	 * core is using by now. */
 	ring_register(RB_DBG_ECO_CNTL, 0x04100000);
+	if (resolve_mode) {
+		/*
+		 * The GMEM resolve, as Mesa does it in emit_blit (fd6_gmem.cc): describe the tile in GMEM, the
+		 * place in memory it goes to, then send the BLIT event. RB does the copy itself, so this does
+		 * not go through the 2D engine at all. The binning pass ends this way, and so does every render
+		 * to a GMEM target: without it the draw runs into on-chip memory and memory never sees it.
+		 */
+		uint32_t tile[1] = { 0 };
+
+		ring_register(RB_BLIT_GMEM_MSAA_CNTL, 0);
+		ring_register(RB_BLIT_BASE_GMEM, tile[0]);              /* where the tile is in GMEM */
+		/* RB_BLIT_DST_INFO: tile mode 0..1 (linear), samples 3..4, swap 5..6, format 7..14. Not the
+		 * layout of RB_2D_DST_INFO, which puts the format at 0..7. */
+		ring_register(RB_BLIT_DST_INFO, FORMAT_8888 << 7 | 1u << 5);
+		ring_register(RB_BLIT_DST, (uint32_t)dst);
+		ring_register(RB_BLIT_DST + 1, (uint32_t)(dst >> 32));
+		ring_register(RB_BLIT_DST_PITCH, (TARGET_ROW + 63) >> 6);
+		/* RB_BLIT_INFO: TYPE 0..1, where BLIT_EVENT_STORE (write the tile out) is 0. */
+		ring_register(RB_BLIT_INFO, 0u);
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+		ring_command(CP_EVENT_WRITE, 1);
+		ring(EVENT_BLIT);
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+		ring_mark(12 + idx * 4 + 3, 0x2004 | (idx << 8));
+		return;
+	}
 	if (blit5) {
 		ring_command(CP_BLIT, 5);
 		ring(0);                        /* BLIT_OP_FILL: the solid colour, no source */
@@ -3370,6 +3407,7 @@ step_frame(void)
 		return false;
 	}
 	PE_parse_boot_argn("adreno_copy", &copy_mode, sizeof(copy_mode));
+	PE_parse_boot_argn("adreno_resolve", &resolve_mode, sizeof(resolve_mode));
 	if (copy_mode) {
 		/* Through the same commit as the picture: a block added after the SMMU tables are written
 		 * out has no translation, and the 2D engine's read of it is refused. */
@@ -4434,6 +4472,10 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 		gpu_fence = 1;
 	}
 	ring_time(gpu_fence, 0);
+	/* Mesa's fd6_emit_restore opens with CP_SET_MODE 0: it decides which CP_SET_DRAW_STATE groups
+	 * execute, and the binning pass hands its state over in exactly those groups. */
+	ring_command(CP_SET_MODE, 1);
+	ring(0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
 	/* PC_CCU_INVALIDATE_COLOR (0x19) is deliberately not sent here: as this payload it stops the command
