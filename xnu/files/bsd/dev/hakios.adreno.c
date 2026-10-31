@@ -3612,11 +3612,28 @@ step_frame(void)
 	 */
 	if (perf_mode) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);
+		/* Each counter must be told which event to count (RB_PERFCTR_RB_SEL, 0x8e10); left alone they
+		 * all count the same default, which is why they moved together and said nothing. */
+		static const uint32_t events[8] = {
+			28,     /* PERF_RB_2D_VALID_PIXELS */
+			23,     /* PERF_RB_2D_ALIVE_CYCLES */
+			40,     /* PERF_RB_2D_OUTPUT_RB_DST_TRANS */
+			39,     /* PERF_RB_2D_INPUT_TRANS */
+			0,      /* PERF_RB_BUSY_CYCLES */
+			25,     /* PERF_RB_2D_STARVE_CYCLES_SRC */
+			27,     /* PERF_RB_2D_STARVE_CYCLES_DST */
+			24,     /* PERF_RB_2D_STALL_CYCLES_A2D */
+		};
+		for (uint32_t i = 0; i < 8; i++) {
+			ring_register(0x8e10 + i, events[i]);
+		}
 		ring_register(0x0500, 0x00000001);              /* RBBM_PERFCTR_CNTL: count */
 		ring_command(CP_WAIT_FOR_IDLE, 0);
-		for (uint32_t i = 0; i < 8; i++) {
+		/* The whole block: each counter is two registers (select and value), so read both halves of
+		 * all eight rather than guessing which one holds the number. */
+		for (uint32_t i = 0; i < 16; i++) {
 			ring_command(CP_REG_TO_MEM, 3);
-			ring(0x04d6 + 2 * i | 1u << 18 | 1u << 30);  /* one counter, 32-bit */
+			ring(0x04d6 + i | 1u << 18 | 1u << 30);
 			ring(CORE_SCRATCH_ADDRESS + 320 + 4 * i);
 			ring(0);
 		}
@@ -3624,22 +3641,22 @@ step_frame(void)
 		 * are simply not counting and this says nothing about the renderer. */
 		ring_command(CP_REG_TO_MEM, 3);
 		ring(0x0400 | 1u << 18 | 1u << 30);
-		ring(CORE_SCRATCH_ADDRESS + 384);
+		ring(CORE_SCRATCH_ADDRESS + 496);
 		ring(0);
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
 	ring_fill(0, 800, 255, 128, 0, 0);         /* orange */
 	if (perf_mode) {
 		ring_command(CP_WAIT_FOR_IDLE, 0);
-		for (uint32_t i = 0; i < 8; i++) {
+		for (uint32_t i = 0; i < 16; i++) {
 			ring_command(CP_REG_TO_MEM, 3);
-			ring(0x04d6 + 2 * i | 1u << 18 | 1u << 30);
-			ring(CORE_SCRATCH_ADDRESS + 352 + 4 * i);
+			ring(0x04d6 + i | 1u << 18 | 1u << 30);
+			ring(CORE_SCRATCH_ADDRESS + 432 + 4 * i);
 			ring(0);
 		}
 		ring_command(CP_REG_TO_MEM, 3);
 		ring(0x0400 | 1u << 18 | 1u << 30);
-		ring(CORE_SCRATCH_ADDRESS + 388);
+		ring(CORE_SCRATCH_ADDRESS + 500);
 		ring(0);
 		ring_command(CP_WAIT_FOR_IDLE, 0);
 	}
@@ -3685,7 +3702,7 @@ step_frame(void)
 	if (!got_them_all) {
 		printf("adreno: %u: the core did not finish the frame; the picture is read as it stands\n", step);
 	}
-	to_memory(core_scratch.memory, 256);
+	to_memory(core_scratch.memory, 1024);
 	printf("adreno: %u: the words it writes when its caches are in memory: %#x, %#x, %#x (told: 0x11223344, 0xc0c0c0c, 0xd0e0d0e)\n", step,
 	    ((volatile uint32_t *)core_scratch.memory)[12], ((volatile uint32_t *)core_scratch.memory)[8], ((volatile uint32_t *)core_scratch.memory)[4]);
 	volatile uint32_t *sc = (volatile uint32_t *)core_scratch.memory;
@@ -3697,11 +3714,13 @@ step_frame(void)
 	    step, sc[16], sc[17], sc[18], sc[19], sc[20], sc[21], sc[22], sc[23]);
 	if (perf_mode) {
 		const volatile uint32_t *pf = (const volatile uint32_t *)core_scratch.memory;
-		printf("adreno: %u: RB counters before the blit: %u %u %u %u %u %u %u %u\n", step,
-		    pf[80], pf[81], pf[82], pf[83], pf[84], pf[85], pf[86], pf[87]);
-		printf("adreno: %u: RB counters after the blit:  %u %u %u %u %u %u %u %u\n", step,
+		printf("adreno: %u: RB block before: %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\n", step,
+		    pf[80], pf[81], pf[82], pf[83], pf[84], pf[85], pf[86], pf[87],
 		    pf[88], pf[89], pf[90], pf[91], pf[92], pf[93], pf[94], pf[95]);
-		printf("adreno: %u: the command processor's counter, before %u after %u\n", step, pf[96], pf[97]);
+		printf("adreno: %u: RB block after:  %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u\n", step,
+		    pf[108], pf[109], pf[110], pf[111], pf[112], pf[113], pf[114], pf[115],
+		    pf[116], pf[117], pf[118], pf[119], pf[120], pf[121], pf[122], pf[123]);
+		printf("adreno: %u: the command processor's counter, before %u after %u\n", step, pf[124], pf[125]);
 	}
 	printf("adreno: %u: markers sc[24..31]: %#x %#x %#x %#x %#x %#x %#x %#x\n",
 	    step, sc[24], sc[25], sc[26], sc[27], sc[28], sc[29], sc[30], sc[31]);
