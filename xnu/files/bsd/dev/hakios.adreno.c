@@ -3626,8 +3626,12 @@ step_frame(void)
 	ring(0);
 	ring(0x11223344);
 	ring_mark(28, 0x4002);
-	if (!ring_run("fill a picture")) {
-		return false;
+	bool got_them_all = ring_run("fill a picture");
+	/* The picture is read whether or not the core got through: two of the three bands' blits are in
+	 * the ring before the point where it stops, so "did the 2D engine write anything" is answerable
+	 * even then. */
+	if (!got_them_all) {
+		printf("adreno: %u: the core did not finish the frame; the picture is read as it stands\n", step);
 	}
 	to_memory(core_scratch.memory, 256);
 	printf("adreno: %u: the words it writes when its caches are in memory: %#x, %#x, %#x (told: 0x11223344, 0xc0c0c0c, 0xd0e0d0e)\n", step,
