@@ -103,6 +103,8 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern void ml_io_unmap(vm_offset_t va);
+static void pm4_nearby(const uint8_t *buffer, uint32_t total, uint32_t at);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
@@ -2806,6 +2808,22 @@ ring_run(const char *what)
 		to_memory(core_target.memory, 64);
 	}
 	uint32_t px0 = core_target.memory ? *(volatile uint32_t *)core_target.memory : 0;
+	/* Which packet the processor stopped on: decoded from the ring itself, so a hang names its cause. */
+	if (taken != ring_at) {
+		to_memory(core_ring.memory, 4 * RING_WORDS);
+		/* The ring holds this one frame from word 0 (each run starts it over), so decode it whole and
+		 * name the packet the read pointer is inside. */
+		{
+			const uint32_t *rw = (const uint32_t *)core_ring.memory;
+			for (uint32_t k = 0; k < 12 && k < taken; k++) {
+				printf("adreno: gpu: ring %u %08x\n", k, rw[k]);
+			}
+			for (uint32_t k = (taken > 6 ? taken - 6 : 0); k < taken; k++) {
+				printf("adreno: gpu: near %u %08x\n", k, rw[k]);
+			}
+		}
+		pm4_nearby((const uint8_t *)core_ring.memory, taken, taken);
+	}
 	printf("adreno: %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
 	    "command processor: fault %#x, interrupts %#x (sqe: %#x %#x %#x %#x), protection %#x, px0 %#x\n",
 	    step, taken, ring_at, status,
@@ -3514,6 +3532,38 @@ step_frame(void)
 	printf("adreno: %u: colour %#x %#x %#x %#x, sp fmt %#x, ccu %#x\n",
 	    step, sc[42], sc[43], sc[44], sc[45], sc[46], sc[47]);
 	to_memory(core_target.memory, core_target.size);
+	/*
+	 * Past the CPU cache, one page at a time: if the engine wrote the picture and this processor is only
+	 * reading its own stale lines, the colour shows up here. Read page by page because the block is not
+	 * one piece of physical memory (mapping all 10 MB at once takes the kernel down).
+	 */
+	{
+		const uint8_t want[4] = { 0x00, 0x80, 0xff, 0xff };
+		uint32_t hits = 0, first = 0, pages = 0;
+		for (uint32_t off = 0; off + 4 <= core_target.size; off += 4096) {
+			vm_offset_t va = ml_io_map_wcomb(kvtophys((vm_offset_t)core_target.memory + off), 4096);
+			if (va == 0) {
+				continue;
+			}
+			const volatile uint8_t *q = (const volatile uint8_t *)va;
+			for (uint32_t i = 0; i + 4 <= 4096; i += 4) {
+				if (q[i] == want[0] && q[i + 1] == want[1] && q[i + 2] == want[2] && q[i + 3] == want[3]) {
+					if (!hits) {
+						first = off + i;
+					}
+					hits++;
+				}
+			}
+			if (off == 0) {
+				printf("adreno: %u: past the cache, page 0 starts %02x %02x %02x %02x\n", step,
+				    q[0], q[1], q[2], q[3]);
+			}
+			ml_io_unmap(va);
+			pages++;
+		}
+		printf("adreno: %u: past the cache the colour is there %u times over %u pages, first at %#x\n",
+		    step, hits, pages, first);
+	}
 	pixel = (const volatile uint8_t *)core_target.memory;
 	{
 		/* Did the pixels land anywhere at all, just not where we look? Any offset of our blue. */
@@ -4164,6 +4214,7 @@ pm4_nearby(const uint8_t *buffer, uint32_t total, uint32_t at)
  * at the word it stopped on (see hakios_gpu_report): a hang is a fact about one instruction.
  */
 static void ib_show_packets(const uint8_t *buffer, uint32_t words, const char *which);
+static void pm4_nearby(const uint8_t *buffer, uint32_t total, uint32_t at);
 #define HAKIOS_GPU_IBS 128               /* (GPU_SUBMIT_CMDS of the service) */
 uint8_t *hakios_gpu_ib_kernel[HAKIOS_GPU_IBS];
 uint64_t hakios_gpu_ib_address[HAKIOS_GPU_IBS];
@@ -4208,8 +4259,9 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
 	ring(EVENT_INVALIDATE_DEPTH);
-	ring_command(CP_EVENT_WRITE, 1);
-	ring(EVENT_INVALIDATE_COLOR);
+	/* PC_CCU_INVALIDATE_COLOR (0x19) is deliberately not sent here: as this payload it stops the command
+	 * processor dead on this chip (ring at 288 of 368, status 0x800005), so every submission from Mesa
+	 * hung before its own commands ran, and the pixels were never written. */
 	for (uint32_t i = 0; i < count; i++) {
 		ring_command(CP_INDIRECT_BUFFER, 3);
 		ring((uint32_t)addresses[i]);
