@@ -3236,12 +3236,71 @@ static uint32_t blit_wfi, blit_inv;             /* off: tried (adreno_wfi=1 adre
 static uint32_t bad_dst;                        /* adreno_bad=1: point the fill at memory the core cannot reach */
 static uint32_t blit5;                          /* adreno_blit5=1: give the blit packet its own rectangles */
 static uint32_t copy_mode;                      /* adreno_copy=1: draw the first band by copying, not filling */
+static uint32_t static_regs_mode;               /* adreno_static=1: write Mesa's static registers first */
 static uint32_t resolve_mode;                   /* adreno_resolve=1: take the picture out of GMEM instead of filling */
 static struct gpu_block core_src;
+
+/*
+ * Mesa's fd6_emit_static_regs: the registers it writes once when the context is made, and which every
+ * submission then carries in its restore buffer (fd6_emit_restore emits that as an IB before drawing).
+ * This port has never written them, and the 2D engine runs on them.
+ */
+static void
+ring_static_regs(void)
+{
+	static const struct { uint32_t reg, value; } fixed[] = {
+		{ 0xa007, 0x00000000 },         /* VFD_MODE_CNTL(RENDERING_PASS) */
+		{ 0xb309, 0x000000a0 },         /* SP_TP_MODE_CNTL, isammode GL */
+		{ 0x9804, 0x00000000 },         /* PC_MODE_CNTL (magic) */
+		{ 0x80a0, 0x00000000 },         /* GRAS_SC_CNTL */
+		{ 0x8811, 0x00000010 },         /* RB_UNKNOWN_8811 */
+		{ 0xab00, 0x00000000 },         /* SP_MODE_CONTROL */
+		{ 0xae04, 0x00000000 },         /* SP_FLOAT_CNTL */
+		{ 0xab20, 0x00000000 },         /* SP_IBO_COUNT */
+		{ 0xa009, 0x00000002 },         /* VFD_ADD_OFFSET(VERTEX) */
+		{ 0x9306, 0x00000001 },         /* VPC_SO_DISABLE(true) */
+		{ 0x8109, 0x00000000 },         /* GRAS_SAMPLE_CNTL */
+		{ 0x8110, 0x00000002 },         /* GRAS_UNKNOWN_8110 */
+		{ 0x8818, 0x00000000 },         /* RB_UNKNOWN_8818 */
+		{ 0x88f0, 0x00000000 },         /* RB_UNKNOWN_88F0 */
+		{ 0x9107, 0x00000000 },         /* VPC_UNKNOWN_9107 */
+		{ 0x9b07, 0x00000000 },         /* PC_MULTIVIEW_CNTL */
+		{ 0xa008, 0x00000000 },         /* VFD_MULTIVIEW_CNTL */
+		{ 0x9305, 0x00000000 },         /* VPC_SO_STREAM_CNTL */
+		{ 0x9300, 0x00000000 },         /* VPC_UNKNOWN_9300 */
+		{ 0x9e72, 0x00000000 },         /* PC_UNKNOWN_9E72 */
+		{ 0x8100, 0x00000000 },         /* GRAS_LRZ_CNTL */
+		{ 0x8898, 0x00000000 },         /* RB_LRZ_CNTL */
+		{ 0x8870, 0x00000000 },         /* RB_DEPTH_PLANE_CNTL */
+		{ 0x8094, 0x00000000 },         /* GRAS_SU_DEPTH_PLANE_CNTL */
+		{ 0xa9a8, 0x00000000 },         /* SP_UNKNOWN_A9A8 */
+		{ 0x8e01, 0x00000000 },         /* RB_UNKNOWN_8E01 (magic) */
+		/* The cmd-only registers: a read of one hangs the CPU on this chip, which is why nothing
+		 * here has ever been confirmed by reading it back. Writing them is fine. */
+		{ 0x8e04, 0x00018000 },         /* RB_DBG_ECO_CNTL (magic) */
+		{ 0xae00, 0x00000000 },         /* SP_DBG_ECO_CNTL (magic) */
+		{ 0xb600, 0x00000000 },         /* TPL1_DBG_ECO_CNTL (magic) */
+		{ 0x9600, 0x00000000 },         /* VPC_DBG_ECO_CNTL (magic) */
+		{ 0x8600, 0x00000000 },         /* GRAS_DBG_ECO_CNTL (magic) */
+		{ 0xbe04, 0x00000000 },         /* HLSQ_DBG_ECO_CNTL (magic) */
+		{ 0xae03, 0x00000000 },         /* SP_CHICKEN_BITS (magic) */
+	};
+
+	for (unsigned i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++) {
+		ring_register(fixed[i].reg, fixed[i].value);
+	}
+	/* An inherited VFD_FETCH[n].BASE with a stale size fetches from memory that is not ours. */
+	for (uint32_t i = 0; i < 32; i++) {
+		ring_register(0xa010 + 4 * i + 2, 0);           /* VFD_FETCH[i].SIZE */
+	}
+}
 
 static void
 ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue, uint32_t idx)
 {
+	if (static_regs_mode && idx == 0) {
+		ring_static_regs();
+	}
 	ring_mark(12 + idx * 4 + 0, 0x2001 | (idx << 8));
 	uint32_t dst_coords[2] = {
 		top << 16,
@@ -3408,6 +3467,7 @@ step_frame(void)
 	}
 	PE_parse_boot_argn("adreno_copy", &copy_mode, sizeof(copy_mode));
 	PE_parse_boot_argn("adreno_resolve", &resolve_mode, sizeof(resolve_mode));
+	PE_parse_boot_argn("adreno_static", &static_regs_mode, sizeof(static_regs_mode));
 	if (copy_mode) {
 		/* Through the same commit as the picture: a block added after the SMMU tables are written
 		 * out has no translation, and the 2D engine's read of it is refused. */
