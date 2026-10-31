@@ -3242,6 +3242,8 @@ step_core_commands(void)
 #define RB_BLIT_DST             0x88d8
 #define RB_BLIT_DST_PITCH       0x88da
 #define RB_BLIT_INFO            0x88e3
+#define CP_SET_PROTECTED_MODE   0x5f
+#define CP_WAIT_REG_MEM         0x3c
 #define CP_SET_MODE             0x63            /* which CP_SET_DRAW_STATE groups run (Mesa sends 0) */
 #define EVENT_BLIT              0x1e            /* (FLD_BLIT: RB reads GMEM, writes memory) */
 #define EVENT_CLEAN_COLOR       0x21            /* CCU_CLEAN_COLOR: writes the cache's colour out (0x1d is only a flush) */
@@ -3603,7 +3605,19 @@ step_frame(void)
 	 * Writing this register while the core is still busy loses it silently. */
 	ring_command(CP_WAIT_FOR_IDLE, 0);
 	ring_register(RB_CCU_CNTL, ccu_cntl); /* Mesa's for this GPU when it draws straight into memory */
+	/* Linux turns the block clocks on with this value for a6xx (a619 is none of a610/a612/a702, so
+	 * 0x8aa8aa82): a6xx_set_hwcg in a6xx_gpu.c. This port only ever read the register, and the
+	 * renderer's busy counter reads zero, which is what a block with no clock looks like. */
+	ring_register(0x00ae, 0x8aa8aa82);              /* RBBM_CLOCK_CNTL */
+	ring_command(CP_WAIT_FOR_IDLE, 0);
+	/* Read them the plain way instead: CP_REG_TO_MEM answered nonsense for these two. */
+	printf("adreno: %u: clock cntl %#x (told 0x8aa8aa82), rbbm status %#x\n", step,
+	    rd(gpu.base + RBBM_CLOCK_CNTL), rd(gpu.base + RBBM_STATUS));
 	ring_mark(2, 0x11110002);
+	/* Mesa opens fd6_emit_restore with CP_SET_MODE 0, before any state: it decides which
+	 * CP_SET_DRAW_STATE groups run and whether RB-directed work is handed on. */
+	ring_command(CP_SET_MODE, 1);
+	ring(0);
 	/*
 	 * Do the renderer block's counters move at all when a blit runs? Eight counters sit at 0x04d6,
 	 * two words apart; RBBM_PERFCTR_CNTL at 0x0500 lets them count. Read before and after one blit:
@@ -3624,6 +3638,21 @@ step_frame(void)
 			27,     /* PERF_RB_2D_STARVE_CYCLES_DST */
 			24,     /* PERF_RB_2D_STALL_CYCLES_A2D */
 		};
+		/* The counters' SRAM must be cleared first (Linux does this after the page table update),
+		 * or every reading is leftover garbage. */
+		ring_command(CP_SET_PROTECTED_MODE, 1);
+		ring(0);
+		ring_register(0x050e, 1);                       /* RBBM_PERFCTR_SRAM_INIT_CMD */
+		ring_command(CP_SET_PROTECTED_MODE, 1);
+		ring(1);
+		/* One poll is enough: the clear is a single write. */
+		ring_command(CP_WAIT_REG_MEM, 6);
+		ring(3);                                        /* WRITE_EQ */
+		ring(0x050f | 1u << 30);                        /* RBBM_PERFCTR_SRAM_INIT_STATUS */
+		ring(1);
+		ring(0xffffffff);
+		ring(0);
+		ring(0);
 		for (uint32_t i = 0; i < 8; i++) {
 			ring_register(0x8e10 + i, events[i]);
 		}
