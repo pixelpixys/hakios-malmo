@@ -71,14 +71,15 @@
  *              this one may have left; the stop at the end of a run asks for that too)
  *  20  writes  the 3D core's registers; starts its command processor and gives it its first
  *              command
- *  21  commands the 3D core to write a word into a page of ours (no secure-mode exit: the zap
- *              shader is the boot loader's here, not started by this kernel)
+ *  21  has    the 3D core leave secure mode with CP_SET_SECURE_MODE(0) once the zap shader is in
+ *              (as Linux's a6xx_hw_init does), checks the trust register reads 0, then has it
+ *              write a word into a page of ours
  *  22  commands a picture filled with three colours, and shows it on the panel
  * When the steps are over, what they started is stopped again, in reverse, and the CX half
  * switched off: nothing of the GPU block outlives the run (its SMMU contexts point into this
  * kernel's memory), and the next one starts from what the phone's own start leaves.
  *
- * The firmware is the phone's own, from /vendor/firmware of its Android. There is no register that holds the chip ID (blair:
+ * The firmware is the phone's own, from /vendor/firmware_mnt/image of its Android (the path its kernel boots with). There is no register that holds the chip ID (blair:
  * 0x06010901, "qcom,chipid" in the device tree): the fuses of step 2 are all the hardware says
  * about itself; there being no real GMU, its "firmware version" does not apply here.
  *
@@ -1326,24 +1327,31 @@ space_off(struct gpu_space *space, uint32_t match)
 #define SCM_INTERRUPTED         1                       /* a call that was preempted says so, and is made again so */
 #define PAS_GPU                 13
 
-/* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
+/*
+ * The zap shader's reserved memory: DT gpu_microcode_region@8ac1a000, 2 MB, no-map. The metadata
+ * (header and hashes) goes in it at ZAP_METADATA, and the loadable segment at its start, as the
+ * phone's own kernel does. TrustZone accepts this; the runs that failed with 0xFFCFFFxx were
+ * passing the stale 6708-byte /vendor/firmware copy, not the 6860-byte
+ * /vendor/firmware_mnt/image file that the phone's kernel actually loads.
+ */
+#define ZAP_MEMORY              0x8ac1a000ull
+#define ZAP_MEMORY_SIZE         0x2000u
+#define ZAP_METADATA            (ZAP_MEMORY + 0x10000ull)
+
+/* The call itself, retried while TrustZone says it was preempted; up to four arguments. */
 static int32_t
-scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+smc_call(uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t fourth,
     uint64_t *answer)
 {
 	uint64_t session = 0;
 
-	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
-	    second, third);
-	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
-	hold(true);
 	for (int i = 0; i < 100; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
 		register uint64_t x2 __asm__("x2") = first;
 		register uint64_t x3 __asm__("x3") = second;
 		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x5 __asm__("x5") = fourth;
 		register uint64_t x6 __asm__("x6") = session;
 		register uint64_t x7 __asm__("x7") = 0;
 
@@ -1351,13 +1359,31 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 		session = x6;
 		if (x0 != SCM_INTERRUPTED) {
-			printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
 			*answer = x1;
 			return (int32_t)x0;
 		}
 	}
-	printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
 	return -1;
+}
+
+/* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
+static int32_t
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+    uint64_t *answer)
+{
+	int32_t result;
+
+	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
+	    second, third);
+	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
+	hold(true);
+	result = smc_call(function, arguments, first, second, third, 0, answer);
+	if (result == -1) {
+		printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
+		return -1;
+	}
+	printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, result, *answer);
+	return result;
 }
 
 static bool
@@ -1433,7 +1459,7 @@ image_file(const char *directory, const char *name, uint64_t *size)
 		return data;
 	}
 	if (!image_asked_quietly) {
-		printf("adreno: %u: no %s/%s in the small image: put the phone's /vendor/firmware/%s into fw-gpu/ and run "
+		printf("adreno: %u: no %s/%s in the small image: put the phone's /vendor/firmware_mnt/image/%s into fw-gpu/ and run "
 		    "userland/build.sh\n", step, directory, name, name);
 	}
 	return NULL;
@@ -1447,17 +1473,16 @@ image_file(const char *directory, const char *name, uint64_t *size)
  * the older per-chip-name a660_zap.mdt) -- and checks the signature. Nothing of the GPU is involved, so it can be asked now. The other
  * two (where the image will be, and "authenticate and start") need the 3D core powered.
  *
- * The header goes in memory of ours, page-aligned and in one piece. Qualcomm's note at that
- * call says that for these calls the hypervisor itself arranges TrustZone's access to the memory
- * ("creates SHM bridges on behalf of Linux"), and that TrustZone protects the memory while it
- * works: so it is not touched again here, and never freed.
+ * The header goes in memory of ours, page-aligned and in one piece, inside the shader's own
+ * reserved region (ZAP_METADATA): TrustZone reads that region, whereas a page of the kernel's heap
+ * at ~3.9 GB it refuses with 0xFFCFFFxx (logs/015953). TrustZone protects the memory while it
+ * works: so it is not touched again here.
  */
-/* The zap shader's header in a page of ours, as TrustZone wants it; where that page is in physical memory. */
+/* The zap shader's header in memory as TrustZone wants it; where that is in physical memory. */
 static bool
 zap_header(uint64_t *phys)
 {
 	const uint8_t *header;
-	vm_offset_t page = 0;
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
@@ -1467,7 +1492,7 @@ zap_header(uint64_t *phys)
 	}
 	/* a 32-bit ELF: the count of segments at 44, the table of them at 52, 32 bytes each, the file size of one at +16 */
 	segments = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	if (memcmp(header, "\177ELF\1", 5) != 0 || segments < 2 || size > PAGE_SIZE) {
+	if (memcmp(header, "\177ELF\1", 5) != 0 || segments < 2 || size > ZAP_MEMORY_SIZE) {
 		printf("adreno: %u: that is not such a header (%02x %02x %02x %02x, %u segments)\n", step, header[0], header[1],
 		    header[2], header[3], segments);
 		return false;
@@ -1479,13 +1504,17 @@ zap_header(uint64_t *phys)
 		printf("adreno: %u: the file is not the header followed by the hashes alone: not what TrustZone takes\n", step);
 		return false;
 	}
-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		printf("adreno: %u: no memory\n", step);
-		return false;
+	/*
+	 * Write the header into the shader's own reserved region, not cached, so no cached copy of
+	 * bytes TrustZone is about to read (and protect) is left on this side.
+	 */
+	{
+		volatile uint8_t *where = (volatile uint8_t *)ml_io_map_wcomb(ZAP_METADATA, ZAP_MEMORY_SIZE);
+		for (uint64_t i = 0; i < size; i++) {
+			where[i] = header[i];
+		}
 	}
-	memcpy((void *)page, header, size);
-	to_memory(page, PAGE_SIZE);             /* TrustZone reads memory, not this processor's cache */
-	*phys = kvtophys(page);
+	*phys = ZAP_METADATA;
 	return true;
 }
 
@@ -1903,6 +1932,7 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 #define RBBM_SECVID_TSB_TRUSTED_BASE GPU_WORD(0xf800)
 #define RBBM_SECVID_TSB_TRUSTED_SIZE GPU_WORD(0xf802)
 #define RBBM_SECVID_TSB_CNTL    GPU_WORD(0xf803)
+#define RBBM_SECVID_TRUST_CNTL  GPU_WORD(0xf400)
 #define RBBM_SECVID_TSB_ADDR_MODE_CNTL GPU_WORD(0xf810)
 
 static bool
@@ -2020,6 +2050,10 @@ step_core_power(void)
 #define CP_ME_INIT              0x48
 #define CP_SET_MARKER           0x65
 #define CP_SET_SECURE_MODE      0x66
+#define CP_SKIP_IB2_ENABLE_GLOBAL 0x1d
+#define CP_SKIP_IB2_ENABLE_LOCAL  0x23
+#define CP_SET_VISIBILITY_OVERRIDE 0x64
+#define RM6_DIRECT_RENDER       1
 
 /*
  * Linux (qcom_adreno_smmu_write_sctlr): after a fault the core's other requests are served, or it
@@ -2197,8 +2231,6 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8ac1a000ull   /* blair: gpu_microcode_region@8ac1a000 (pil_gpu_micro_code_mem), not redwood's 0x8b71a000 */
-#define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
 
@@ -2224,9 +2256,15 @@ step_zap_load(void)
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
-	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
-	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
-	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
+	/*
+	 * Do not ask TrustZone to give up the image first (zap_unload): the boot loader loads the
+	 * zap shader to light the screen, so by the time this kernel runs TrustZone already holds an
+	 * initialized, authenticated image; dropping it would leave nothing to start. The call that
+	 * takes the signature fails with "already initialized" for that same reason, so it is taken
+	 * to mean the image is there, and the call below authorizes and starts it.
+	 */
+	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put each segment's bytes "
+	    "there, and ask TrustZone to authenticate and run it");
 
 	/*
 	 * blair: gen6_3_25_0_zap.{mdt,b00,b01,b02} has three program headers but only one Linux
@@ -2281,15 +2319,21 @@ step_zap_load(void)
 		}
 	}
 
-	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put each segment's bytes "
-	    "there, and ask TrustZone to authenticate and run it");
 	if (!zap_header(&header)) {
 		return false;
 	}
 	if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
 	    header, 0, &answer) != 0 || answer != 0) {
-		printf("adreno: %u: TrustZone does not take the signature (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
-		    "BEFORE, which is used as it is\n", step, answer);
+		printf("adreno: %u: TrustZone does not take the signature (%#llx): taken to mean an image from the boot loader "
+		    "is already initialized; ask it to run that one\n", step, answer);
+		if (scm("to authenticate and run the image TrustZone already holds", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET,
+		    SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer) == 0 && answer == 0) {
+			printf("adreno: %u: TRUSTZONE HAS AUTHENTICATED AND STARTED THE IMAGE IT ALREADY HELD\n", step);
+			zap_is_loaded = true;
+			return true;
+		}
+		printf("adreno: %u: TrustZone does not run it either (%#llx): it is used as it is, if it is there\n", step,
+		    answer);
 		zap_is_loaded = true;
 		return true;
 	}
@@ -2367,6 +2411,15 @@ step_core_start(void)
 	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
 	put64(&gpu, "rbbm_secvid_tsb_trusted_base", RBBM_SECVID_TSB_TRUSTED_BASE, 0);
 	put(&gpu, "rbbm_secvid_tsb_trusted_size", RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
+	/*
+	 * The core comes out of reset in secure mode (RBBM_SECVID_TRUST_CNTL reads 1: the render
+	 * block silently drops every write that is not into TrustZone's memory, while the command
+	 * processor's own writes still land). Linux's a6xx_hw_init writes 0 here when it runs with
+	 * no zap shader, but on this phone that register is TrustZone's: a direct write resets the
+	 * phone (logs/002627), and CP_SET_SECURE_MODE(0) leaves the core wedged (logs/002450).
+	 * Only loading a zap shader through TrustZone may lift it.
+	 */
+	get(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
 	for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
 		put(&gpu, "address mode: 64 bits", GPU_WORD(address_modes[i]), 1);
 	}
@@ -2481,7 +2534,7 @@ step_core_start(void)
 	return true;
 }
 
-/* ---- step 21: a word written on command (the core is not in secure mode on this phone) ----------------------- */
+/* ---- step 21: out of secure mode; a word written on command -------------------------------------------------- */
 
 static bool
 step_core_commands(void)
@@ -2491,8 +2544,18 @@ step_core_commands(void)
 	if (!cx_ready() || !core_runs) {
 		return false;
 	}
-	announce("have the 3D core write a word into a page of ours; it is not in secure mode here (the zap shader is "
-	    "TrustZone's from the boot loader, not started by this kernel)");
+	announce("have the 3D core write a word into a page of ours; first, with the zap shader in, take the core out of "
+	    "secure mode as Linux does (CP_SET_SECURE_MODE 0), and check the register");
+	if (zap_is_loaded) {
+		ring_command(CP_SET_SECURE_MODE, 1);
+		ring(0);
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+		if (!ring_run("leave secure mode")) {
+			return false;
+		}
+	}
+	printf("adreno: %u: the core's secure-mode register reads %#x (0 = out of secure mode)\n", step,
+	    get(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL));
 	scratch[0] = 0xdeadbeef;                /* so that what is read back cannot be mistaken for the real thing */
 	to_memory(core_scratch.memory, 64);
 	ring_command(CP_MEM_WRITE, 3);
@@ -2559,9 +2622,11 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	ring_register(RB_2D_DST, CORE_TARGET_ADDRESS);
 	ring_register(RB_2D_DST + 1, 0);
 	ring_register(RB_2D_DST_PITCH, TARGET_ROW >> 6);
+	/* Mesa's emit_blit_fini: the core takes no 2D command until it is idle, and is idle again after. */
 	ring_command(CP_WAIT_FOR_IDLE, 0);
 	ring_command(CP_BLIT, 1);
 	ring(3);                                /* "scale": the 2D engine's one operation */
+	ring_command(CP_WAIT_FOR_IDLE, 0);
 }
 
 static bool
@@ -2580,20 +2645,39 @@ step_frame(void)
 	for (uint32_t i = 0; i < core_space.table_count; i++) {
 		to_memory((vm_offset_t)core_space.tables[i].table, 4096);
 	}
+	/*
+	 * Mesa's sysmem setup (fd6_gmem.cc, fd6_emit_sysmem) puts the command processor in "direct
+	 * render" before anything is drawn: CP_SET_MARKER(RM6_DIRECT_RENDER), visibility overridden
+	 * on, no IB2 skipping. The marker used before (0xc, RM6_BLIT2DSCALE) is a no-op in the SQE
+	 * firmware, so the core was never told that a 2D blit was coming and may have dropped it.
+	 */
 	ring_command(CP_SET_MARKER, 1);
-	ring(12);                               /* "2D blits follow" */
+	ring(RM6_DIRECT_RENDER);
+	ring_command(CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+	ring(0);
+	ring_command(CP_SKIP_IB2_ENABLE_LOCAL, 1);
+	ring(1);
+	ring_command(CP_SET_VISIBILITY_OVERRIDE, 1);
+	ring(1);
 	/* Both bin controls default to "render into GMEM", which nothing here has set up: the 2D
 	 * engine then runs, faults nothing and leaves memory as it was. Mesa's sysmem path puts the
 	 * buffers in system memory (fd6_gmem.cc, fd6_emit_tile_init). */
-	ring_register(GRAS_BIN_CONTROL, 3u << 22);
-	ring_register(RB_BIN_CONTROL, 3u << 22);
-	ring_register(RB_BIN_CONTROL2, 0);
-	ring_register(VFD_MODE_CNTL, 0);
+	put(&gpu, "gras_bin_control", GPU_WORD(GRAS_BIN_CONTROL), 3u << 22);
+	put(&gpu, "rb_bin_control", GPU_WORD(RB_BIN_CONTROL), 3u << 22);
+	put(&gpu, "rb_bin_control2", GPU_WORD(RB_BIN_CONTROL2), 0);
+	put(&gpu, "vfd_mode_cntl", GPU_WORD(VFD_MODE_CNTL), 0);
 	/* Mesa's sysmem value for a619 (fd6_screen_init + fd6_emit_ccu_cntl): 64K colour cache at
 	 * offset 0x10000, both caches full, no concurrent resolve. The ring drops writes to this
 	 * register (it reads back 0), so it goes straight to the block like the vendor's privileged
 	 * ones (NOTES 2026-11-01 (5)). */
 	put(&gpu, "rb_ccu_cntl", GPU_WORD(RB_CCU_CNTL), 0x08000000);
+	/*
+	 * If the core were still in "secure" mode, everything it writes goes nowhere unless the
+	 * address is in TrustZone's memory: the render block would work and memory would stay as it
+	 * was, with no fault and no SMMU report -- what is seen here. Zero means it is out.
+	 */
+	printf("adreno: %u: the core's secure-mode register reads %#x\n", step,
+	    get(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL));
 	ring_fill(0, 800, 255, 128, 0);         /* orange */
 	ring_fill(800, 1600, 255, 255, 255);
 	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
@@ -2620,6 +2704,9 @@ step_frame(void)
 	to_memory(core_scratch.memory, 64);
 	printf("adreno: %u: the words it writes when its caches are in memory: %#x, %#x (told: 0xc0c0c0c, 0xd0e0d0e)\n", step,
 	    ((volatile uint32_t *)core_scratch.memory)[8], ((volatile uint32_t *)core_scratch.memory)[4]);
+	printf("adreno: %u: after the ring ran, bin controls read %#x %#x, ccu %#x (told %#x %#x, %#x)\n", step,
+	    rd(gpu.base + GPU_WORD(GRAS_BIN_CONTROL)), rd(gpu.base + GPU_WORD(RB_BIN_CONTROL)),
+	    rd(gpu.base + GPU_WORD(RB_CCU_CNTL)), 3u << 22, 3u << 22, 0x08000000u);
 	to_memory(core_target.memory, core_target.size);
 	pixel = (const volatile uint8_t *)core_target.memory;
 	printf("adreno: %u: the picture's first pixel is %02x %02x %02x %02x (blue green red alpha; told: 00 80 ff ff), one in "
@@ -3427,7 +3514,7 @@ start_by_itself(void)
 	}
 	image_asked_quietly = false;
 	if (missing != NULL) {
-		printf("adreno: THE GPU IS NOT STARTED: the small image has no fw/%s (the phone's /vendor/firmware/%s goes into "
+		printf("adreno: THE GPU IS NOT STARTED: the small image has no fw/%s (the phone's /vendor/firmware_mnt/image/%s goes into "
 		    "fw-gpu/); the system draws with its software renderer\n", missing, missing);
 		return false;
 	}
