@@ -729,8 +729,6 @@ cx_ready(void)
  */
 static struct block gmu = { "gmu", 0x0596a000, 0x30000 };         /* blair: this is the GMU's "wrapper" -- a register-compatible stub, no CM3 processor -- at the DTS's gmu_wrapper window; its own base is kgsl_3d0 + 0x6a000 on every a6xx chip, wrapper or not, so every GMU_WORD() offset below still lands correctly */
 #define GMU_WORD(n)             (4u * (n))
-#define GMU_DTCM                GMU_WORD(0x1c00)        /* the processor's 16K of data memory (its code: 0x0c00) */
-#define GMU_DTCM_VERSIONS       GMU_WORD(0x1c00 + 0xff8) /* five words where loaded firmware carries its versions */
 #define GMU_CM3_SYSRESET        GMU_WORD(0x5000)        /* 1: the processor is held in reset */
 #define GMU_CM3_BOOT_CONFIG     GMU_WORD(0x5001)
 #define GMU_CM3_FW_INIT_RESULT  GMU_WORD(0x501c)        /* 0xbabeface once firmware has started */
@@ -795,9 +793,7 @@ step_first_words(void)
 	printf("adreno: %u: the GMU wrapper's counter counts at %u Hz: %s\n", step, hz, hz > 18000000 && hz < 20500000 ?
 	    "the 19.2 MHz crystal, even with no firmware running: THE GPU BLOCK IS ALIVE" :
 	    "not the crystal's 19.2 MHz (unsurprising with no GMU firmware: see the rest)");
-	for (uint32_t i = 0; i < 5; i++) {
-		get(&gmu, "dtcm, where firmware has its versions", GMU_DTCM_VERSIONS + 4 * i);
-	}
+	/* blair: no DTCM behind the wrapper -- reading where the firmware's versions would be stops the bus */
 
 	announce("read the GPU's bus interface (0x3d0f000) and the CX odds and ends (0x3d9e000)");
 	get(&gbif, "scache_cntl0", GBIF_SCACHE_CNTL0);
@@ -1000,7 +996,7 @@ step_gmu_memory(void)
 
 #define SMMU_S2CR_FAULT         (2u << 16)
 #define SMMU_SMR_VALID          (1u << 31)
-#define SMMU_STREAM_MASK        0x400           /* dt: the second cell of every "iommus" of this SMMU */
+#define SMMU_STREAM_MASK        0               /* blair: the mask the verified malmo branch wrote; 0x400 here reads back 0 */
 #define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))                       /* in the second page, like CBAR */
 #define SMMU_CBA2R_64_BIT       1
@@ -1225,7 +1221,7 @@ space_faulted(const struct gpu_space *space)
 
 /*
  * One more stream through a context that is on. A match is taken only as the device tree has
- * it, a stream and the mask 0x400: one entry for streams 0 and 1 (mask 0x401) reads back 0.
+ * it. blair: the mask is 0 (the verified malmo branch); with redwood's 0x400 the SMR reads back 0.
  */
 static bool
 space_stream(struct gpu_space *space, uint32_t match, uint32_t stream)
@@ -1511,7 +1507,11 @@ step_zap_signature(void)
 		return true;
 	}
 	printf("adreno: %u: TrustZone does not take it: the call returns %d, its answer is %#llx\n", step, result, answer);
-	return false;
+	/* blair: the boot loader has already loaded and run the zap shader, so TrustZone keeps it and refuses another
+	 * (adreno-head's is_malmo branch, which passed steps 12..22 this way); step 19 asks again and uses the one it has. */
+	printf("adreno: %u: SM6375 (blair): TAKEN TO MEAN THAT THE BOOT LOADER'S ZAP SHADER IS ALREADY IN AND KEPT; "
+	    "continuing with it\n", step);
+	return true;
 }
 
 /* ---- step 13: memory for the GMU ------------------------------------------------------------------------ */
@@ -1890,12 +1890,13 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 /*
  * blair/a619_holi has no GMU firmware to ask, so there is no HFI exchange, no RPMh speed table,
  * no "keep it powered" vote: the 3D core's power is switched on directly, by the one register
- * sequence Linux's a6xx_gpu.c actually runs for this exact chip (adreno_is_a619_holi() branches)
- * before and inside its hw_init -- clear the bus halt and GPR0 (not RBBM_GBIF_HALT, which other
- * a6xx chips use instead), then a6xx_sptprac_enable(): write 0x778000 to the GMU wrapper's own
- * SPTPRAC_POWER_CONTROL and wait for its PWR_CLK_STATUS to read back (val & 0x38) == 0x28. No
- * memory is involved, nothing is asked of RPMh: this is the entire difference, in Linux, between
- * a chip with a real GMU and this one.
+ * sequence this phone's own kernel was brought up with -- switch the GX half on directly (clear
+ * gx_gdscr's collapse bit, release the I/O clamps), clock it (gx_cxo, gx_gfx3d), then
+ * a6xx_sptprac_enable(): write 0x778000 to the GMU wrapper's own SPTPRAC_POWER_CONTROL and wait
+ * for its PWR_CLK_STATUS to read back (val & 0x38) == 0x28 -- and only then clear the bus halt
+ * and GPR0 (not RBBM_GBIF_HALT, which other a6xx chips use instead). No memory is involved,
+ * nothing is asked of RPMh: this is the entire difference, in Linux, between a chip with a real
+ * GMU and this one.
  */
 #define GMU_GX_SPTPRAC_POWER_CONTROL GMU_WORD(0x81)    /* global (a6xx_gmu.xml) word 0x1a881; local = that minus 0x1a800 */
 #define RBBM_GPR0_CNTL          GPU_WORD(0x18)         /* a6xx.xml word 0x0018; a619_holi clears this instead of RBBM_GBIF_HALT */
@@ -1912,19 +1913,15 @@ step_core_power(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("turn on the GPU clock controller's gx_gmu clock (0x5991064): on a chip with real GMU firmware the "
-	    "firmware itself turns this on; there is none here, so it is done directly");
-	if (!clock_on(&gpucc, "gx_gmu", GPUCC_GX_GMU_CBCR, true)) {
-		return false;
-	}
+	announce("switch the 3D core's own power switch on (gpu_gx_gdsc, 0x100c): clear its collapse bit, as Linux's "
+	    "a619_holi path does, and release the I/O clamps");
+	put(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR) & ~GDSC_SW_COLLAPSE);
+	put(&gpucc, "gx_clamp_io", 0x1508, 0);
 
-	announce("clear the 3D core's bus halt and its gpr0 control (a619_holi's own path in Linux's a6xx_gpu.c hw_init, "
-	    "not the rbbm_gbif_halt other a6xx chips use), then its \"zero-trust-mode\" register");
-	put(&gbif, "halt", GBIF_HALT, 0);
-	get(&gbif, "halt", GBIF_HALT);
-	put(&gpu, "rbbm_gpr0_cntl", RBBM_GPR0_CNTL, 0);
-	get(&gpu, "rbbm_gpr0_cntl", RBBM_GPR0_CNTL);
-	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
+	announce("turn on the 3D core's clocks (gx_cxo at 0x1060, gx_gfx3d at 0x1054): their status bits are not ones "
+	    "to rely on here, so they are written and not waited for");
+	clock_on(&gpucc, "gx_cxo", 0x1060, false);
+	clock_on(&gpucc, "gx_gfx3d", 0x1054, false);
 
 	announce("ask the GMU's wrapper to power the 3D core directly (SPTPRAC, 0x596a204): no HFI, no firmware -- this "
 	    "is Linux's a6xx_sptprac_enable() for this exact chip");
@@ -1938,6 +1935,14 @@ step_core_power(void)
 	core_is_on = true;
 	get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+
+	announce("clear the 3D core's bus halt and its gpr0 control (a619_holi's own path in Linux's a6xx_gpu.c hw_init, "
+	    "not the rbbm_gbif_halt other a6xx chips use), then its \"zero-trust-mode\" register");
+	put(&gbif, "halt", GBIF_HALT, 0);
+	get(&gbif, "halt", GBIF_HALT);
+	put(&gpu, "rbbm_gpr0_cntl", RBBM_GPR0_CNTL, 0);
+	get(&gpu, "rbbm_gpr0_cntl", RBBM_GPR0_CNTL);
+	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
 
 	announce("read registers of the 3D core itself (0x5900000): the first time it has power");
 	get(&gpu, "rbbm_status", RBBM_STATUS);
@@ -2213,7 +2218,7 @@ step_zap_load(void)
 	const uint8_t *mdt;
 	volatile uint8_t *memory;
 	uint64_t mdtsize = 0, header = 0, answer = ~0ull;
-	uint32_t segments, min_addr = ~0u, max_end = 0;
+	uint32_t segments, min_addr = ~0u;
 	char name[32];
 
 	if (!cx_ready() || !core_is_on) {
@@ -2224,11 +2229,13 @@ step_zap_load(void)
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
 
 	/*
-	 * blair: the zap shader here is gen6_3_25_0_zap.{mdt,b00,b01,b02} -- three segments with
-	 * real bytes, not redwood's one (a660_zap.b02) -- so the mdt's program-header table is
-	 * read again (zap_header() already used it once, for the signature check alone) to learn
-	 * where each segment's bytes belong relative to each other inside our one reserved
-	 * region, the way Linux's qcom_mdt_loader.c: qcom_mdt_load does.
+	 * blair: gen6_3_25_0_zap.{mdt,b00,b01,b02} has three program headers but only one Linux
+	 * would load: b00 is the header itself, b01 the segment of hashes (which TrustZone is
+	 * given separately, in zap_header), b02 the shader's bytes. The table is read again here
+	 * -- zap_header() already used it once, for the signature check alone -- so that the same
+	 * selection is made as Linux's qcom_mdt_loader.c: qcom_mdt_load (mdt_phdr_loadable) and
+	 * the one loadable segment lands at offset 0 of the reserved region (the image is
+	 * relocatable: bit 27 of the segment's flags), not at its own p_paddr of 0x5000.
 	 */
 	mdt = image_file("fw", "gen6_3_25_0_zap.mdt", &mdtsize);
 	if (mdt == NULL) {
@@ -2240,23 +2247,38 @@ step_zap_load(void)
 		return false;
 	}
 	for (uint32_t i = 0; i < segments; i++) {
-		uint32_t p_paddr, p_memsz;
+		uint32_t p_type, p_flags, p_paddr, p_memsz;
+		memcpy(&p_type, mdt + 52 + 32 * i, sizeof(p_type));
+		memcpy(&p_flags, mdt + 52 + 32 * i + 24, sizeof(p_flags));
 		memcpy(&p_paddr, mdt + 52 + 32 * i + 12, sizeof(p_paddr));
 		memcpy(&p_memsz, mdt + 52 + 32 * i + 20, sizeof(p_memsz));
-		if (p_memsz == 0) {
+		/* Linux's mdt_phdr_loadable(): only PT_LOAD, not the segment that holds the hashes, not empty */
+		if (p_type != 1 || (p_flags & 7u << 24) == 2u << 24 || p_memsz == 0) {
 			continue;
 		}
 		if (p_paddr < min_addr) {
 			min_addr = p_paddr;
 		}
-		if (p_paddr + p_memsz > max_end) {
-			max_end = p_paddr + p_memsz;
-		}
 	}
-	if (min_addr == ~0u || max_end <= min_addr || max_end - min_addr > ZAP_MEMORY_SIZE) {
-		printf("adreno: %u: the zap shader's segments (%#x to %#x) do not fit the %#x bytes reserved for it\n", step,
-		    min_addr, max_end, ZAP_MEMORY_SIZE);
+	if (min_addr == ~0u) {
+		printf("adreno: %u: the zap shader has no segment Linux would load\n", step);
 		return false;
+	}
+	for (uint32_t i = 0; i < segments; i++) {
+		uint32_t p_type, p_flags, p_paddr, p_memsz;
+		memcpy(&p_type, mdt + 52 + 32 * i, sizeof(p_type));
+		memcpy(&p_flags, mdt + 52 + 32 * i + 24, sizeof(p_flags));
+		memcpy(&p_paddr, mdt + 52 + 32 * i + 12, sizeof(p_paddr));
+		memcpy(&p_memsz, mdt + 52 + 32 * i + 20, sizeof(p_memsz));
+		if (p_type != 1 || (p_flags & 7u << 24) == 2u << 24 || p_memsz == 0) {
+			continue;
+		}
+		/* blair's shader is relocatable (bit 27 of its flags): segments sit at paddr minus the lowest one */
+		if (p_paddr - min_addr + p_memsz > ZAP_MEMORY_SIZE) {
+			printf("adreno: %u: segment %u (%#x bytes at offset %#x) does not fit the %#x bytes reserved for the "
+			    "zap shader\n", step, i, p_memsz, p_paddr - min_addr, ZAP_MEMORY_SIZE);
+			return false;
+		}
 	}
 
 	announce("hand the zap shader's header to TrustZone, tell it where the image goes, put each segment's bytes "
@@ -2287,15 +2309,17 @@ step_zap_load(void)
 		memory[i] = 0;
 	}
 	for (uint32_t i = 0; i < segments; i++) {
-		uint32_t p_paddr, p_filesz, p_memsz;
+		uint32_t p_type, p_flags, p_paddr, p_filesz, p_memsz;
 		const uint8_t *segment;
 		uint64_t size = 0;
 
+		memcpy(&p_type, mdt + 52 + 32 * i, sizeof(p_type));
+		memcpy(&p_flags, mdt + 52 + 32 * i + 24, sizeof(p_flags));
 		memcpy(&p_paddr, mdt + 52 + 32 * i + 12, sizeof(p_paddr));
 		memcpy(&p_filesz, mdt + 52 + 32 * i + 16, sizeof(p_filesz));
 		memcpy(&p_memsz, mdt + 52 + 32 * i + 20, sizeof(p_memsz));
-		if (p_memsz == 0 || p_filesz == 0) {
-			continue;        /* a segment with nothing in the file (pure BSS) -- there is no "bNN" for it */
+		if (p_type != 1 || (p_flags & 7u << 24) == 2u << 24 || p_memsz == 0 || p_filesz == 0) {
+			continue;        /* as Linux: not PT_LOAD, the hashes, or nothing to put there */
 		}
 		snprintf(name, sizeof(name), "gen6_3_25_0_zap.b%02u", i);
 		segment = image_file("fw", name, &size);
@@ -2493,6 +2517,10 @@ step_core_commands(void)
  * 64 bytes, in memory of ours; the framebuffer driver copies it to the panel.
  */
 #define RB_CCU_CNTL             0x8e07          /* register numbers: these are written by command */
+#define VFD_MODE_CNTL           0xa007
+#define GRAS_BIN_CONTROL        0x80a1
+#define RB_BIN_CONTROL          0x8800
+#define RB_BIN_CONTROL2         0x88d3
 #define GRAS_2D_BLIT_CNTL       0x8400
 #define GRAS_2D_DST_TL          0x8405
 #define GRAS_2D_DST_BR          0x8406
@@ -2554,7 +2582,18 @@ step_frame(void)
 	}
 	ring_command(CP_SET_MARKER, 1);
 	ring(12);                               /* "2D blits follow" */
-	ring_register(RB_CCU_CNTL, 0x10000004); /* Mesa's for this GPU when it draws straight into memory */
+	/* Both bin controls default to "render into GMEM", which nothing here has set up: the 2D
+	 * engine then runs, faults nothing and leaves memory as it was. Mesa's sysmem path puts the
+	 * buffers in system memory (fd6_gmem.cc, fd6_emit_tile_init). */
+	ring_register(GRAS_BIN_CONTROL, 3u << 22);
+	ring_register(RB_BIN_CONTROL, 3u << 22);
+	ring_register(RB_BIN_CONTROL2, 0);
+	ring_register(VFD_MODE_CNTL, 0);
+	/* Mesa's sysmem value for a619 (fd6_screen_init + fd6_emit_ccu_cntl): 64K colour cache at
+	 * offset 0x10000, both caches full, no concurrent resolve. The ring drops writes to this
+	 * register (it reads back 0), so it goes straight to the block like the vendor's privileged
+	 * ones (NOTES 2026-11-01 (5)). */
+	put(&gpu, "rb_ccu_cntl", GPU_WORD(RB_CCU_CNTL), 0x08000000);
 	ring_fill(0, 800, 255, 128, 0);         /* orange */
 	ring_fill(800, 1600, 255, 255, 255);
 	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
