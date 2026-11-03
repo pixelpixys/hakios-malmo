@@ -3596,6 +3596,11 @@ hakios_adreno_init(void)
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 			gpu_kept = true;
 			quiet = true;
+			/* the same late punishment as below, but the system must not start before it has come */
+			for (uint32_t second = 1; second <= watch_seconds; second++) {
+				sleep_ms(1000);
+				printf("adreno: alive %u s after step %u; %s\n", second, done, last_write);
+			}
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 			HakiosGPUStart();
 			return;
