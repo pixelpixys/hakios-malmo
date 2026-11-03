@@ -2540,13 +2540,14 @@ static bool
 step_core_commands(void)
 {
 	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch.memory;
+	uint32_t nosecure = 0;
 
 	if (!cx_ready() || !core_runs) {
 		return false;
 	}
 	announce("have the 3D core write a word into a page of ours; first, with the zap shader in, take the core out of "
 	    "secure mode as Linux does (CP_SET_SECURE_MODE 0), and check the register");
-	if (zap_is_loaded) {
+	if (zap_is_loaded && !(PE_parse_boot_argn("adreno_nosecure", &nosecure, sizeof(nosecure)) && nosecure)) {
 		ring_command(CP_SET_SECURE_MODE, 1);
 		ring(0);
 		ring_command(CP_WAIT_FOR_IDLE, 0);
