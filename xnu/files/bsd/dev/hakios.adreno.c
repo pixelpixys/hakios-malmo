@@ -2957,6 +2957,7 @@ hakios_adreno_quiesce(void)
 #define EVENT_INVALIDATE_COLOR  0x19
 
 static bool gpu_kept;
+static bool gpu_asleep;                 /* ... and switched off between uses (runtime PM) */
 static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
 static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
@@ -2973,6 +2974,7 @@ static unsigned gpu_free_count;
 extern void HakiosGPUStart(void);
 extern void HakiosGPUStop(void);       /* takes the clients' lock, then calls hakios_gpu_stop() */
 static void gpu_block_stop(void);
+bool hakios_adreno_resume(void);       /* runtime PM: a kept GPU is started on the system's first use */
 
 /*
  * A run that ends in order -- its time is up, the host asks for the end, five fingers on the
@@ -2990,6 +2992,9 @@ hakios_gpu_stop(void)
 		uint32_t waited = 0;
 
 		gpu_kept = false;                       /* (nothing more is taken) */
+		if (gpu_asleep) {
+			return;                         /* (nothing of it was started: see hakios_adreno_resume()) */
+		}
 		quiet = false;
 		/*
 		 * What the core has been given, it finishes first: told to slumber in the middle of a
@@ -3069,6 +3074,9 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 uint64_t
 hakios_gpu_address(uint64_t size)
 {
+	if (!hakios_adreno_resume()) {
+		return 0;
+	}
 	size = (size + 0xffff) & ~0xffffull;
 	for (unsigned i = 0; i < gpu_free_count; i++) {
 		if (gpu_free[i].size >= size) {
@@ -3305,6 +3313,39 @@ static bool(*const steps[])(void) = {
 	step_frame,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
+
+/*
+ * The GPU a kept kernel switched off after its steps: the first thing the system asks of the
+ * service brings it back. Step 4 finds the block running -- the CX half is still powered, only
+ * halted -- and takes it down before starting again (stale_stop()), which is the same clean
+ * start a fresh kernel gets. The steps before the 3D core are cheap; the ones that allocate
+ * (step 18) reuse the tables' places and leave their old memory behind (a leak of three blocks
+ * per wake; a reboot-bound kernel is not expected to sleep and wake often).
+ */
+bool
+hakios_adreno_resume(void)
+{
+	if (!gpu_kept || !gpu_asleep) {
+		return gpu_kept;
+	}
+	printf("adreno: the system asks for the GPU: starting it\n");
+	gpu_asleep = false;                    /* (taken before the steps: a failed one is not tried again) */
+	quiet = false;
+	for (step = 4; step <= 21; step++) {
+		if (!steps[step - 1]()) {
+			printf("adreno: resume: step %u FAILED; the GPU is not usable\n", step);
+			return false;
+		}
+	}
+	gpu_free[0].start = GPU_ADDRESSES_START;
+	gpu_free[0].size = GPU_ADDRESSES_SIZE;
+	gpu_free_count = 1;
+	bzero((void *)core_scratch.memory, 4096);
+	to_memory(core_scratch.memory, 4096);
+	quiet = true;
+	printf("adreno: THE GPU IS ON for the system to draw with\n");
+	return true;
+}
 
 /* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
 
@@ -3601,7 +3642,10 @@ hakios_adreno_init(void)
 				sleep_ms(1000);
 				printf("adreno: alive %u s after step %u; %s\n", second, done, last_write);
 			}
-			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
+			printf("adreno: the GPU is switched off until the system first asks for it (the service HakiosGPU)\n");
+			gpu_block_stop();
+			quiet = true;
+			gpu_asleep = true;
 			HakiosGPUStart();
 			return;
 		}
