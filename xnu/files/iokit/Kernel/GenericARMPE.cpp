@@ -256,14 +256,13 @@ GenericARMPE::start(IOService * provider)
 			psci_smp_init();
 		}
 		/*
-		 * The slower cores (an L2 access penalty, the loader's "small-core") are started 28 seconds
-		 * later (boot-arg small_cores_after=S; 0: at once). With all seven from the start the lock
-		 * screen came 1.5 s later than with the four big ones alone (26.5-27.0 s after the kernel
-		 * began instead of 25.3-25.5: start-up's other work shares memory and cache with
-		 * SpringBoard's), while that work as a whole was done earlier (34 s instead of 38). With
-		 * the slower cores joining once the lock screen is there: 25.3 s and 36 s.
+		 * The slower cores (an L2 access penalty, the loader's "small-core") are started at once;
+		 * boot-arg small_cores_after=S delays that by S seconds. A delay left them announced to
+		 * userland but not running, and the first user-session spawns wedged (logs 003418, 002714).
+		 * Cost of all up front: the lock screen 1.5 s later (26.5-27.0 s after the kernel began
+		 * instead of 25.3-25.5: start-up's other work shares memory and cache with SpringBoard's).
 		 */
-		uint32_t later = 28;
+		uint32_t later = 0;
 		static thread_call_t later_call;
 
 		PE_parse_boot_argn("small_cores_after", &later, sizeof(later));

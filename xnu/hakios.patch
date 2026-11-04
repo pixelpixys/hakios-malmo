@@ -3171,6 +3171,15 @@ index bec97fbf7243..203e1f48783f 100644
  #endif
  
  #if CONFIG_DTRACE
+@@ -780,6 +780,8 @@
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+ 	 * at the latest
+ 	 */
++	/* the count is final once the topology is parsed; set it here, before ml_wait_max_cpus() can sleep for the start-up */
++	ml_set_max_cpus(machine_info.max_cpus);
+ 	vm_set_restrictions(machine_info.max_cpus);
+ 
+ 
 diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
 index 384ef23fe0e1..d5ab6db0edbc 100644
 --- a/osfmk/kern/thread.c

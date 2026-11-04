@@ -318,7 +318,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			/* same sequence as the FIQ path in sleh_fiq() */
 			getCpuDatap()->cpu_decrementer = -1; /* Large */
 			if (++gic_timer_irq_count <= 3 || (gic_timer_irq_count % 1000) == 0) {
-				kprintf("vtimer_irq #%u (intid %u)\n", gic_timer_irq_count, intid);
+				kprintf("vtimer_irq #%u (intid %u) on cpu %d\n", gic_timer_irq_count, intid, cpu);
 			}
 			rtclock_intr(TRUE);
 		} else if (intid == GIC_SGI_SIGNAL) {
