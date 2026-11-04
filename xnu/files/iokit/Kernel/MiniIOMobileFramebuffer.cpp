@@ -38,6 +38,8 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+extern "C" uint64_t kvtophys(vm_offset_t va);
+extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -930,7 +932,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
-	uint32_t layers = 0;
+	uint32_t layers = 0, drew = 0;
+	uint32_t was = *(const volatile uint32_t *)fBase;
+	uint64_t fbphys = kvtophys((vm_offset_t)fBase);
 	MiniIOSurface * recorded = NULL;
 	bool report;
 
@@ -1034,10 +1038,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
 			drawLayer(s, src, dst);
+			drew++;
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 		}
+	}
+	if (drew != 0) {
+		FlushPoC_DcacheRegion((vm_offset_t)fBase, (size_t)fPanelHeight * fRowBytes);
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
@@ -1045,8 +1053,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fSwapsShown++;
 	if (gTouchLat) {
-		hakios_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
-		    micros(drawn));
+		hakios_tl("tl: v %u ready %llu shown %llu done %llu: %u layer%s drawn, surface %#x, panel %#x (was %#x, phys %#llx)\n",
+		    swapWord(swap, SWAP_ID), micros(ready), micros(shown), micros(drawn), drew, drew == 1 ? "" : "s",
+		    recorded != NULL ? *(const uint32_t *)recorded->pixels() : 0, *(const uint32_t *)fBase, was, fbphys);
 	}
 	if (layers != fLayersShown) {
 		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,

@@ -482,6 +482,22 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
  */
 static thread_call_t loader_stop_call;
 
+/* The host's request comes to this thread call on any processor; boot-arg return_cpu has that
+ * processor end the run, as with the timer (without it, whoever hears the request does). */
+static void
+loader_return_on_the_boot_processor(void)
+{
+	uint32_t cpu = 0;
+
+	if (PE_parse_boot_argn("return_cpu", &cpu, sizeof(cpu)) && cpu <= (uint32_t)ml_get_max_cpu_number() &&
+	    cpu_xcall((int)cpu, loader_return_test, (void *)1) == KERN_SUCCESS) {
+		for (;;) {
+			delay_for_interval(1000, NSEC_PER_MSEC);        /* that processor ends it */
+		}
+	}
+	loader_return();
+}
+
 static void
 loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
@@ -496,7 +512,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		hakios_adreno_stop();
 		hakios_wifi_stop();
 		hakios_adsp_stop();
-		loader_return();
+		loader_return_on_the_boot_processor();
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(loader_stop_call, deadline);
