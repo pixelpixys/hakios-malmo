@@ -3331,6 +3331,12 @@ hakios_adreno_resume(void)
 	printf("adreno: the system asks for the GPU: starting it\n");
 	gpu_asleep = false;                    /* (taken before the steps: a failed one is not tried again) */
 	quiet = false;
+	/*
+	 * Step 18 makes a new ring with a new command processor that reads from its start: the
+	 * cursors of the first start would tell it to read words that were never written.
+	 */
+	ring_at = ring_sent = 0;
+	core_stuck = false;
 	for (step = 4; step <= 21; step++) {
 		if (!steps[step - 1]()) {
 			printf("adreno: resume: step %u FAILED; the GPU is not usable\n", step);
