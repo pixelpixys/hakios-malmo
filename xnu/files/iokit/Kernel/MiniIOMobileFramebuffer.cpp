@@ -175,6 +175,10 @@ swapQueue(void)
  * touch takes to show (tools/latency.py; the touch's own lines: bsd/dev/hakios.input.c).
  */
 static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
+/* Boot-arg fbsolid=1: paint the whole panel magenta before every hand-over. The loader's screenshot
+ * reads the same physical memory the display scans, so if it shows apple and not magenta, the kernel's
+ * writes are not reaching DRAM (cache or wrong address), not a CoreAnimation problem. */
+static TUNABLE(uint32_t, gFBSolid, "fbsolid", 0);
 
 static inline uint64_t
 micros(uint64_t absolute)
@@ -1021,7 +1025,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
 		s = surfaces[layer];
 		if (report) {
-			IOLog("MiniIOMobileFramebuffer: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
+			hakios_tl("fb: swap %u layer %u: surface %u%s (%ux%u '%c%c%c%c') "
 			    "from %d,%d %dx%d to %d,%d %dx%d, layers set 0x%x\n", swapWord(swap, SWAP_ID), layer, sid,
 			    s ? "" : " MISSING", s ? s->info.width : 0, s ? s->info.height : 0,
 			    s ? (int) (s->info.pixelFormat >> 24 & 0xff) : '?', s ? (int) (s->info.pixelFormat >> 16 & 0xff) : '?',
@@ -1044,6 +1048,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	if (gFBSolid) {
+		uint32_t * pixels = (uint32_t *) fBase;
+
+		for (size_t i = 0; i < (size_t) fPanelHeight * (fRowBytes / sizeof(uint32_t)); i++) {
+			pixels[i] = 0xFFFF00FF;
+		}
+		drew++;
+	}
 	if (drew != 0) {
 		FlushPoC_DcacheRegion((vm_offset_t)fBase, (size_t)fPanelHeight * fRowBytes);
 	}
@@ -1053,9 +1065,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fSwapsShown++;
 	if (gTouchLat) {
-		hakios_tl("tl: v %u ready %llu shown %llu done %llu: %u layer%s drawn, surface %#x, panel %#x (was %#x, phys %#llx)\n",
+		hakios_tl("tl: v %u ready %llu shown %llu done %llu: %u layer%s drawn, surface %#x, panel %#x (was %#x, phys %#llx, va %p)\n",
 		    swapWord(swap, SWAP_ID), micros(ready), micros(shown), micros(drawn), drew, drew == 1 ? "" : "s",
-		    recorded != NULL ? *(const uint32_t *)recorded->pixels() : 0, *(const uint32_t *)fBase, was, fbphys);
+		    recorded != NULL ? *(const uint32_t *)recorded->pixels() : 0, *(const uint32_t *)fBase, was, fbphys, fBase);
 	}
 	if (layers != fLayersShown) {
 		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
@@ -1215,7 +1227,7 @@ IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32
 {
 	mach_port_t old;
 
-	IOLog("MiniIOMobileFramebuffer: notification port for type %u\n", (unsigned) type);
+	hakios_tl("fb: notification port for type %u\n", (unsigned) type);
 	if (type >= kFBNotifyTypes) {
 		return kIOReturnBadArgument;
 	}
@@ -1268,6 +1280,9 @@ IOMobileFramebufferUserClient::vsync(void)
 		fVSyncRunning = false;
 	} else {
 		fVSyncCount++;
+		if (fVSyncCount <= 3 || fVSyncCount % 300 == 0) {
+			hakios_tl("tl: b %llu\n", fVSyncCount);
+		}
 		setAsyncReference64(ref, fPorts[kFBNotifyVSync], fCallbacks[kFBNotifyVSync], fRefcons[kFBNotifyVSync], fTask);
 		args[0] = (uint32_t) now;
 		args[1] = now >> 32;
@@ -1297,7 +1312,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 
 		gFBCalls[selector]++;
 		proc_selfname(procname, sizeof(procname));
-		IOLog("MiniIOMobileFramebuffer: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
+		/* hakios_tl, not IOLog: the kernel console is muted without -v, the loader's log is not */
+		hakios_tl("fb: %s[%d] selector %u (scalars %u in [0x%llx 0x%llx 0x%llx 0x%llx], %u out; "
 		    "structure %u in, %u out)\n", procname, proc_selfpid(), selector, args->scalarInputCount,
 		    args->scalarInputCount > 0 ? in[0] : 0, args->scalarInputCount > 1 ? in[1] : 0,
 		    args->scalarInputCount > 2 ? in[2] : 0, args->scalarInputCount > 3 ? in[3] : 0, args->scalarOutputCount,
@@ -1378,6 +1394,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		IOLockLock(fLock);
 		fCallbacks[in[2]] = in[0];
 		fRefcons[in[2]] = in[1];
+		if (in[2] == kFBNotifyVSync) {
+			hakios_tl("fb: refresh notifications %s\n", in[0] != 0 ? "asked for" : "turned off");
+		}
 		if (in[2] == kFBNotifyVSync && in[0] != 0 && !fVSyncRunning && !fClosed) {
 			fVSyncRunning = true;
 			armVSync();
@@ -1422,7 +1441,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 
 	if (selector < 128 && !(gFBLogged[selector / 64] & (1ULL << (selector % 64)))) {
 		gFBLogged[selector / 64] |= 1ULL << (selector % 64);
-		IOLog("MiniIOMobileFramebuffer: selector %u not implemented (scalars %u in [0x%llx 0x%llx 0x%llx], %u out; "
+		hakios_tl("fb: selector %u not implemented (scalars %u in [0x%llx 0x%llx 0x%llx], %u out; "
 		    "structure %u in, %u out)\n", selector, args->scalarInputCount, args->scalarInputCount > 0 ? in[0] : 0,
 		    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, args->scalarOutputCount,
 		    args->structureInputSize, args->structureOutputSize);

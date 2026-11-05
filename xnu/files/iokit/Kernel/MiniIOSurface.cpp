@@ -102,6 +102,7 @@ static uint32_t         gSurfaceTraced;                         /* (a tunable is
 static char             gSurfaceTraceOf[32];
 
 extern "C" void loader_log_line(const char *line);
+extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
 
 /* A line about a traced surface: to the loader's log too, where it outlives the kernel's own, short log. */
 static void
@@ -1674,14 +1675,32 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		}
 		return kIOReturnSuccess;
 
+	case 40:                                        /* SpringBoard's IOSurfaceSharedEventAddEventListener */
+	case 41:                                        /* ... and the wake port it hands over */
+		/*
+		 * SpringBoard logs "IOSurfaceSharedEventAddEventListener failed: e00002c7" and gives up when
+		 * these are refused (it asks for 40, fails, then asks 41). Nothing here ever signals a shared
+		 * event, but the setup itself costs nothing to accept.
+		 */
+		if (!(gSurfaceLogged[selector / 64] & (1ULL << (selector % 64)))) {
+			gSurfaceLogged[selector / 64] |= 1ULL << (selector % 64);
+			hakios_tl("MiniIOSurface: selector %u accepted as a no-op (shared event listener)\n", selector);
+		}
+		return kIOReturnSuccess;
+
 	default:
 		break;
 	}
 
 	if (selector < 128 && !(gSurfaceLogged[selector / 64] & (1ULL << (selector % 64)))) {
+		char procname[32] = "?";
+
 		gSurfaceLogged[selector / 64] |= 1ULL << (selector % 64);
-		IOLog("MiniIOSurface: selector %u not implemented (scalars %u in, %u out; structure %u in, %u out)\n", selector,
-		    args->scalarInputCount, args->scalarOutputCount, args->structureInputSize, args->structureOutputSize);
+		/* hakios_tl, not IOLog: the kernel console is muted without -v, the loader's log is not */
+		proc_selfname(procname, sizeof(procname));
+		hakios_tl("MiniIOSurface: %s[%d] selector %u not implemented (scalars %u in, %u out; structure %u in, %u out)\n",
+		    procname, proc_selfpid(), selector, args->scalarInputCount, args->scalarOutputCount,
+		    args->structureInputSize, args->structureOutputSize);
 	}
 	return kIOReturnUnsupported;
 }
