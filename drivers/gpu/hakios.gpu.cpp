@@ -348,6 +348,10 @@ HakiosGPUStart(void)
 void
 HakiosGPUStop(void)
 {
+	if (gGPULock == NULL) {
+		hakios_gpu_stop();              /* (gpu_nosvc: no service was made, so no lock either) */
+		return;
+	}
 	IOLockLock(gGPULock);
 	hakios_gpu_stop();
 	IOLockUnlock(gGPULock);

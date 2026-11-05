@@ -3356,15 +3356,23 @@ hakios_adreno_resume(void)
 /* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
 
 /*
- * The SoC's temperature sensors report by themselves, in a block that is always on (dt: tsens1,
- * whose readings are at 0xc265000; Linux's tsens-v2.c): a status word a sensor, the last reading
- * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. Sensors 1 and
- * 2 sit at the GPU (dt: gpuss-0, gpuss-1). Read, never written: once a minute while the GPU is
+ * The SoC's temperature sensors report by themselves, in a block that is always on (Linux's
+ * tsens-v2.c): a status word a sensor, the last reading in its low 12 bits, signed, in tenths of
+ * a degree, and bit 21 when there is one. Read, never written: once a minute while the GPU is
  * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
  * sensor caught between two readings has none for a moment and is asked again; one that still
  * has none is put down as -273.0.
+ *
+ * Where they are is the phone's own device tree's. On redwood they are tsens1 (0xc265000),
+ * sensors 1 and 2 (gpuss-0, gpuss-1). On blair they are tsens0's readings (0x4411000), sensors
+ * 13 and 14 -- and 0xc265000 there is somebody else's block: reading it hangs the core.
  */
-static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
+#define HAKIOS_SOC_BASE         0x00200000ul    /* where the loader says the phone's peripherals begin (redwood's was 0x400000) */
+
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+
+static struct block tsens_redwood = { "tsens1", 0x0c265000, 0x200 };
+static struct block tsens_blair = { "tsens0", 0x04411000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 
@@ -3372,15 +3380,18 @@ void
 hakios_adreno_minute(void)
 {
 	int32_t tenths[2];
+	bool blair = pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE;
+	struct block *b = blair ? &tsens_blair : &tsens_redwood;
+	unsigned first = blair ? 13 : 1;
 
 	if (!gpu_kept) {
 		return;
 	}
-	need(&tsens);
+	need(b);
 	for (unsigned i = 0; i < 2; i++) {
 		tenths[i] = -2730;
 		for (unsigned again = 0; again < 16 && tenths[i] == -2730; again++) {
-			uint32_t status = rd(tsens.base + TSENS_STATUS(1 + i));
+			uint32_t status = rd(b->base + TSENS_STATUS(first + i));
 
 			if (status & TSENS_VALID) {
 				tenths[i] = (int32_t)(status << 20) >> 20;
@@ -3536,10 +3547,6 @@ out:
  * that only look (10 to 12) left out, no pauses, no watch. Anywhere else -- QEMU, whose machine
  * has its peripherals elsewhere -- not one register of the above is touched.
  */
-#define HAKIOS_SOC_BASE        0x00200000ul    /* where the loader says the phone's peripherals begin (redwood's was 0x400000) */
-
-extern vm_offset_t pe_arm_get_soc_base_phys(void);
-
 static bool
 start_by_itself(void)
 {
@@ -3652,7 +3659,11 @@ hakios_adreno_init(void)
 			gpu_block_stop();
 			quiet = true;
 			gpu_asleep = true;
-			HakiosGPUStart();
+			if (!(PE_parse_boot_argn("gpu_nosvc", &only, sizeof(only)) && only)) {
+				HakiosGPUStart();
+			} else {
+				printf("adreno: gpu_nosvc: the service HakiosGPU is not made, the GPU is only kept asleep\n");
+			}
 			return;
 		}
 		if (!by_itself) {
