@@ -83,6 +83,13 @@ else:
         'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')
     }
 
+for name, path in parts.items():
+    if not os.path.isfile(path):
+        hint = ''
+        if name == 'fd':
+            hint = ("\n  The UEFI image is not in the repository: it carries the phone vendor's own drivers, which are not\n"
+                    "  redistributed here. Build it from your own phone's firmware: uefi/README.md")
+        sys.exit(f'mkxnuimg.py: {path} not found{hint}')
 shim = open(parts['shim'], 'rb').read()
 fd = open(parts['fd'], 'rb').read()
 assert len(fd) == FD_SIZE, f"Expected FD size {hex(FD_SIZE)}, got {hex(len(fd))}"
