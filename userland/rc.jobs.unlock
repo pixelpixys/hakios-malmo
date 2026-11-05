@@ -3,5 +3,7 @@
 /redwood/bin/svc_test
 /redwood/bin/surf_test
 /bin/ps -A
+/redwood/bin/cpu_test
+/redwood/bin/mg_test
 # "swipe up to open": until somebody can do it with a finger
 /redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 250 &

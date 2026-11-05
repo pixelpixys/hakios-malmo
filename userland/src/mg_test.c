@@ -22,6 +22,9 @@ static const char *const keys[] = {
 int
 main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
+	printf("mg_test: MGGetProductType() = %#llx\n", (unsigned long long)MGGetProductType());
+
 	int count = argc > 1 ? argc - 1 : (int)(sizeof(keys) / sizeof(keys[0]));
 
 	for (int i = 0; i < count; i++) {

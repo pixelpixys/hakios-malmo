@@ -4,15 +4,14 @@
 usage: fetch-from-ipsw.py MEMBER OUTPUT
 
 The IPSW is a ZIP64 archive on Apple's CDN; its directory is read with HTTP range requests and
-the member is streamed (and inflated, if it is compressed) straight to OUTPUT. A download that
-breaks off is taken up again: a member stored without compression (the big disk images are)
-continues where it stopped, also when OUTPUT is the partial file of an earlier run; a compressed
-one starts over.
+the member is streamed (and inflated, if it is compressed) straight to OUTPUT.
 """
+import concurrent.futures
 import http.client
 import os
 import struct
 import sys
+import threading
 import time
 import urllib.request
 import zlib
@@ -58,29 +57,83 @@ def directory():
 
 
 def download(data, method, csize, output):
-    """One attempt at the member whose bytes start at DATA in the archive; returns the size of OUTPUT."""
+    """Download member whose bytes start at DATA in the archive; returns size of OUTPUT."""
     if method == 0:
-        have = os.path.getsize(output) if os.path.exists(output) else 0
-        if have > csize:
-            have = 0
-        if have < csize:
-            with fetch(data + have, data + csize - 1) as stream, open(output, 'ab' if have else 'wb') as out:
-                while chunk := stream.read(1 << 20):
-                    out.write(chunk)
+        chunk_size = 16 * 1024 * 1024
+        workers = 8
+        fd = os.open(output, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.ftruncate(fd, csize)
+            total_chunks = (csize + chunk_size - 1) // chunk_size
+            downloaded = 0
+            lock = threading.Lock()
+            last_print = time.time()
+            start_time = time.time()
+
+            def fetch_chunk(i):
+                nonlocal downloaded, last_print
+                chunk_start = i * chunk_size
+                chunk_end = min(csize, (i + 1) * chunk_size) - 1
+                for attempt in range(5):
+                    try:
+                        with fetch(data + chunk_start, data + chunk_end) as stream:
+                            content = stream.read()
+                            if len(content) != (chunk_end - chunk_start + 1):
+                                raise IOError(f"short read: {len(content)} vs {chunk_end - chunk_start + 1}")
+                            os.pwrite(fd, content, chunk_start)
+                            with lock:
+                                downloaded += len(content)
+                                now = time.time()
+                                if now - last_print >= 1.5 or downloaded == csize:
+                                    pct = (downloaded / csize) * 100
+                                    mb_done = downloaded / (1024 * 1024)
+                                    mb_total = csize / (1024 * 1024)
+                                    speed = (downloaded / max(0.1, now - start_time)) / (1024 * 1024)
+                                    print(f"\r  [{pct:5.1f}%] {mb_done:.1f} MB / {mb_total:.1f} MB ({speed:.2f} MB/s)", end="", flush=True)
+                                    last_print = now
+                            return
+                    except Exception as e:
+                        if attempt == 4:
+                            raise e
+                        time.sleep(2)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                list(executor.map(fetch_chunk, range(total_chunks)))
+            print()
+        finally:
+            os.close(fd)
         return os.path.getsize(output)
+
+    # method 8: deflated stream
     inflater = zlib.decompressobj(-15)
     written = 0
+    read_bytes = 0
+    start_time = time.time()
+    last_print = time.time()
     with fetch(data, data + csize - 1) as stream, open(output, 'wb') as out:
         while chunk := stream.read(1 << 20):
-            chunk = inflater.decompress(chunk)
-            out.write(chunk)
-            written += len(chunk)
+            read_bytes += len(chunk)
+            decomp = inflater.decompress(chunk)
+            out.write(decomp)
+            written += len(decomp)
+            now = time.time()
+            if now - last_print >= 1.5 or read_bytes == csize:
+                pct = (read_bytes / csize) * 100
+                mb_read = read_bytes / (1024 * 1024)
+                mb_total = csize / (1024 * 1024)
+                speed = (read_bytes / max(0.1, now - start_time)) / (1024 * 1024)
+                print(f"\r  [{pct:5.1f}%] {mb_read:.1f} MB / {mb_total:.1f} MB compressed ({speed:.2f} MB/s)", end="", flush=True)
+                last_print = now
         tail = inflater.flush()
         out.write(tail)
-    return written + len(tail)
+        written += len(tail)
+        print()
+    return written
 
 
 def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
     member, output = sys.argv[1], sys.argv[2]
     for name, method, csize, usize, offset in directory():
         if name != member:
@@ -95,10 +148,10 @@ def main():
             try:
                 written = download(data, method, csize, output)
             except (OSError, http.client.HTTPException, zlib.error) as error:
-                print(f'{member}: {error}', file=sys.stderr)
+                print(f'\n{member}: {error}', file=sys.stderr)
             if written == usize:
                 break
-            print(f'{member}: the download broke off, trying again ({attempt} of {ATTEMPTS})', file=sys.stderr)
+            print(f'\n{member}: the download broke off, trying again ({attempt} of {ATTEMPTS})', file=sys.stderr)
             time.sleep(5)
         print(f'{member}: {written} bytes (expected {usize})')
         sys.exit(0 if written == usize else 1)

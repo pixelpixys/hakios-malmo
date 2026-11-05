@@ -551,6 +551,18 @@ static const struct platform platform_redwood = {
 	.small_cores = 0x0f,
 };
 
+static const struct platform platform_malmo = {
+	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
+	.name = "malmo", .io_base = 0x00200000, .io_size = 0x3FE00000,
+	.gic_dist = 0x0F200000, .gic_redist = 0x0F240000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/*
+	 * Cores 0-5 are Cortex-A55s (1.8 GHz), 6-7 Cortex-A78s (2.2 GHz).
+	 * Small cores mask: bits 0..5 = 0x3f.
+	 */
+	.small_cores = 0x3f,
+};
+
 /* ------------------------------------------------------------------------ */
 
 static void
@@ -934,7 +946,7 @@ static uint64_t sound_len;
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
 #define START_SECONDS           5
 #define SILENCE_SECONDS         50
-#define NOTE_SECONDS            24      /* how long the kernel's progress is written down as it happens */
+#define NOTE_SECONDS            60      /* how long the kernel's progress is written down as it happens */
 
 static void wdt_pet(void);
 static int wdt_armed;
@@ -2166,7 +2178,7 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	if (charger_enabled || (PLAT != &platform_redwood && PLAT != &platform_malmo)) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -2334,10 +2346,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
+			flush_dcache((uint64_t)(uintptr_t)live, (uint64_t)(uintptr_t)live + sizeof(*live));
 			if (live->heartbeat != last_beat) {
 				last_beat = live->heartbeat;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
-			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
+			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS && (budget == 0 || seconds_since(started) >= budget + 15)) {
 				log_of_hung_kernel(live, slide);
 				status = OTHER_CPU_HUNG;
 			}
@@ -2432,7 +2445,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (PLAT != &platform_redwood && PLAT != &platform_malmo) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -3932,6 +3945,8 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == 0x85200000ULL) {
+			PLAT = &platform_malmo;
 		} else {
 			ramfb_phone_screen();
 		}

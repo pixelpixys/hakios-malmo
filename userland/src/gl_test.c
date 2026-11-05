@@ -267,6 +267,14 @@ main(int argc, char **argv)
 	OSMesaContext context;
 	int good = 0;
 
+	/* A debug option as the second word ("nobin", "sysmem", a list), for the phone's shell passes no
+	 * environment through: Mesa reads FD_MESA_DEBUG itself, one word at a time. */
+	if (argc > 1 && argv[1][0] != '0' && argv[1][0] > '9') {
+		static char options[128];
+
+		snprintf(options, sizeof(options), "%s", argv[1]);
+		setenv("FD_MESA_DEBUG", options, 1);
+	}
 	context = OSMesaCreateContextAttribs(attributes, NULL);
 	if (context == NULL || !OSMesaMakeCurrent(context, window, GL_UNSIGNED_BYTE, 16, 16)) {
 		printf("gl_test: no OpenGL ES context\n");

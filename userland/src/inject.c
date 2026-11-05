@@ -154,9 +154,10 @@ my_begin_update(void *display, void *update)
 {
 	uintptr_t r = orig_begin_update(display, update);
 
-	if (calls_begin++ < 6) {
-		say("hakios: begin_update -> %#lx (flags %#llx)\n", r, (unsigned long long)DISPLAY_FLAGS(display));
+	if (calls_begin < 10 || calls_begin % 300 == 0) {
+		say("hakios: begin_update #%u -> %#lx (flags %#llx)\n", calls_begin, r, (unsigned long long)DISPLAY_FLAGS(display));
 	}
+	calls_begin++;
 	return r;
 }
 
@@ -165,9 +166,10 @@ my_finish_update(void *display, void *update, unsigned flags)
 {
 	uintptr_t r = orig_finish_update(display, update, flags);
 
-	if (calls_finish++ < 6) {
-		say("hakios: finish_update(%#x) -> %#lx\n", flags, r);
+	if (calls_finish < 10 || calls_finish % 300 == 0) {
+		say("hakios: finish_update #%u(%#x) -> %#lx\n", calls_finish, flags, r);
 	}
+	calls_finish++;
 	return r;
 }
 
@@ -201,9 +203,10 @@ my_render_update(void *server, void *update, unsigned *flags)
 {
 	uintptr_t r = orig_render_update(server, update, flags);
 
-	if (calls_render++ < 6) {
-		say("hakios: render_update -> %#lx (flags %#x)\n", r, flags ? *flags : 0);
+	if (calls_render < 10 || calls_render % 300 == 0) {
+		say("hakios: render_update #%u -> %#lx (flags %#x)\n", calls_render, r, flags ? *flags : 0);
 	}
+	calls_render++;
 	return r;
 }
 
