@@ -244,6 +244,10 @@ find_channel(struct peripheral *p, uint32_t channels)
 #define PON_SUBTYPE_HLOS        0x09
 #define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
 #define PON_RESIN               0x40
+/* the older blocks (subtype 0x04, as in this phone's PM6125) have one status bit per input instead: power, volume
+ * down, and USB in (which reads as set while the cable is in) */
+#define PON_KPDPWR_OLD          0x01
+#define PON_RESIN_OLD           0x02
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
@@ -254,6 +258,9 @@ find_channel(struct peripheral *p, uint32_t channels)
 #define GPIO_REG_SUPPLY         0x41
 #define GPIO_REG_PULL           0x42            /* [2:0]: 0 to 3 up (30, 1.5, 31.5 uA, 1.5 with a boost), 4 down, 5 none */
 #define GPIO_REG_ENABLE         0x46            /* [7] */
+
+/* Which bit of the power-on block's status is which input: the ones above, or the older block's. */
+static uint8_t pon_kpdpwr = PON_KPDPWR, pon_resin = PON_RESIN;
 
 #define POLL_MS                 16
 #define MINUTE_TICKS            (60 * 1000 / POLL_MS)
@@ -330,8 +337,8 @@ buttons_poll(void)
 	if (power.usable || volume_down.usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(&power, status & pon_kpdpwr);
+			button_look(&volume_down, status & pon_resin);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
@@ -378,7 +385,7 @@ static void
 pon_inputs(void)
 {
 	const char *problem;
-	uint8_t r[8], more[2];
+	uint8_t r[8], more[2], kind[2];
 
 	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n",
 	    pon.name, pon.id & 0xff, pon.id & 0xff);
@@ -387,14 +394,20 @@ pon_inputs(void)
 		printf("buttons: %s: %s\n", pon.name, problem);
 		return;
 	}
+	if (spmi_read(&pon, REG_TYPE, kind, 2) == NULL && kind[1] != PON_SUBTYPE_HLOS) {
+		pon_kpdpwr = PON_KPDPWR_OLD;
+		pon_resin = PON_RESIN_OLD;
+		printf("buttons: this power-on block is the older kind (subtype %#x): power is status bit 0, volume down bit 1\n",
+		    kind[1]);
+	}
 	spmi_read(&pon, REG_INT_LATCHED, more, 2);
 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_kpdpwr) ? "HELD" : "released",
+	    (r[0] & pon_resin) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
 	power.usable = volume_down.usable = true;
-	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	power.last = r[0] & pon_kpdpwr;
+	volume_down.last = r[0] & pon_resin;
 }
 
 /* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
