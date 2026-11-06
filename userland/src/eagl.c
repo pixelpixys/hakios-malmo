@@ -371,9 +371,11 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
  * for a home screen. (Mesa's driver for this GPU drew the first triangle of each such quad
  * with pixels of another tile, fragments of other icons under the labels, until it was given a
  * flush before the first draw that reads the picture after one that does not:
- * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) Off by default after the 2.3.4 merge: the
- * home screen then has no black boxes under the labels (logs/nofetch-130.png); glfetch=1 turns
- * the extension back on, to see the difference.
+ * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) Off by default: offered, CoreAnimation draws
+ * the labels' shadows and the widgets' corners as black plates over the wallpaper -- the pixels
+ * it reads are not the composited ones (logs/flush-home-2012.png); withheld, "Reduce
+ * Transparency" (ui_lite=1) keeps the home screen clean at 24-31 frames a second
+ * (logs/lite-2034.png). glfetch=1 offers it again, to see the difference.
  */
 static int fetch_offered = 0;
 

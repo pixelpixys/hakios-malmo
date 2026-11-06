@@ -136,7 +136,7 @@
  
 --- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
 +++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
-@@ -445,6 +445,21 @@
+@@ -445,6 +445,22 @@
         DRAW == DRAW_INDIRECT_OP_INDIRECT_COUNT)
        ctx->batch->barrier |= FD6_WAIT_FOR_ME;
  
@@ -149,9 +149,10 @@
 +    * a label's shadow that way over icons drawn the ordinary way: the first
 +    * triangle of each such quad was wrong, the second right.  A CCU colour
 +    * flush before the draw mends it, and so does a UCHE invalidate alone;
-+    * the first such draw gets both, as a framebuffer barrier would give.
++    * every such draw now gets both: the flag the old check kept is per
++    * batch and survives a change of framebuffer, so some draws went without.
 +    */
-+   if (unlikely(emit.fs->fb_read) && !ctx->batch->prev_draw_read_fb)
++   if (unlikely(emit.fs->fb_read))
 +      ctx->batch->barrier |= FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE;
 +   ctx->batch->prev_draw_read_fb = emit.fs->fb_read;
 +
