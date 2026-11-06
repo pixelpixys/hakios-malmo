@@ -1951,7 +1951,26 @@ step_core_power(void)
 	announce("turn on the 3D core's clocks (gx_cxo at 0x1060, gx_gfx3d at 0x1054): their status bits are not ones "
 	    "to rely on here, so they are written and not waited for");
 	clock_on(&gpucc, "gx_cxo", 0x1060, false);
+	/*
+	 * The 3D core's clock is gx_gfx3d_clk_src, an RCG at 0x101c (gpucc-sm6375.c, this phone's own map), and
+	 * nothing here had set it: it is whatever the boot loader left, and if that is the 19.2 MHz crystal the
+	 * core draws some fifteen times slower than its lowest rated speed. Ask the 600 MHz GPLL0 for half of it
+	 * (300 MHz, under the device tree's lowest level of 315) when it runs from the crystal; leave it be if the
+	 * boot loader clocked it from a PLL already. source 5 is GPLL0, divider field 3 is a divider of 2 (2*2-1).
+	 */
+	{
+		uint32_t was = get(&gpucc, "gx_gfx3d_clk_src", 0x1020);
+
+		if ((was & RCG_SOURCE_MASK) == 0) {
+			clock_source("gx_gfx3d_clk_src", 0x101c, 5u << 8 | 3);
+		}
+		printf("adreno: %u: gx_gfx3d_clk_src %#x -> %#x (300 MHz from GPLL0 when it was the crystal)\n", step, was,
+		    get(&gpucc, "gx_gfx3d_clk_src", 0x1020));
+	}
 	clock_on(&gpucc, "gx_gfx3d", 0x1054, false);
+	clock_on(&gpucc, "cx_gfx3d", 0x10a4, false);
+	clock_on(&gpucc, "cx_gfx3d_slv", 0x10a8, false);
+
 
 	announce("ask the GMU's wrapper to power the 3D core directly (SPTPRAC, 0x596a204): no HFI, no firmware -- this "
 	    "is Linux's a6xx_sptprac_enable() for this exact chip");
