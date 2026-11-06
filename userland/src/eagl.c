@@ -249,7 +249,7 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
+	struct image images[1024];
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
@@ -371,13 +371,13 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
  * for a home screen. (Mesa's driver for this GPU drew the first triangle of each such quad
  * with pixels of another tile, fragments of other icons under the labels, until it was given a
  * flush before the first draw that reads the picture after one that does not:
- * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) Off by default: offered, CoreAnimation draws
- * the labels' shadows and the widgets' corners as black plates over the wallpaper -- the pixels
- * it reads are not the composited ones (logs/flush-home-2012.png); withheld, "Reduce
- * Transparency" (ui_lite=1) keeps the home screen clean at 24-31 frames a second
- * (logs/lite-2034.png). glfetch=1 offers it again, to see the difference.
+ * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) On by default: offered, CoreAnimation's
+ * shadows and colour matrices are one draw where otherwise there are four. It used to draw black
+ * plates over the wallpaper (logs/flush-home-2012.png) because a GMEM tile holds only what the
+ * batch drew into it; such batches are drawn into memory now (freedreno_gmem.c, same patch).
+ * Boot-arg glfetch=0 withholds it, to see the difference.
  */
-static int fetch_offered = 0;
+static int fetch_offered = 1;
 
 #define GL_SCISSOR_TEST                 0x0c11
 #define GL_SCISSOR_BOX                  0x0c10
@@ -4258,7 +4258,7 @@ install(void)
 		if ((argument = strstr(arguments, "gltrace_corners=")) != NULL) {
 			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);
 		}
-		fetch_offered = strstr(arguments, "glfetch=1") != NULL;
+		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;

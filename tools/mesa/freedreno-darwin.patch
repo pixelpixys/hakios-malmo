@@ -364,3 +364,22 @@
     /* We use a null software winsys since we always just render to ordinary
      * driver resources.
      */
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -732,6 +732,16 @@
+ 
+    if (FD_DBG(SYSMEM))
+       sysmem = true;
++
++   /* Darwin on hakios: a draw that reads the framebuffer reads it through
++    * UCHE, and a GMEM tile holds only what this batch drew into it: what was
++    * drawn before the batch is not there.  CoreAnimation's label shadows and
++    * widget corners came out as black plates over the wallpaper for that
++    * reason.  A batch with such a draw is drawn into memory instead, where
++    * the read finds what is there.
++    */
++   if (fd_patch_num_elements(&batch->fb_read_patches))
++      sysmem = true;
+ 
+    /* Layered rendering always needs bypass. */
+    for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
