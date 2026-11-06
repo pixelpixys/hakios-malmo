@@ -1,0 +1,8 @@
+# Page swipes across the home screen, for measuring frames a second:
+#   GL=1 RC_JOBS=rc.jobs.swipe userland/build.sh && XL_CMDLINE="... gpu=1 fb_hz=120" ./xl run
+/redwood/bin/rwtouch wait 40 swipe 0.85 0.5 0.15 0.5 400 &
+/redwood/bin/rwtouch wait 41 swipe 0.15 0.5 0.85 0.5 400 &
+/redwood/bin/rwtouch wait 42 swipe 0.85 0.5 0.15 0.5 400 &
+/redwood/bin/rwtouch wait 43 swipe 0.15 0.5 0.85 0.5 400 &
+/redwood/bin/rwtouch wait 44 swipe 0.85 0.5 0.15 0.5 400 &
+/redwood/bin/rwtouch wait 45 swipe 0.15 0.5 0.85 0.5 400 &
