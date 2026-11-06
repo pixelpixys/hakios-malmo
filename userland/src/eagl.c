@@ -371,10 +371,11 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
  * for a home screen. (Mesa's driver for this GPU drew the first triangle of each such quad
  * with pixels of another tile, fragments of other icons under the labels, until it was given a
  * flush before the first draw that reads the picture after one that does not:
- * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) Boot-arg glfetch=0 keeps the extension from
- * CoreAnimation, to see the difference.
+ * tools/mesa/freedreno-darwin.patch, fd6_draw.cc.) Off by default after the 2.3.4 merge: the
+ * home screen then has no black boxes under the labels (logs/nofetch-130.png); glfetch=1 turns
+ * the extension back on, to see the difference.
  */
-static int fetch_offered = 1;
+static int fetch_offered = 0;
 
 #define GL_SCISSOR_TEST                 0x0c11
 #define GL_SCISSOR_BOX                  0x0c10
@@ -4255,7 +4256,7 @@ install(void)
 		if ((argument = strstr(arguments, "gltrace_corners=")) != NULL) {
 			trace_corners = (GLsizei)strtol(argument + 16, NULL, 10);
 		}
-		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
+		fetch_offered = strstr(arguments, "glfetch=1") != NULL;
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;
