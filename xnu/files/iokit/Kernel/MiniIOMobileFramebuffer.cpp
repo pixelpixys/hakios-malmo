@@ -28,6 +28,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <vm/vm_kern.h>
+#include <vm/pmap.h>
 
 extern "C" {
 #include <console/video_console.h>
@@ -267,6 +269,10 @@ static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
  */
 static TUNABLE(uint32_t, gBeam, "fb_beam", 1);
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+#ifndef VM_WIMG_WCOMB
+#define VM_WIMG_WCOMB 0x6       /* VM_MEM_COHERENT | VM_MEM_NOT_CACHEABLE (arm/memory_types.h is not on IOKit's path) */
+#endif
 static inline uint32_t refreshHz(void);
 
 /*
@@ -275,6 +281,42 @@ static inline uint32_t refreshHz(void);
  * abort a minute after boot, so on a SoC not known here nothing is read and frames stay on their beat.
  */
 static TUNABLE(uint64_t, gIntfPhysical, "fb_intf", 0);
+
+/*
+ * Boot-arg fb2_pa=PHYSICAL: a second frame the loader kept for the panel below 4 GB (the pipe's address is 32-bit).
+ * It is inside the kernel's static region, so nothing else allocates it; the driver maps it write-combined, as the
+ * text console maps the boot framebuffer, and the panel is given one buffer or the other in the blanking.
+ * fb_flip=1 turns it on. Off: frames are drawn into the buffer the panel scans, behind the scan (fb_beam), which is
+ * slower but shows every frame whole; the flip is still being worked out (flashes and a DPU underrun when it commits
+ * a frame that is not complete).
+ */
+static TUNABLE(uint64_t, gSecondPhysical, "fb2_pa", 0);
+static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
+
+/*
+ * Boot-arg fb_dpu=1: a read-only look at the layer registers of the display controller, to see whether a second
+ * buffer and a flip are within reach (the panel then reads one buffer while the next frame is written to the other).
+ * Offsets from this phone's device tree (sde-sspp-off, sde-mixer-off, sde-dspp-off); MDSS itself at fb_intf's block.
+ * The pipe that scans the boot framebuffer is found by its stride, or by its address matching the framebuffer's. Reads
+ * only, once, five seconds after the driver starts.
+ */
+static TUNABLE(uint32_t, gDpuProbe, "fb_dpu", 0);
+#define MDSS_MDP_PHYSICAL       0x5e00000UL
+#define MDSS_MDP_SIZE           0x8f030UL
+#define SSPP_VIG_OFF            0x5000                  /* sde-sspp-off, from MDSS: the device tree's offsets are */
+#define SSPP_DMA_OFF            0x25000                 /* ... absolute, as fb_intf (sde-intf-off 0x6b800) shows */
+#define MIXER_OFF               0x45000
+#define SSPP_SRC_SIZE           0x00
+#define SSPP_SRC_XY             0x08
+#define SSPP_SRC0_ADDR          0x14
+#define SSPP_SRC0_STRIDE        0x24
+#define SSPP_SRC_FORMAT         0x30
+#define SSPP_SRC_OP_MODE        0x38
+#define SSPP_FETCH_CONFIG       0x48
+#define LM_OUT_SIZE             0x04
+#define CTL_OFF                 0x2000                  /* sde-ctl-off */
+#define CTL_FLUSH               0x18
+#define CTL_START               0x1c
 
 static vm_offset_t
 panelInterface(void)
@@ -353,6 +395,10 @@ class IOMobileFramebuffer : public IOService
 public:
 	IOLock *        fLock;
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	uint8_t *       fDraw;                  /* where the next frame is drawn: the buffer the panel is not reading */
+	uint64_t        fBasePhys, fDrawPhys;   /* ... their physical addresses (the pipe reads by physical address) */
+	IOBufferMemoryDescriptor * fBackMemory; /* ... one physically contiguous frame, below 4 GB for the pipe's 32-bit address */
+	vm_offset_t     fSspp, fCtl;            /* the pipe that scans the panel, and the control block that latches it */
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -436,6 +482,7 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void flip(void);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool fSettling;                 /* drawing the last frame again, filtered (fb_filter=2) */
 	bool fFilterFrame;              /* this frame came slowly: filtered as it is (fb_filter=2) */
@@ -447,6 +494,8 @@ public:
 	static void helperMain(void * self, wait_result_t result);
 	static void beamProbeMain(void * self, wait_result_t result);
 	void beamProbe(void);
+	static void dpuProbeMain(void * self, wait_result_t result);
+	void dpuProbe(void);
 	uint64_t beamNextScan(uint64_t now);
 	void beamWait(const struct RowJob * job, int32_t lastRow);
 	void beamShareDone(const struct RowJob * job, unsigned share, int32_t firstRow, int32_t lastRow, uint64_t began);
@@ -587,6 +636,10 @@ IOMobileFramebuffer::start(IOService * provider)
 	if (gMeasure && kernel_thread_start(measurePanel, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
+	if (gDpuProbe && kernel_thread_start(dpuProbeMain, this, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "the display controller's pipes: looked at");
+		thread_deallocate(thread);
+	}
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
 	if (panel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
@@ -643,6 +696,33 @@ IOMobileFramebuffer::start(IOService * provider)
 	fDiffLeft = fDiffTop = ~0u;
 	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
 	    fPanelWidth, fPanelHeight, fRowBytes);
+	/*
+	 * A second frame, so that one is drawn while the panel reads the other: the pipe that scans the panel is given
+	 * the other's address in the blanking before a scan, and the frame on the panel is then always whole (with one
+	 * buffer the frame is written behind the scan, and a row written too late waits for the next frame to be fixed).
+	 * The pipe reads by physical address (fb_dpu showed the boot framebuffer's), so the loader keeps it below 4 GB;
+	 * it is mapped write-combined, as the text console maps the boot framebuffer (the pipe reads memory, and a
+	 * mapping through the kernel's cacheable view of it stalled the presentation after a few frames).
+	 */
+	fDraw = fBase;
+	fBasePhys = fDrawPhys = (uint64_t) vinfo.v_physaddr;
+	fBackMemory = NULL;
+	fSspp = ml_io_map(MDSS_MDP_PHYSICAL, MDSS_MDP_SIZE);
+	fCtl = fSspp != 0 ? fSspp + CTL_OFF : 0;
+	if (gFlip && gSecondPhysical != 0) {
+		vm_size_t bytes = round_page((vm_size_t) fPanelHeight * fRowBytes);
+		vm_offset_t virt = ml_io_map_unmappable((vm_offset_t) gSecondPhysical, bytes, VM_WIMG_WCOMB);
+
+		if (virt != 0) {
+			fDraw = (uint8_t *) virt;
+			fDrawPhys = gSecondPhysical;
+		}
+	}
+	hakios_tl("fb: second frame %s at pa %#llx; mdss %#llx\n", fDraw != fBase ? "made" : "NOT made",
+	    fDraw != fBase ? fDrawPhys : 0ull, (uint64_t) fSspp);
+	if (fDraw == fBase) {
+		IOLog("MiniIOMobileFramebuffer: no second frame for the panel: frames are drawn where they are shown\n");
+	}
 
 	if (gRecSeconds != 0) {
 		/* one piece of physical memory: the loader will send it over USB as it lies */
@@ -843,7 +923,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
 			continue;
 		}
-		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
+		to = (uint32_t *) (fDraw + (size_t) y * fRowBytes);
 		if (job->unscaled) {
 			/* not scaled at all */
 			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
@@ -962,7 +1042,7 @@ IOMobileFramebuffer::beamProbe(void)
 	uint32_t first, frames, line, lines = 0, smallest = ~0u;
 	uint64_t began, ended, until;
 
-	IOSleep(60000);
+	IOSleep(1000);          /* (the panel is already scanning the boot framebuffer: the flip needs its lines early) */
 	intf = panelInterface();
 	if (intf == 0) {
 		IOLog("MiniIOMobileFramebuffer: fb_beam: no display interface known for this SoC (fb_intf=): frames stay on their beat\n");
@@ -1071,6 +1151,38 @@ IOMobileFramebuffer::beamShareDone(const struct RowJob * job, unsigned share, in
 			__atomic_fetch_add(&fStatShareClose[share], 1, __ATOMIC_RELAXED);
 		}
 	}
+}
+
+/* fb_dpu: read-only: which pipe scans out, from where, and with what stride (see the comment at fb_dpu). */
+void
+IOMobileFramebuffer::dpuProbeMain(void * self, wait_result_t result __unused)
+{
+	((IOMobileFramebuffer *) self)->dpuProbe();
+}
+
+void
+IOMobileFramebuffer::dpuProbe(void)
+{
+	IOSleep(5000);
+	uint64_t phys = kvtophys((vm_offset_t) fBase);
+	vm_offset_t mdss = ml_io_map(MDSS_MDP_PHYSICAL, MDSS_MDP_SIZE);
+	struct { const char * name; uint32_t off; } pipes[] = { { "vig", SSPP_VIG_OFF }, { "dma", SSPP_DMA_OFF } };
+
+	if (mdss == 0) {
+		hakios_tl("fb_dpu: could not map the display controller\n");
+		return;
+	}
+	hakios_tl("fb_dpu: the panel's memory is at %#llx, %ux%u, %u bytes a row\n", phys, fPanelWidth, fPanelHeight, fRowBytes);
+	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
+		volatile uint32_t * p = (volatile uint32_t *) (mdss + pipes[i].off);
+
+		hakios_tl("fb_dpu: %s: address %#x, stride %#x, size %#x, xy %#x, format %#x, op mode %#x (its memory %s the panel's)\n",
+		    pipes[i].name, p[SSPP_SRC0_ADDR / 4], p[SSPP_SRC0_STRIDE / 4], p[SSPP_SRC_SIZE / 4], p[SSPP_SRC_XY / 4],
+		    p[SSPP_SRC_FORMAT / 4], p[SSPP_SRC_OP_MODE / 4],
+		    (uint64_t) p[SSPP_SRC0_ADDR / 4] == phys ? "is" : "is not");
+	}
+	hakios_tl("fb_dpu: mixer at mdss+%#x: op mode %#x, out size %#x\n", MIXER_OFF,
+	    *(volatile uint32_t *) (mdss + MIXER_OFF + 0x00), *(volatile uint32_t *) (mdss + MIXER_OFF + LM_OUT_SIZE));
 }
 
 /*
@@ -1190,7 +1302,8 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.ry1 = py1 > (int32_t) fPanelHeight ? (int32_t) fPanelHeight : py1;
 	job.filter = filter;
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
-	job.scan = fSettling ? 0 : fBeamScan;
+	/* with a second buffer the rows are written where the panel is not reading: no scan to keep behind */
+	job.scan = fDraw != fBase ? 0 : (fSettling ? 0 : fBeamScan);
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, job.ry0, job.ry1, fBlendRow);
 		return;
@@ -1403,6 +1516,45 @@ IOMobileFramebuffer::presenter(void)
 }
 
 /*
+ * The frame just drawn into fDraw, on the panel from its next scan on: the pipe's source address is changed in the
+ * blanking before a scan (or at once, if one is not being read), and the control block is told to latch it there.
+ * Then the two buffers change places: what the panel read is where the next frame is drawn.
+ */
+void
+IOMobileFramebuffer::flip(void)
+{
+	if (fDraw == fBase || fSspp == 0 || fCtl == 0) {
+		return;
+	}
+	if (fBeamIntf != 0 && fBeamLines > fPanelHeight) {
+		/* the device tree's line counter starts at the blanking: the active rows are the last fPanelHeight lines */
+		uint32_t line = *(volatile uint32_t *)(fBeamIntf + INTF_LINE_COUNT);
+		uint32_t blank = fBeamLines - fPanelHeight;
+
+		if (line >= blank && line < fBeamLines) {
+			uint64_t now = mach_absolute_time();
+			uint64_t at = now - fBeamPeriod * line / fBeamLines + fBeamPeriod;
+
+			if (at > now) {
+				clock_delay_until(at);
+			}
+		}
+	}
+	*(volatile uint32_t *)(fSspp + SSPP_SRC0_ADDR) = (uint32_t) fDrawPhys;
+	*(volatile uint32_t *)(fCtl + CTL_FLUSH) = 1u << 0;     /* SSPP_VIG0 */
+	*(volatile uint32_t *)(fCtl + CTL_START) = 1;
+	{
+		uint8_t * front = fBase;
+		uint64_t frontPhys = fBasePhys;
+
+		fBase = fDraw;
+		fBasePhys = fDrawPhys;
+		fDraw = front;
+		fDrawPhys = frontPhys;
+	}
+}
+
+/*
  * The frame on the panel once more, filtered (fb_filter=2): the same layers from the same surfaces where show() put
  * them, nothing else (no turn to wait for, no swap to hand on, nothing counted). Its surfaces were held since.
  */
@@ -1426,6 +1578,10 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 		drawLayer(s, src, dst);
 	}
 	fSettling = false;
+	if (fDraw != fBase) {
+		FlushPoC_DcacheRegion((vm_offset_t) fDraw, (size_t) fPanelHeight * fRowBytes);
+		flip();
+	}
 	fStatSettled++;
 }
 
@@ -1437,7 +1593,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0, drew = 0;
 	uint32_t was = *(const volatile uint32_t *)fBase;
-	uint64_t fbphys = kvtophys((vm_offset_t)fBase);
+	uint64_t fbphys = fBasePhys;
 	MiniIOSurface * recorded = NULL;
 	bool report;
 
@@ -1519,7 +1675,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			/* the bottom layer taken away: nothing is shown, the screen is black */
 			if (layer == 0 && (set & 1) && fGraphics) {
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
-					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+					bzero(fDraw + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
 			}
 			continue;
@@ -1553,7 +1709,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	if (gFBSolid) {
-		uint32_t * pixels = (uint32_t *) fBase;
+		uint32_t * pixels = (uint32_t *) fDraw;
 
 		for (size_t i = 0; i < (size_t) fPanelHeight * (fRowBytes / sizeof(uint32_t)); i++) {
 			pixels[i] = 0xFFFF00FF;
@@ -1561,7 +1717,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		drew++;
 	}
 	if (drew != 0) {
-		FlushPoC_DcacheRegion((vm_offset_t)fBase, (size_t)fPanelHeight * fRowBytes);
+		FlushPoC_DcacheRegion((vm_offset_t)fDraw, (size_t)fPanelHeight * fRowBytes);
+		flip();
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {

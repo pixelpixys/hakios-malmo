@@ -33,6 +33,7 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define RESIDENT_RD_OFFSET  0x08000000ULL
 #define RESIDENT_RD_RESERVE 0x30000000ULL         /* RAM that must remain for the kernel itself */
 #define PAGE_SIZE_MAX       0x4000ULL
+#define FB2_SIZE            0x1000000ULL          /* a second frame for the panel: 10 MB and change at 1080x2400 */
 
 #define LOG_PARTITION       u"logdump"
 #define CHECKPOINT_SELFTEST 999
@@ -2971,6 +2972,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			rd1_size = res_size;
 		}
 	}
+	/*
+	 * A second frame for the panel, below 4 GB (the display pipe's address register is 32-bit): the gap between
+	 * the payload RAM disk and the resident root is inside the kernel's static region, which the VM is never
+	 * given, so nothing else allocates it. The driver maps it write-combined and flips the panel to it.
+	 */
+	uint64_t fb2_pa = 0;
+	if (rd1_size != 0) {
+		uint64_t lo = (rd_pa + rd_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
+
+		if (lo + FB2_SIZE <= rd1_pa && lo + FB2_SIZE <= 0x100000000ULL) {
+			fb2_pa = lo;
+			print("second frame at pa %x size %x\n", fb2_pa, (uint64_t)FB2_SIZE);
+		}
+	}
 	/* everything up to topOfKernelData is the kernel's static region: it must cover both images */
 	uint64_t dt_pa = rd1_size != 0 ? rd1_pa + rd1_size : rd_pa + rd_size;
 	uint64_t dt_max = 0x10000;
@@ -3202,6 +3217,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("WARNING: hakios_kver= does not fit in the kernel command line (%d of %d used)\n", (uint64_t)before,
 			    (uint64_t)(BOOT_LINE_LENGTH - 1));
 		}
+	}
+	if (fb2_pa != 0) {
+		static const char prefix[] = "fb2_pa=0x";
+		static const char hex[] = "0123456789abcdef";
+
+		for (const char *c = prefix; *c && n < BOOT_LINE_LENGTH - 1; c++) {
+			ba->commandLine[n++] = *c;
+		}
+		for (int shift = 60; shift >= 0 && n < BOOT_LINE_LENGTH - 1; shift -= 4) {
+			ba->commandLine[n++] = hex[(fb2_pa >> shift) & 0xf];
+		}
+		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	}
 	/*
 	 * The payload's own command line, last. The kernel's boot_args holds BOOT_LINE_LENGTH characters and the
