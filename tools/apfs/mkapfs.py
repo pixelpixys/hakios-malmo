@@ -332,7 +332,9 @@ class Volume:
         forks = iter(())
         if self.compress:
             # compressed by as many processes as there are processors, taken in the files' order
-            pool = concurrent.futures.ProcessPoolExecutor()
+            # a worker holds a whole file plus its zlib output; on a small machine that is the peak
+            pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=int(os.environ.get('MKAPFS_JOBS', 0)) or None)
             forks = pool.map(compressed_fork, [n.source for n in files if n.size > 0 and not self.is_plain(n)],
                              chunksize=16)
         for node in files:
