@@ -1,62 +1,68 @@
-# HakiOS
+# HakiOS for Motorola Moto G85 5G (`malmo` / Qualcomm SM6375 Blair)
 
-English · [中文](README.zh.md) · [Українська](README.uk.md)
+> **Порт Apple Darwin XNU (xnu-8796.121.2) и iOS 16.5 SpringBoard на смартфон Motorola Moto G85 5G**  
+> Репозиторий: [github.com/pixelpixys/hakios-malmo](https://github.com/pixelpixys/hakios-malmo)
 
-**Apple's open-source Darwin kernel (XNU, xnu-8796.121.2) on Android phones**, the way Android is Linux on phones: a boot loader of its
-own, drivers of its own, a configuration system and a version of its own. The same kernel runs in QEMU with nothing of Apple's and
-nothing of any phone's (`make qemu-open`). A research bench, not a ROM: by default it runs from RAM, and a reboot gives the phone back to
-Android.
+---
 
-**Documentation:** [docs/](docs/index.md), and the site, [hackios-web.vercel.app](https://hackios-web.vercel.app).
+## 📊 Общий прогресс портирования: **~78%**
 
-**News, 4 November 2026:** on the POCO X5 Pro 5G the window server draws through Metal on the Adreno 642L, two ways. hakios-metal: page
-swipes 110 to 115 frames a second, Settings' scroll 118, the home button 106, rendering at 828x1792 stretched to the panel; 101, about 90 and about 90 at the full 1125x2436. UniXNU's Metal on Vulkan: swipes 50 to 57, scroll 41. The panel is 120 Hz,
-and **120 frames a second has not been reached**. [Metal on the Adreno](docs/reference/metal.md),
-[the measurements](docs/reference/metal-measurements.md).
+Интерфейс SpringBoard (iOS 16.5) полностью загружается в оперативную память (Live RAM) без изменения разделов Android. Перезагрузка возвращает телефон в исходное состояние.
 
-Start with [Getting started](docs/getting-started/index.md), [On the phone](docs/getting-started/phone.md) or
-[Port a device](docs/porting/index.md). What works, part by part: [the documentation's front page](docs/index.md#what-works).
+---
 
-## Repositories
+## ⚙️ Статус компонентов (Hardware Support)
 
-| Repository | Contents |
-|---|---|
-| [hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | **common**: the kernel port, every common driver, the loader, user space, the tools, this documentation, and `devices/qemu` |
-| [`hakios-metal/`](hakios-metal) | Metal's command model on the Adreno, through the kernel's GPU driver |
-| [hakios-sm7325](https://github.com/oosexgang/hakios-sm7325) | POCO X5 Pro 5G: its defconfig, status, UEFI platform, firmware script, and its SoC's layer (Qualcomm SC7280 family) |
-| [hakios-mt6768](https://github.com/oosexgang/hakios-mt6768) | Infinix Hot 20 (MediaTek Helio G85): an experimental port with its own loader. Not in this repository's manifest |
-| [hakios-uefi](https://github.com/oosexgang/hakios-uefi) | the firmware that starts the loader: Mu-Silicium with HakiOS's boot path, banner and name, and HakiOS's U-Boot |
-| [hackios-web](https://github.com/oosexgang/hackios-web) | the website |
-| [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) | old: a pointer kept for its links. User space is `userland/` here |
+| Компонент / Подсистема | Статус | Процент готовности | Примечания |
+|---|:---:|:---:|---|
+| **CPU / Multicore** | ✅ Работает | 100% | 8 ядер Kryo (2x Gold + 6x Silver), `bootcpu=7 cpus=7`, SMP |
+| **Память / RAM & APFS** | ✅ Работает | 100% | Live APFS ramdisk (`root.apfs`, `system.apfs`), сжатие lz4 |
+| **Дисплей (Framebuffer)** | ✅ Работает | 100% | 1080x2400 OLED, плавная развёртка 120 Гц (`fb_hz=120`, `ca_vbl=1`) |
+| **GPU (Adreno 619)** | ✅ Работает | 90% | Аппаратное ускорение через `hakios-gl` / Mesa Freedreno, Metal-эмуляция |
+| **Сенсорный экран (Touch)** | ✅ Работает | 95% | FocalTech FT3683G (I2C SE1), мультитач, жесты навигации |
+| **Кнопки управления** | ✅ Работает | 100% | Питание (Power) и Громкость (+/-) через драйвер PMIC PON |
+| **Хаптика / Виброотклик** | ✅ Работает | 85% | Awinic AW86927 (I2C SE8), тактильная отдача при нажатиях |
+| **Звук / Динамики (Audio)** | 🟡 В процессе | 65% | Драйвер FourSemi FS1815 написан; запуск ADSP адаптирован под SPMI/RPM-SMD |
+| **Wi-Fi** | 🟡 В процессе | 50% | WCN3990: реализован WLAN_EN (GPIO84), MSA QMI (0x86500000), инициализация ICNSS |
+| **Bluetooth** | 🟡 В процессе | 45% | Поддержка WCN3990 через UART / QCA coex (GPIO 69), драйвер в доработке |
+| **Модем / LTE (Сотовая сеть)** | 🔴 В разработке | 25% | Выгружены таблицы MPSS, изоляция каналов QMI |
+| **Камеры** | 🔴 В разработке | 10% | Требуется портирование ISP Spectra и сенсоров Sony LYT-600 |
 
-How they fit: [the repositories](docs/porting/repositories.md).
+---
 
-## What you bring, and what is never here
+## 🚀 Запуск и аргументы ядра
 
-Nothing of Apple's and no vendor's firmware is in these repositories. The Darwin user space, if you want it, you lay out yourself from an
-IPSW you get yourself, and the firmware comes off your own phone; nothing is downloaded for you, decrypted or circumvented. Apple's
-services (activation, Apple ID, iCloud, the App Store) are not supported and not a goal.
-[What is in the repository, and what never is](docs/index.md#what-is-in-the-repository-and-what-never-is).
+Запуск системы осуществляется через кастомный загрузчик **HakiOS XNULoader v3** (`loader.efi`) поверх **Mu-Silicium UEFI**:
 
-## Contributing
+```bash
+XL_SECS=36000 XL_FOLLOW=10 XL_CMDLINE="touchscreen=1 buttons=1 bootcpu=7 cpus=7 gpu=1 fb_hz=120 fb_threads=6 ca_vbl=1" ./xl run
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [COMMUNITY.md](COMMUNITY.md).
+### Основные аргументы `XL_CMDLINE`:
+- `gpu=1`: включение драйвера Adreno 619 и аппаратного пайплайна отрисовки.
+- `fb_hz=120`: форсирование частоты обновления 120 Гц для плавного скроллинга.
+- `touchscreen=1`: опрос сенсорного экрана FocalTech (I2C SE1, GPIO 0/1).
+- `buttons=1`: поддержка аппаратных кнопок.
+- `adsp=1 sound=4`: включение аудиопроцессора Hexagon и стереоусилителей FS1815.
+- `wifi=1`: запуск стека Wi-Fi WCN3990 через ICNSS.
 
-## License and legal
+---
 
-The XNU patch and the files derived from it are under the Apple Public Source License 2.0 ([LICENSE.APSL](LICENSE.APSL)), the rest under
-MIT ([LICENSE](LICENSE)), as the file headers say. Third parties: [NOTICE](NOTICE),
-[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md), [COMPLIANCE.md](COMPLIANCE.md). What is and is not distributed: [LEGAL.md](LEGAL.md).
-None of this is legal advice.
+## 🛠️ Особенности архитектуры порта под Moto G85 (`malmo`)
 
-HakiOS is an independent research project. It is **not affiliated with or endorsed by Apple**; "Darwin", "iPhone", "XNU" and "Apple" are
-named only to describe what the code works with. If you believe a file here infringes anyone's rights, open an issue and it will be
-removed.
+1. **SoC Snapdragon 695 / 6s Gen 3 (SM6375, Blair):**
+   - В отличие от Snapdragon 778G (SC7280/redwood), где используется RPMh RSC, в SM6375 питание управляется через **RPM-SMD** и SPMI.
+   - Драйверы ADSP (`drivers/audio/hakios.adsp.c`) и Wi-Fi (`drivers/wifi/hakios.wifi.c`) переписаны с использованием прямого SPMI-мониторинга шин питания (`ldoa1`, `ldoa17`).
+2. **Аудиоусилители FourSemi FS1815:**
+   - Кастомный драйвер `drivers/audio/hakios.speaker.c` и заголовочный файл `drivers/audio/hakios.fs1815.h` с прошивкой `fs1815.fsm`.
+   - Поддержка I2C адресов `0x34` / `0x35` с аппаратными пинами сброса GPIO 48 / GPIO 59.
+3. **Радиочип WCN3990:**
+   - Реализовано переключение питания `cnss_wlan_en` через GPIO84 и подготовка буферов MSA/QMI для загрузки прошивки `wlanmdsp.mbn`.
 
-## Team
+---
 
-hakios is an experimental project focused on bringing darwin to android hardware. our goal is to make hakios free and accessible to everyone.
+## 📄 Лицензии и копирайты
 
-@oodze - founder, @netusd - advertising / ceo-dev, @wannqn - dev, @hxfuxyyXD - dev, Rhaenja Hun（杭润嘉） - developer / sponsor
-
-tym sicilium for the sources!
+- Ядро XNU: [Apple Public Source License 2.0 (APSL)](LICENSE.APSL)
+- Драйверы и тулчейн HakiOS: [MIT License](LICENSE)
+- Оригинальный проект: [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel)
