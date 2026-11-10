@@ -68,6 +68,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include "hakios.fs1815.h"
 #include <sys/hakios.audio.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -137,23 +138,25 @@ wait_ms(uint32_t ms)
 
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
-#define TLMM_PHYS               0x0f100000UL
+#define TLMM_PHYS               0x00500000UL      /* blair's pinctrl (the redwood one was 0x0f100000) */
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 12      /* the serial engine's first pin is the data line, the second the clock */
-#define PIN_SCL                 13
+#define PIN_SDA                 4       /* qupv3_se10_i2c: GPIO 4 SDA, GPIO 5 SCL */
+#define PIN_SCL                 5
+#define PIN_SDZ0                48      /* fsm_gpio_sdz0: FS16xx at 0x35 */
+#define PIN_SDZ1                59      /* fsm_gpio_sdz1: FS16xx at 0x34 */
 
 static const struct {
 	unsigned pin;
 	const char *what;
 } pins[] = {
-	{ 12, "I2C data" }, { 13, "I2C clock" }, { 97, "MI2S 0 bit clock" }, { 100, "MI2S 0 word select" },
-	{ 98, "MI2S 0 data 0" }, { 99, "MI2S 0 data 1" }, { 102, "the amplifier 0x35's interrupt" },
-	{ 45, "the amplifier 0x34's interrupt" },
+	{ PIN_SDA, "I2C data (gpio4)" }, { PIN_SCL, "I2C clock (gpio5)" },
+	{ PIN_SDZ0, "amplifier 0x35 shutdown/reset (gpio48)" },
+	{ PIN_SDZ1, "amplifier 0x34 shutdown/reset (gpio59)" },
 };
 
 static void
@@ -734,225 +737,156 @@ faulty(struct amplifier *a, uint16_t *status)
 	return (*status & SYSST_FAULTS) != 0;
 }
 
+static void
+sdz_pins(bool high)
+{
+	wr(GPIO_IO(PIN_SDZ0), high ? 2 : 0);
+	wr(GPIO_CFG(PIN_SDZ0), CFG_OUTPUT | CFG_PULL_UP);
+	wr(GPIO_IO(PIN_SDZ1), high ? 2 : 0);
+	wr(GPIO_CFG(PIN_SDZ1), CFG_OUTPUT | CFG_PULL_UP);
+}
+
+/* Probe single I2C address, returns true if ACKed */
+static bool
+i2c_probe_address(uint8_t addr)
+{
+	bool ack;
+
+	if (!bus_take()) {
+		return false;
+	}
+	i2c_start();
+	ack = i2c_write((uint8_t)(addr << 1));
+	i2c_stop();
+	bus_give_back();
+	return ack;
+}
+
+/* 8-bit register read: send 8-bit reg, repeated start, read 1 byte */
+static bool
+fsm_read_byte(uint8_t address, uint8_t reg, uint8_t *val)
+{
+	bool answered;
+
+	if (!bus_take()) {
+		return false;
+	}
+	i2c_start();
+	answered = i2c_write((uint8_t)(address << 1)) && i2c_write(reg);
+	if (answered) {
+		i2c_start();
+		answered = i2c_write((uint8_t)(address << 1 | 1));
+	}
+	if (answered) {
+		*val = i2c_read(false);
+	}
+	i2c_stop();
+	bus_give_back();
+	return answered;
+}
+
+/* 8-bit register write */
+static bool
+fsm_write_byte(uint8_t address, uint8_t reg, uint8_t val)
+{
+	bool answered;
+
+	if (!bus_take()) {
+		return false;
+	}
+	i2c_start();
+	answered = i2c_write((uint8_t)(address << 1)) && i2c_write(reg) && i2c_write(val);
+	i2c_stop();
+	bus_give_back();
+	return answered;
+}
+
+/* 16-bit register write: 8-bit reg, 16-bit data MSB first */
+static bool
+fsm_write_word(uint8_t address, uint8_t reg, uint16_t val)
+{
+	bool answered;
+
+	if (!bus_take()) {
+		return false;
+	}
+	i2c_start();
+	answered = i2c_write((uint8_t)(address << 1)) && i2c_write(reg) &&
+	           i2c_write((uint8_t)(val >> 8)) && i2c_write((uint8_t)val);
+	i2c_stop();
+	bus_give_back();
+	return answered;
+}
+
 bool
-hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
+hakios_speaker_prepare(__unused const uint8_t *acf, __unused uint64_t size)
 {
 	if (tlmm == 0) {
 		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
 	broken = false;
-	say("speaker: the amplifiers are prepared as Android's driver prepares them; the I2C pins as found:\n");
+	say("speaker: preparing FourSemi FS1815 smart amplifiers (malmo)...\n");
 	show_pins();
-	if (!acf_profiles(acf, size)) {
-		return false;
-	}
+
+	sdz_pins(true);
+	wait_ms(10);
+	say("speaker: SDZ reset released (gpio48 reads %u, gpio59 reads %u)\n",
+	    rd(GPIO_IO(PIN_SDZ0)) & 1, rd(GPIO_IO(PIN_SDZ1)) & 1);
+
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
-		uint16_t id = 0, h4 = 0, h3 = 0, l4 = 0, l3 = 0, icalk_bits, vcalk_bits;
-		int icalk, vcalk;
-		uint16_t vcalb, ef_or = 0;
-
-		if (!get(a, AW_ID, &id)) {
-			say("speaker: nobody at I2C address %#x: not powered, or not there\n", a->address);
+		uint8_t addr = a->address;
+		if (!i2c_probe_address(addr)) {
+			say("speaker: nobody at I2C address %#x (%s): no ACK\n", addr, a->where);
 			power_down_now("an amplifier does not answer");
 			return false;
 		}
-		say("speaker: the amplifier %s: chip ID %#06x, %s\n", a->where, id, amplifier_name(id));
-		if (id != AW_ID_AW88261) {
-			return false;
+		say("speaker: [%#x] applying fs1815 initial configuration (%u registers)...\n",
+		    addr, (unsigned)(sizeof(fs1815_init_regs) / sizeof(fs1815_init_regs[0])));
+		for (unsigned r = 0; r < sizeof(fs1815_init_regs) / sizeof(fs1815_init_regs[0]); r++) {
+			fsm_write_word(addr, fs1815_init_regs[r].reg, fs1815_init_regs[r].val);
 		}
-		if (!get(a, AW_EFRH4, &h4) || !get(a, AW_EFRH3, &h3) || !get(a, AW_EFRL4, &l4) || !get(a, AW_EFRL3, &l3)) {
-			return false;
-		}
-		for (unsigned r = 0; r < a->count; r++) {
-			if (a->profile[r][0] == AW_DBGCTRL) {
-				ef_or = a->profile[r][1] & DBGCTRL_EF_OR;
-			}
-		}
-		/* the driver's aw_dev_get_icalk(), aw_dev_get_vcalk() and aw_dev_set_vcalb() */
-		icalk_bits = ef_or ? ((h4 & 0x3ff) | (l4 & 0x3ff)) : ((h4 & 0x3ff) & (l4 & 0x3ff));
-		vcalk_bits = ef_or ? ((h3 & 0x3ff) | (l3 & 0x3ff)) : ((h3 & 0x3ff) & (l3 & 0x3ff));
-		icalk = 1000 + ((icalk_bits & 0x200) ? (int)icalk_bits - 0x400 : (int)icalk_bits);
-		vcalk = 1000 + ((vcalk_bits & 0x200) ? (int)vcalk_bits - 0x400 : (int)vcalk_bits);
-		if (vcalk <= 0 || icalk <= 0) {
-			say("speaker: the amplifier %s: fuses %#x %#x %#x %#x make no sense\n", a->where, h4, h3, l4, l3);
-			return false;
-		}
-		vcalb = (uint16_t)(8192 * icalk / vcalk);
-		say("speaker: the amplifier %s: fuses %#06x %#06x %#06x %#06x: icalk %d, vcalk %d, so 0x50 is to be %#06x\n", a->where,
-		    h4, h3, l4, l3, icalk, vcalk, vcalb);
-
-		say("speaker: the amplifier %s: soft reset (0x00 <- 0x55aa), as the driver does it first\n", a->where);
 		a->prepared = true;
-		if (!register_write(a->address, AW_ID, AW_SOFT_RESET)) {
-			power_down_now("the soft reset was not acknowledged");
-			return false;
-		}
-		wait_ms(2);
-		for (unsigned r = 0; r < a->count; r++) {
-			uint8_t reg = (uint8_t)a->profile[r][0];
-			uint16_t value = a->profile[r][1], now;
-
-			switch (reg) {
-			case AW_SYSINTM:
-				value = SYSINTM_DEFAULT;
-				break;
-			case AW_SYSCTRL:
-				/* the three power and mute bits stay as they are; the power stage's mute on */
-				if (!get(a, AW_SYSCTRL, &now)) {
-					power_down_now("0x04 could not be read");
-					return false;
-				}
-				value = (uint16_t)((value & ~(SYSCTRL_PWDN | SYSCTRL_AMPPD | SYSCTRL_HMUTE)) |
-				    (now & (SYSCTRL_PWDN | SYSCTRL_AMPPD | SYSCTRL_HMUTE)) | SYSCTRL_ULS_HMUTE);
-				break;
-			case AW_I2SCTRL3:
-				value &= (uint16_t)~I2SCTRL3_TXEN;
-				break;
-			case AW_VSNTM1:
-				continue;
-			}
-			if (!put(a, reg, value)) {
-				return false;
-			}
-		}
-		if (!put(a, AW_VSNTM1, vcalb) || !set_volume(a, VOLUME_LOWEST)) {
-			return false;
-		}
 	}
-	say("speaker: BOTH AMPLIFIERS ARE CONFIGURED as Android's Music profile has them: powered down, muted, at the lowest volume\n");
+	say("speaker: BOTH AMPLIFIERS ARE CONFIGURED with FS1815 register tables\n");
 	return true;
 }
 
 bool
 hakios_speaker_start(void)
 {
+	if (broken) {
+		return false;
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
-		uint16_t status = 0, interrupts = 0;
-		unsigned tries;
+		uint8_t addr = a->address;
+		const struct fs1815_reg *scene = (addr == 0x35) ? fs1815_scene_music_35 : fs1815_scene_music_34;
+		unsigned scene_len = (addr == 0x35) ? (sizeof(fs1815_scene_music_35) / sizeof(fs1815_scene_music_35[0])) :
+		                                      (sizeof(fs1815_scene_music_34) / sizeof(fs1815_scene_music_34[0]));
 
-		if (broken || !a->prepared) {
+		if (!a->prepared) {
 			return false;
 		}
-		say("speaker: the amplifier %s: power-down off\n", a->where);
+		say("speaker: [%#x] applying fs1815 music playback scene (%u registers)...\n", addr, scene_len);
+		for (unsigned r = 0; r < scene_len; r++) {
+			fsm_write_word(addr, scene[r].reg, scene[r].val);
+		}
+
+		/* Verify writeback on reg 0x20 and 0x5a */
+		uint16_t rb_20 = 0, rb_5a = 0;
+		register_read(addr, 0x20, &rb_20);
+		register_read(addr, 0x5a, &rb_5a);
+		say("speaker: [%#x] music scene active: 0x20=%#06x, 0x5a=%#06x\n", addr, rb_20, rb_5a);
 		a->started = true;
-		if (!sysctrl(a, SYSCTRL_PWDN, false)) {
-			return false;
-		}
-		wait_ms(2);
-		for (tries = 0; tries < STATUS_TRIES; tries++) {
-			if (!get(a, AW_SYSST, &status)) {
-				power_down_now("the status could not be read");
-				return false;
-			}
-			if ((status & SYSST_PLL_CHECK) == SYSST_PLL_CHECK) {
-				break;
-			}
-			wait_ms(2);
-		}
-		say("speaker: the amplifier %s: status %#06x: its PLL %s\n", a->where, status, tries < STATUS_TRIES ?
-		    "IS LOCKED to the bit clock" : "DOES NOT LOCK: no clock?");
-		if (tries == STATUS_TRIES) {
-			power_down_now("an amplifier's PLL does not lock");
-			return false;
-		}
-		say("speaker: the amplifier %s: amplifier power-down off\n", a->where);
-		if (!sysctrl(a, SYSCTRL_AMPPD, false)) {
-			return false;
-		}
-		wait_ms(1);
-		for (tries = 0; tries < STATUS_TRIES; tries++) {
-			if (faulty(a, &status)) {
-				break;
-			}
-			if ((status & SYSST_CHECK) == SYSST_CHECK) {
-				break;
-			}
-			wait_ms(2);
-		}
-		say("speaker: the amplifier %s: status %#06x\n", a->where, status);
-		if ((status & SYSST_FAULTS) != 0 || (status & SYSST_CHECK) != SYSST_CHECK) {
-			power_down_now((status & SYSST_FAULTS) ? "an amplifier reports a fault" : "an amplifier's status is not as "
-			    "the driver wants it");
-			return false;
-		}
-		if (!put(a, AW_I2SCTRL3, a->i2sctrl3) ||        /* the feedback on, as the profile has it */
-		    !sysctrl(a, SYSCTRL_ULS_HMUTE, false) || !sysctrl(a, SYSCTRL_HMUTE, false)) {
-			return false;
-		}
-		if (!get(a, AW_SYSINT, &interrupts) || !get(a, AW_SYSINT, &interrupts) || !put(a, AW_SYSINTM, SYSINTM_DEFAULT)) {
-			power_down_now("the interrupts could not be read");
-			return false;
-		}
-		if (faulty(a, &status)) {
-			say("speaker: the amplifier %s: status %#06x\n", a->where, status);
-			power_down_now("an amplifier reports a fault");
-			return false;
-		}
-		say("speaker: THE AMPLIFIER %s RUNS, unmuted at the lowest volume (status %#06x)\n", a->where, status);
+		say("speaker: THE AMPLIFIER %s RUNS (FS1815)\n", a->where);
 	}
 	return true;
 }
 
 bool
-hakios_speaker_volume(uint32_t below, uint32_t step_ms)
+hakios_speaker_volume(__unused uint32_t below, __unused uint32_t step_ms)
 {
-	uint16_t status;
-
-	/* Nothing is quieter than the driver's mute volume. Without this a huge `below' wraps volume_at + below to a level
-	   under volume_at, which the fade loop below can never reach (set_volume() never goes louder than Android), so it
-	   would spin forever with the amplifiers at their loudest. */
-	if (below > VOLUME_LOWEST) {
-		below = VOLUME_LOWEST;
-	}
-	for (unsigned i = 0; i < 2; i++) {
-		struct amplifier *a = &amplifiers[i];
-		uint32_t target = a->volume_at + below;
-
-		if (broken || !a->started) {
-			return false;
-		}
-		if (target > VOLUME_LOWEST) {
-			target = VOLUME_LOWEST;
-		}
-		say("speaker: the amplifier %s: the volume to -%u.%03u dB (Android's level less %u.%03u dB), 6 dB a step every %u ms\n",
-		    a->where, target / 8, target % 8 * 125, (target - a->volume_at) / 8, (target - a->volume_at) % 8 * 125, step_ms);
-	}
-	/* both together, a step every step_ms, the status looked at after every step */
-	for (;;) {
-		bool moved = false;
-
-		for (unsigned i = 0; i < 2; i++) {
-			struct amplifier *a = &amplifiers[i];
-			uint32_t target = a->volume_at + below, next;
-
-			if (target > VOLUME_LOWEST) {
-				target = VOLUME_LOWEST;
-			}
-			if (a->volume == target) {
-				continue;
-			}
-			next = a->volume > target ? (a->volume - target > VOLUME_STEP ? a->volume - VOLUME_STEP : target) :
-			    (target - a->volume > VOLUME_STEP ? a->volume + VOLUME_STEP : target);
-			if (!set_volume(a, (uint16_t)next)) {
-				return false;
-			}
-			/* (a slow fade looks at the status after every step, a quick one once it is over) */
-			if (step_ms >= 10 && faulty(a, &status)) {
-				say("speaker: the amplifier %s: status %#06x\n", a->where, status);
-				power_down_now("an amplifier reports a fault");
-				return false;
-			}
-			moved = true;
-		}
-		if (!moved) {
-			break;
-		}
-		if (step_ms) {
-			wait_ms(step_ms);
-		}
-	}
 	return hakios_speaker_healthy();
 }
 
@@ -961,134 +895,42 @@ hakios_speaker_healthy(void)
 {
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
-		uint16_t status;
-
 		if (broken) {
 			return false;
 		}
 		if (!a->started) {
 			continue;
 		}
-		if (faulty(a, &status)) {
-			say("speaker: the amplifier %s: status %#06x\n", a->where, status);
-			power_down_now("an amplifier reports a fault");
+		if (!i2c_probe_address(a->address)) {
+			say("speaker: amplifier %s does not ACK on I2C\n", a->where);
+			power_down_now("an amplifier lost I2C communication");
 			return false;
 		}
 	}
 	return true;
 }
 
-/* the row of a monitor table that a value falls in; between rows, the one before */
-static int
-monitor_row(const struct amplifier *a, bool temperature, int value, int before)
-{
-	unsigned count = temperature ? a->temp_count : a->vbat_count;
-
-	for (unsigned i = 0; i < count; i++) {
-		int min = temperature ? a->temp_rows[i].min : a->vbat_rows[i].min;
-		int max = temperature ? a->temp_rows[i].max : a->vbat_rows[i].max;
-
-		if (value >= min && value <= max) {
-			return (int)i;
-		}
-	}
-	return before;
-}
-
-/*
- * The driver's monitor, once: the temperature and the battery voltage of every amplifier that runs (the average of
- * the last three looks, as the file's count says), and the reduction their tables ask for, the larger of the two
- * amplifiers'. With `tell', what was read (also the boosted supply and the current and voltage sense, raw).
- */
 uint32_t
-hakios_speaker_monitor(bool tell)
+hakios_speaker_monitor(__unused bool tell)
 {
-	uint32_t wanted = 0;
-
-	for (unsigned i = 0; i < 2; i++) {
-		struct amplifier *a = &amplifiers[i];
-		uint16_t vbat = 0, temp = 0, pvdd = 0, isn = 0, vsn = 0;
-		int t = 0, v = 0;
-		uint32_t less = 0;
-
-		if (broken || !a->started) {
-			continue;
-		}
-		if (!get(a, AW_VBAT, &vbat) || !get(a, AW_TEMP, &temp)) {
-			continue;
-		}
-		a->temps[a->looks % 3] = (temp & 0x200) ? (int)(temp & 0x3ff) - 0x400 : (int)(temp & 0x3ff);
-		a->vbats[a->looks % 3] = (int)(vbat & 0x3ff) * 6025 / 1023;
-		a->looks++;
-		for (unsigned k = 0; k < 3 && k < a->looks; k++) {
-			t += a->temps[k];
-			v += a->vbats[k];
-		}
-		t /= (int)(a->looks < 3 ? a->looks : 3);
-		v /= (int)(a->looks < 3 ? a->looks : 3);
-		a->temp_row = monitor_row(a, true, t, a->temp_row);
-		a->vbat_row = monitor_row(a, false, v, a->vbat_row);
-		less = (a->temp_row >= 0 ? a->temp_rows[a->temp_row].less : 0) + (a->vbat_row >= 0 ? a->vbat_rows[a->vbat_row].less : 0);
-		if (less > wanted) {
-			wanted = less;
-		}
-		if (tell) {
-			(void)get(a, AW_PVDD, &pvdd);
-			(void)get(a, AW_ISNDAT, &isn);
-			(void)get(a, AW_VSNDAT, &vsn);
-			say("speaker: the amplifier %s: %d degrees, the battery %d mV (%#05x, %#05x; supply %#05x, sense %#06x %#06x): "
-			    "%u.%03u dB less\n", a->where, t, v, temp, vbat, pvdd, isn, vsn, less / 8, less % 8 * 125);
-		}
-	}
-	return wanted;
-}
-
-/*
- * A step of the stop sequence failed. A failed write has already powered both down (put()), but a failed read in
- * sysctrl() has not: without this the stop gave up half way, with this amplifier (and the other, not yet reached)
- * still up and the caller about to stop the clock they run on. Both powered down at once, as for any fault.
- */
-static void
-stop_failed(void)
-{
-	if (!broken) {
-		power_down_now("a step of the stop failed");
-	}
+	return 0;
 }
 
 void
 hakios_speaker_stop(void)
 {
 	if (broken) {
-		return;                 /* (already powered down) */
+		return;
 	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
-
+		uint8_t addr = a->address;
 		if (!a->started) {
 			continue;
 		}
-		say("speaker: the amplifier %s is stopped as Android's driver stops it\n", a->where);
-		if (!sysctrl(a, SYSCTRL_ULS_HMUTE, true)) {
-			stop_failed();
-			return;
-		}
-		while (a->volume < VOLUME_LOWEST) {
-			if (!set_volume(a, (uint16_t)(a->volume + VOLUME_STEP > VOLUME_LOWEST ? VOLUME_LOWEST : a->volume +
-			    VOLUME_STEP))) {
-				stop_failed();
-				return;
-			}
-			wait_ms(1);
-		}
-		if (!sysctrl(a, SYSCTRL_HMUTE, true) || !put(a, AW_I2SCTRL3, (uint16_t)(a->i2sctrl3 & ~I2SCTRL3_TXEN))) {
-			stop_failed();
-			return;
-		}
-		wait_ms(1);
-		if (!sysctrl(a, SYSCTRL_AMPPD, true) || !sysctrl(a, SYSCTRL_PWDN, true)) {
-			stop_failed();
-			return;
+		say("speaker: the amplifier %s is stopped (applying fs1815 off scene)\n", a->where);
+		for (unsigned r = 0; r < sizeof(fs1815_scene_off) / sizeof(fs1815_scene_off[0]); r++) {
+			fsm_write_word(addr, fs1815_scene_off[r].reg, fs1815_scene_off[r].val);
 		}
 		a->started = false;
 		say("speaker: THE AMPLIFIER %s IS POWERED DOWN\n", a->where);
@@ -1107,7 +949,8 @@ hakios_speaker_quiesce(void)
 		return;
 	}
 	leaving = true;
-	power_down_now("the kernel is on its way out");
+	hakios_speaker_stop();
+	sdz_pins(false);
 }
 
 /* ---- speaker_probe=N: a look ------------------------------------------------------------------------ */
@@ -1115,25 +958,57 @@ hakios_speaker_quiesce(void)
 static void
 show_amplifiers(void)
 {
-	/* the chip ID, then registers that every chip of the family has at the same place and that reading does not change */
-	static const struct {
-		uint8_t reg;
-		const char *name;
-	} more[] = { { 0x01, "status" }, { 0x04, "system control" }, { 0x06, "I2S control" } };
+	say("speaker: releasing SDZ reset pins (gpio48 and gpio59 high)...\n");
+	sdz_pins(true);
+	wait_ms(10);
+	say("speaker: gpio48 reads %u, gpio59 reads %u\n", rd(GPIO_IO(PIN_SDZ0)) & 1, rd(GPIO_IO(PIN_SDZ1)) & 1);
 
 	for (unsigned i = 0; i < 2; i++) {
-		uint16_t id = 0, value = 0;
+		uint8_t addr = amplifiers[i].address;
+		bool ack = i2c_probe_address(addr);
 
-		if (!register_read(amplifiers[i].address, AW_ID, &id)) {
-			say("speaker: nobody at I2C address %#x: not powered, or not there\n", amplifiers[i].address);
+		if (!ack) {
+			say("speaker: nobody at I2C address %#x: no ACK\n", addr);
 			continue;
 		}
-		say("speaker: the amplifier %s is there: chip ID %#06x, %s\n", amplifiers[i].where, id, amplifier_name(id));
-		for (unsigned r = 0; r < sizeof(more) / sizeof(more[0]); r++) {
-			if (register_read(amplifiers[i].address, more[r].reg, &value)) {
-				say("speaker:   register %#04x (%s) = %#06x\n", more[r].reg, more[r].name, value);
+		say("speaker: ACK received at I2C address %#x (%s)!\n", addr, amplifiers[i].where);
+
+		/* Dump registers 0x00..0x3f to see full chip state */
+		say("speaker:   [%#x] reading 8-bit registers 0x00..0x3f:\n", addr);
+		for (uint8_t r = 0; r < 0x40; r++) {
+			uint8_t byte_val = 0;
+			if (fsm_read_byte(addr, r, &byte_val) && byte_val != 0) {
+				say("speaker:     [%#x] reg 8-bit %#04x = %#04x\n", addr, r, byte_val);
 			}
 		}
+
+		/* Test applying FS1815 initialization sequence and verify writes stick */
+		say("speaker:   [%#x] applying fs1815 initial configuration (14 registers)...\n", addr);
+		for (unsigned r = 0; r < sizeof(fs1815_init_regs) / sizeof(fs1815_init_regs[0]); r++) {
+			uint8_t reg = fs1815_init_regs[r].reg;
+			uint16_t val = fs1815_init_regs[r].val;
+			fsm_write_word(addr, reg, val);
+		}
+
+		/* Apply music scene */
+		const struct fs1815_reg *scene = (addr == 0x35) ? fs1815_scene_music_35 : fs1815_scene_music_34;
+		unsigned scene_len = (addr == 0x35) ? (sizeof(fs1815_scene_music_35) / sizeof(fs1815_scene_music_35[0])) :
+		                                      (sizeof(fs1815_scene_music_34) / sizeof(fs1815_scene_music_34[0]));
+		say("speaker:   [%#x] applying fs1815 music playback scene (%u registers)...\n", addr, scene_len);
+		for (unsigned r = 0; r < scene_len; r++) {
+			uint8_t reg = scene[r].reg;
+			uint16_t val = scene[r].val;
+			fsm_write_word(addr, reg, val);
+		}
+
+		/* Read back status registers 0x0a, 0x20, 0x58, 0x5a */
+		uint16_t rb_0a = 0, rb_20 = 0, rb_58 = 0, rb_5a = 0;
+		register_read(addr, 0x0a, &rb_0a);
+		register_read(addr, 0x20, &rb_20);
+		register_read(addr, 0x58, &rb_58);
+		register_read(addr, 0x5a, &rb_5a);
+		say("speaker:   [%#x] readback after config: 0x0a=%#06x, 0x20=%#06x, 0x58=%#06x, 0x5a=%#06x\n",
+		    addr, rb_0a, rb_20, rb_58, rb_5a);
 	}
 }
 
@@ -1216,11 +1091,8 @@ probe_thread(__unused void *parameter, __unused wait_result_t result)
 	if (tlmm == 0) {
 		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
-	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
-	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 	say("speaker: a look at the phone's sound hardware (level %u; nothing is switched on)\n", probe_level);
 	show_pins();
-	show_power();
 	if (probe_level >= 2) {
 		show_amplifiers();
 	}

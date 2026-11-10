@@ -488,11 +488,21 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
-# ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
+# Moto G85 (SM6375 / Blair): copy wlanmdsp.mbn, bdwlan_malmo_ipa.bin, regdb.bin
+for fw_dir in ../fw-wifi fw-wifi; do
+	if [ -f "$fw_dir/wlanmdsp.mbn" ]; then
+		mkdir -p root/fw
+		install -m 0644 "$fw_dir/wlanmdsp.mbn" root/fw/
+		[ -f "$fw_dir/bdwlan_malmo_ipa.bin" ] && install -m 0644 "$fw_dir/bdwlan_malmo_ipa.bin" root/fw/
+		[ -f "$fw_dir/regdb.bin" ] && install -m 0644 "$fw_dir/regdb.bin" root/fw/
+		break
+	fi
+done
+# ... and the vibration motor's waveforms, the phone's /vendor/firmware/haptic_ram.bin, from ../fw-haptic
 # (drivers/haptic/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
-if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
+if [ -f ../fw-haptic/haptic_ram.bin ]; then
 	mkdir -p root/fw
-	install -m 0644 ../fw-haptic/aw8697_haptic.bin root/fw/
+	install -m 0644 ../fw-haptic/haptic_ram.bin root/fw/
 fi
 # ... and the cameras' register tables (drivers/camera/hakios.camera.c, cam=2 and up), made by tools/camsensor.py out of
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
@@ -686,8 +696,6 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
 	if [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
-		../devices/redwood/tools/modem_firmware.py --dtb ../devices/redwood/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
-			--node /soc/qcom,mss@4080000 >/dev/null
 		mkdir -p sysroot/fw
 		cp ../fw-modem/modem.mdt ../fw-modem/modem.b[0-9][0-9] sysroot/fw/
 		# ... and the firmware partition's image/ (its mcfg configurations and the registry's *.jsn, pulled from

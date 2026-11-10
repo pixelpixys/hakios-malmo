@@ -109,9 +109,14 @@ static uint32_t ipa_mem_offset;          /* where the IPA's local memory begins,
 static bool rmtfs_share(bool in);
 static bool rmtfs_start(void);
 static void rmtfs_stop(void);
+static bool glink_find(void);
+static bool glink_is_up(void);
+static bool step_link(void);
 
 #define STEPS                   11
-#define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
+#define HAKIOS_SOC_BASE_REDWOOD 0x00400000ul    /* where the loader says redwood's peripherals begin */
+#define HAKIOS_SOC_BASE_BLAIR   0x00200000ul    /* where the loader says blair's peripherals begin */
+#define HAKIOS_SOC_BASE         0x00400000ul
 
 static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
 static uint32_t step;                   /* the one being performed */
@@ -1046,7 +1051,9 @@ step_survey(void)
 
 #define MPSS_MEMORY_DEFAULT     0x8b800000u   /* dt: reserved-memory mpss@..., memory-region of qcom,mss */
 static uint32_t mpss_memory = MPSS_MEMORY_DEFAULT;
-#define MPSS_MEMORY_SIZE        0x0f600000u
+#define MPSS_MEMORY_SIZE_DEFAULT 0x10000000u  /* 256 MB on Blair / Moto G85 (0x8b800000..0x9b800000) */
+static uint32_t mpss_memory_size = MPSS_MEMORY_SIZE_DEFAULT;
+#define MPSS_MEMORY_SIZE        mpss_memory_size
 #define PAS_MPSS_DEFAULT        4               /* dt: qcom,pas-id of qcom,mss */
 static uint32_t pas_mpss = PAS_MPSS_DEFAULT;
 
@@ -1266,6 +1273,11 @@ step_mailbox(void)
 {
 	bool open;
 
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		printf("mpss: %u: Blair / Moto G85 uses IPCC directly, AOP mailbox is skipped\n", step);
+		return true;
+	}
+
 	announce("open the mailbox to the always-on processor, unless it is open: words of its message memory, and its doorbell");
 	lck_mtx_lock(&hakios_aop_mailbox_lock);
 	open = mailbox_open();
@@ -1452,10 +1464,12 @@ dsp_shutdown(const char *why)
 	wr(ipcc.base + IPCC_DISABLE, IPCC_MPSS << 16 | IPCC_SMP2P);
 	doorbells();
 	dsp_started = false;
-	mailbox_send("{class: image, res: load_state, name: modem, val: off}");
-	if (rails_asked) {
-		rails(0);
-		rails_asked = false;
+	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_BLAIR) {
+		mailbox_send("{class: image, res: load_state, name: modem, val: off}");
+		if (rails_asked) {
+			rails(0);
+			rails_asked = false;
+		}
 	}
 	return true;
 }
@@ -1739,7 +1753,19 @@ step_our_item(void)
 			smem_poke(our_item + SMP2P_AT_VALUE(1), ipa);
 			printf("mpss: %u: our entry \"ipa\" = %#x\n", step, ipa);
 		}
-		smem_poke(our_item + SMP2P_AT_COUNTS, 16 | (ipa != 0 ? 2u : 1u) << 16);
+		/*
+		 * A third entry, "wlan" (dt: smp2p_wlan_1_in / qcom,smp2p-wlan-1-in of qcom,smp2p-modem):
+		 * informs Hexagon modem DSP that WLAN subsystem / wlan_pd is active.
+		 */
+		bzero(name, sizeof(name));
+		strlcpy((char *)name, "wlan", sizeof(name));
+		for (uint32_t word = 0; word < 4; word++) {
+			smem_poke(our_item + SMP2P_AT_NAME(2) + 4 * word, name[word]);
+		}
+		smem_poke(our_item + SMP2P_AT_VALUE(2), 1);
+		printf("mpss: %u: our entry \"wlan\" = 1\n", step);
+
+		smem_poke(our_item + SMP2P_AT_COUNTS, 16 | (ipa != 0 ? 3u : 2u) << 16);
 	}
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
 	settle();
@@ -2448,16 +2474,18 @@ step_start(void)
 	} else if (!rmtfs_buffer_make() || !rmtfs_share(true)) {
 		printf("mpss: %u: THE MODEM GETS NO BUFFER FOR ITS FILES: it is started all the same, and will offer little\n", step);
 	}
-	if (!rails(384)) {
-		lck_mtx_unlock(&dsp_lock);
-		return false;
-	}
-	rails_asked = true;
-	if (!mailbox_send("{class: image, res: load_state, name: modem, val: on}")) {
-		rails(0);
-		rails_asked = false;
-		lck_mtx_unlock(&dsp_lock);
-		return false;
+	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_BLAIR) {
+		if (!rails(384)) {
+			lck_mtx_unlock(&dsp_lock);
+			return false;
+		}
+		rails_asked = true;
+		if (!mailbox_send("{class: image, res: load_state, name: modem, val: on}")) {
+			rails(0);
+			rails_asked = false;
+			lck_mtx_unlock(&dsp_lock);
+			return false;
+		}
 	}
 	result = scm("to authenticate the modem's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_mpss, 0, 0, 0,
 	    &answer);
@@ -2466,9 +2494,11 @@ step_start(void)
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT START THE MODEM: the call returns %d, its answer is %#llx\n", step, result,
 		    answer);
-		mailbox_send("{class: image, res: load_state, name: modem, val: off}");
-		rails(0);
-		rails_asked = false;
+		if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_BLAIR) {
+			mailbox_send("{class: image, res: load_state, name: modem, val: off}");
+			rails(0);
+			rails_asked = false;
+		}
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -2482,7 +2512,20 @@ step_start(void)
 		if (now >= limit || !dsp_started) {
 			break;
 		}
-		doorbells();
+		/*
+		 * The root PD's ELF loader reads wlanmdsp.mbn over RFS as soon as it is up, and gives up if the
+		 * server is not there. The DSP's GLINK queue (item 480) appears within the first milliseconds,
+		 * so the link -- and with it RMTFS/TFTP -- is taken up here rather than in step 9. Once the link
+		 * thread runs, it owns the doorbells and the DSP's words; this loop only watches their state.
+		 */
+		if (!glink_is_up() && glink_find()) {
+			if (!step_link()) {
+				printf("mpss: %u: the link is not up yet; the watch goes on\n", step);
+			}
+		}
+		if (!glink_is_up()) {
+			doorbells();
+		}
 		spoke = spoke || doorbell.glink + doorbell.smp2p != 0;
 		if (dsp_words(&words) && (!have || memcmp(&words, &last, sizeof(words)) != 0)) {
 			char when[64];
@@ -2494,7 +2537,9 @@ step_start(void)
 			}
 			last = words;
 			have = spoke = true;
-			dsp_listen(&words);
+			if (!glink_is_up()) {
+				dsp_listen(&words);
+			}
 			state = dsp_state(&words);
 			if ((state & DSP_READY) && ready_at == 0) {
 				ready_at = now;
@@ -2625,6 +2670,12 @@ static struct {
 		[CHANNEL_QRTR] = { .name = "IPCRTR", .ours = 1, .intents = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } } },
 	},
 };
+
+static bool
+glink_is_up(void)
+{
+	return glink.up;
+}
 
 static struct glink_channel *
 glink_theirs(uint32_t theirs)
@@ -3591,7 +3642,17 @@ rmtfs_load(void)
 		uint64_t size = 0;
 		int error = hakios_ufs_read_partition(rmtfs_files[f].partition, 0, NULL, 0, &size);
 
-		if (error != 0 || size == 0 || size > (64u << 20)) {
+		if ((error != 0 || size == 0) && strcmp(rmtfs_files[f].partition, "fsg") == 0) {
+			error = hakios_ufs_read_partition("fsg_b", 0, NULL, 0, &size);
+			if (error != 0 || size == 0) {
+				error = hakios_ufs_read_partition("fsg_a", 0, NULL, 0, &size);
+			}
+			if (error == 0 && size != 0) {
+				rmtfs_files[f].partition = (hakios_ufs_read_partition("fsg_b", 0, NULL, 0, &size) == 0) ? "fsg_b" : "fsg_a";
+			}
+		}
+
+		if (error != 0 || size == 0 || size > (132u << 20)) {
 			printf("mpss: %u: the partition %s: %s (%d)\n", step, rmtfs_files[f].partition, error == ENXIO ?
 			    "no storage to read it from (the loader was not asked for ufs=2)" : "not read", error);
 			continue;
@@ -3981,6 +4042,14 @@ static struct hakios_qrtr_port *tftp_port, *servreg_port;
 static bool ipa_qmi_start(void);
 static void ipa_qmi_stop(void);
 static struct hakios_qrtr_port *ipa_host_port;
+static void pdr_client_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length);
+static void pdr_client_server(void *context, bool arrived, uint32_t service, uint32_t version, uint32_t instance, uint32_t node, uint32_t port);
+static void wlfw_client_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length);
+static void wlfw_client_server(void *context, bool arrived, uint32_t service, uint32_t version, uint32_t instance, uint32_t node, uint32_t port);
+static struct hakios_qrtr_port *pdr_client_port;
+static struct hakios_qrtr_port *wlfw_client_port;
+static uint32_t pdr_modem_node, pdr_modem_port;
+static uint32_t wlfw_modem_node, wlfw_modem_port;
 
 /* The port, and the service on it; the partitions are read in step 2, the buffer shared in step 7. */
 static bool
@@ -4016,6 +4085,18 @@ rmtfs_start(void)
 			our_servers[3].service = 0x31;          /* the IPA's host service (below) */
 			our_servers[3].instance = 0x101;
 			our_servers[3].port = ipa_host_port->number;
+		}
+	}
+	if (pdr_client_port == NULL) {
+		pdr_client_port = qrtr_open(pdr_client_receive, pdr_client_server, NULL);
+		if (pdr_client_port != NULL) {
+			qrtr_lookup(pdr_client_port, 0x42, 0, 0);
+		}
+	}
+	if (wlfw_client_port == NULL) {
+		wlfw_client_port = qrtr_open(wlfw_client_receive, wlfw_client_server, NULL);
+		if (wlfw_client_port != NULL) {
+			qrtr_lookup(wlfw_client_port, 0x45, 0, 0);
 		}
 	}
 	return true;
@@ -4278,6 +4359,9 @@ tftp_file_of(const char *path)
 	return NULL;
 }
 
+/* Registering the PDR listeners waits for the modem to show it can reach RFS (see pdr_register_listeners). */
+static void pdr_note_rfs_ready(void);
+
 /* A request to our TFTP port: a read starts a transfer on a port of its own; anything else is refused. From the link's thread. */
 static void
 tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
@@ -4412,6 +4496,27 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 			t->borrowed = true;
 		}
 	}
+	static struct {
+		char name[64];
+		uint8_t dummy_buf[16];
+	} dummies[] = {
+		{ "/readwrite/shob.bin", { 0 } },
+		{ "/readwrite/hob_report.txt", { 0 } },
+		{ "/readwrite/dhob.bin", { 0 } },
+		{ "/readwrite/dhob_report.txt", { 0 } },
+		{ "/readwrite/datablock/id_00", { 0 } },
+		{ "/readwrite/mot_rfs/imei_sv", { 0 } },
+		{ "/readwrite/ota_firewall/ruleset", { 0 } },
+	};
+	for (unsigned d = 0; d < sizeof(dummies) / sizeof(dummies[0]) && file == NULL; d++) {
+		if (strcmp(name, dummies[d].name) == 0) {
+			file = dummies[d].dummy_buf;
+			size = sizeof(dummies[d].dummy_buf);
+			t->borrowed = true;
+			strlcpy(fwname, "(dummy stub)", sizeof(fwname));
+			break;
+		}
+	}
 	if (file == NULL && tftp_file_of(name) == NULL) {
 		printf("mpss: tftp: the modem reads \"%s\": NOT A PATH SERVED HERE\n", name);
 		tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
@@ -4421,6 +4526,18 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 	if (file == NULL) {
 		snprintf(fwname, sizeof(fwname), "image/%s", tftp_file_of(name));
 		file = root_file(fwname, &size);
+		if (file == NULL) {
+			file = hakios_image_file("fw", fwname, &size, NULL);
+		}
+		if (file == NULL) {
+			file = hakios_image_file("fw", tftp_file_of(name), &size, NULL);
+		}
+		if (file == NULL) {
+			const char *base = strrchr(name, '/');
+			if (base != NULL) {
+				file = hakios_image_file("fw", base + 1, &size, NULL);
+			}
+		}
 	} else {
 		strlcpy(fwname, "(written by the modem)", sizeof(fwname));
 	}
@@ -4459,6 +4576,7 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 		printf("mpss: tftp: the modem reads \"%s\": %llu bytes; blocks of %u, window %u, %u asked for, from %u%s\n", name, size, blksize,
 		    wsize, rsize, seek, options ? "" : " (no options)");
 	}
+	pdr_note_rfs_ready();
 	if (!options) {
 		tftp_send_window(t, 0);
 		return;
@@ -4556,7 +4674,7 @@ jsn_string(const char *from, const char *end, const char *key, char *out, size_t
 static void
 servreg_load(void)
 {
-	static const char *const files[] = { "modemr.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "battmgr.jsn", "cdspr.jsn", "wpssr.jsn" };
+	static const char *const files[] = { "modemr.jsn", "modemuw.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "battmgr.jsn", "cdspr.jsn", "wpssr.jsn" };
 
 	servreg_maps = 0;
 	for (unsigned f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
@@ -4634,8 +4752,12 @@ servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void
 		for (unsigned i = 0; i < servreg_maps; i++) {
 			found += strcmp(servreg_map[i].service, wanted) == 0;
 		}
+		if (found == 0 && strcmp(wanted, "tms/pddump_disabled") == 0) {
+			/* Modem root PD asks where dump is disabled */
+			found = 1;
+		}
 		/* TLV 0x10: how many domains in all; 0x11: the table's revision; 0x12: the list, each a string with a
-		 * byte of length, the instance (4 bytes), and the service data (a byte of validity, 4 bytes) */
+		 * byte of length, the service data (a byte of validity, 4 bytes), and the instance (4 bytes) */
 		answer[at++] = 0x10;
 		answer[at++] = 2;
 		answer[at++] = 0;
@@ -4651,19 +4773,38 @@ servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void
 
 			answer[at++] = 0x12;
 			at += 2;                        /* the length, filled in below */
-			answer[at++] = (uint8_t)found;
-			for (unsigned i = 0; i < servreg_maps && at + 64 < sizeof(answer); i++) {
-				if (strcmp(servreg_map[i].service, wanted) != 0) {
-					continue;
-				}
-				answer[at++] = (uint8_t)strlen(servreg_map[i].domain);
-				memcpy(answer + at, servreg_map[i].domain, strlen(servreg_map[i].domain));
-				at += (unsigned)strlen(servreg_map[i].domain);
+			answer[at++] = (uint8_t)found;  /* array length: 1 byte */
+			if (strcmp(wanted, "tms/pddump_disabled") == 0) {
+				const char *dom = "msm/modem/root_pd";
+				answer[at++] = (uint8_t)strlen(dom);
+				memcpy(answer + at, dom, strlen(dom));
+				at += (unsigned)strlen(dom);
+				uint32_t inst = 180;
+				answer[at++] = 0;       /* service_data_valid = 0 (1 byte) */
+				answer[at++] = 0;       /* service_data = 0 (4 bytes) */
+				answer[at++] = 0;
+				answer[at++] = 0;
+				answer[at++] = 0;
 				for (unsigned b = 0; b < 4; b++) {
-					answer[at++] = (uint8_t)(servreg_map[i].instance >> (8 * b));
+					answer[at++] = (uint8_t)(inst >> (8 * b));
 				}
-				answer[at++] = 0;       /* no service data */
-				at += 4;
+			} else {
+				for (unsigned i = 0; i < servreg_maps && at + 64 < sizeof(answer); i++) {
+					if (strcmp(servreg_map[i].service, wanted) != 0) {
+						continue;
+					}
+					answer[at++] = (uint8_t)strlen(servreg_map[i].domain);
+					memcpy(answer + at, servreg_map[i].domain, strlen(servreg_map[i].domain));
+					at += (unsigned)strlen(servreg_map[i].domain);
+					answer[at++] = 0;       /* service_data_valid = 0 (1 byte) */
+					answer[at++] = 0;       /* service_data = 0 (4 bytes) */
+					answer[at++] = 0;
+					answer[at++] = 0;
+					answer[at++] = 0;
+					for (unsigned b = 0; b < 4; b++) {
+						answer[at++] = (uint8_t)(servreg_map[i].instance >> (8 * b));
+					}
+				}
 			}
 			answer[list + 1] = (uint8_t)(at - list - 3);
 			answer[list + 2] = (uint8_t)((at - list - 3) >> 8);
@@ -5042,6 +5183,9 @@ step_link(void)
 	thread_t thread;
 	uint64_t began;
 
+	if (glink.up) {
+		return true;                    /* taken up early in step 7, before the modem could ask for RFS */
+	}
 	if (!dsp_started || glink.descriptor == 0) {
 		return false;
 	}
@@ -5089,103 +5233,17 @@ step_link(void)
 
 /* ---- step 10: QRTR ---------------------------------------------------------------------------------- */
 
-static bool
-step_qrtr(void)
-{
-	unsigned services = 0;
-
-	if (!glink.channel[CHANNEL_QRTR].open) {
-		return false;
-	}
-	PE_parse_boot_argn("modem_listen", &listen_seconds, sizeof(listen_seconds));
-	announce("listen to QRTR on the channel: the DSP's hello (answered from the link's thread), and the services it tells of");
-	for (unsigned ms = 0; ms < listen_seconds * 1000; ms++) {
-		sleep_ms(1);
-	}
-	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
-		services += qrtr_servers[i].there;
-	}
-	printf("mpss: %u: after %u s: %s; the DSP is node %u and has told of %u services; it looked for %u of ours; QRTR received %u "
-	    "and sent %u datagrams\n", step, listen_seconds, qrtr_hellos ? "HELLO BOTH WAYS" : "NO HELLO FROM THE DSP", qrtr_peer,
-	    services, qrtr_lookups, qrtr_in, qrtr_out);
-	return qrtr_hellos != 0;
-}
-
-/* ---- step 11: the modem's services: online, and what the network says ------------------------------ */
-
-/*
- * QMI, by hand: a message is a byte of flags (0 a request, 2 an answer, 4 a notice), a transaction
- * of two bytes, the message's number and the length of what follows, then TLVs (a type, a length
- * of two bytes, the value). The device management service (DMS, 2) is asked to put the modem
- * online -- message 0x2e, TLV 1 = 0 --: it starts in low power and stays there until somebody
- * does, which on Android is the RIL's first act. The network access service (NAS, 3) is then
- * asked, by hakios.nas.c, for the serving system (0x24: registered or not) and the signal (0x4f:
- * dBm, per radio); both are answers to questions, asked every second here and every two seconds
- * afterwards (modem=1), since no indication is asked for. What comes back is the kernel's to show:
- * sysctl kern.hakios.cellular_up, _registered, _bars, _dbm, _radio.
- */
 #define QMI_DMS                 2
 #define QMI_NAS                 3
 #define DMS_SET_OPERATING_MODE  0x002e
 #define DMS_GET_OPERATING_MODE  0x002d
 #define DMS_ONLINE              0
 
-static struct hakios_nas_client nas;
-static bool nas_opened;
 static struct hakios_qrtr_port *dms_port;
 static uint32_t dms_node, dms_port_number;      /* where DMS is; 0: not seen */
 static volatile uint32_t dms_answers;
 static volatile uint32_t dms_result, dms_error;
 static uint16_t dms_transaction;
-static int cellular_up, cellular_registered, cellular_bars, cellular_dbm, cellular_radio;
-static char cellular_operator[40];               /* "MCC MNC name" of the serving network; "" when none */
-static char cellular_ip[20], cellular_gateway[20], cellular_dns[44];  /* the data session's addresses; "" until it is up */
-static int cellular_data, cellular_mtu;         /* 1 once the data session is up */
-static uint32_t nas_polls, nas_changes;
-
-SYSCTL_DECL(_kern_hakios);
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_up, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_up, 0,
-    "the modem runs and its network access service answers");
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_registered, 0,
-    "registered with a network");
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_bars, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_bars, 0, "signal, 0 to 4 bars");
-SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_operator, 0,
-    "the serving network: its name as the modem gives it; empty when none");
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_data, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_data, 0, "1: the data session is up");
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_mtu, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_mtu, 0, "the data session's MTU");
-SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_ip, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_ip, 0, "the data session's IPv4 address");
-SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_gateway, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_gateway, 0, "its gateway");
-SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_dns, 0, "its DNS servers, space-separated");
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_dbm, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_dbm, 0, "signal, dBm; 0: none read");
-SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_radio, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_radio, 0,
-    "the radio (QMI NAS): 4 GSM, 5 UMTS, 8 LTE, 12 NR");
-
-static const char *
-radio_name(uint8_t radio)
-{
-	return radio == 4 ? "GSM" : radio == 5 ? "UMTS" : radio == 8 ? "LTE" : radio == 12 ? "NR" : "?";
-}
-
-static void wds_advance(void);
-static volatile bool wds_registered;      /* NAS says the modem is registered (set by nas_changed) */
-static void probe_dump(const char *who, const uint8_t *m, size_t length);
-
-/* From the link's thread, when what NAS says has changed. */
-static void
-nas_changed(__unused void *context, const struct hakios_nas_state *state)
-{
-	nas_changes++;
-	cellular_registered = state->registered;
-	snprintf(cellular_operator, sizeof(cellular_operator), "%s", state->registered ? state->operator_name : "");
-	cellular_bars = state->bars;
-	cellular_dbm = state->has_signal ? state->dbm : 0;
-	cellular_radio = state->has_signal ? state->radio_interface : 0;
-	wds_registered = state->registered;
-	wds_advance();          /* bind once, start the session once registered, retry if refused */
-	tell("mpss: nas: %s%s%s (%u-%u); signal %s%d dBm (%s): %u bars\n", state->registered ? "REGISTERED WITH A NETWORK" : "not registered",
-	    state->operator_name[0] ? ", network " : "", state->operator_name, state->mcc, state->mnc,
-	    state->has_signal ? "" : "none read, ", state->has_signal ? state->dbm : 0, radio_name(state->radio_interface), state->bars);
-}
 
 /* A datagram for our DMS port: the answer to our one question. From the link's thread. */
 static void
@@ -5235,21 +5293,6 @@ dms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 	dms_result = result;
 	dms_error = error;
 	dms_answers++;
-}
-
-static void
-dms_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
-    uint32_t node, uint32_t port)
-{
-	if (service != QMI_DMS) {
-		return;
-	}
-	if (arrived) {
-		dms_node = node;
-		dms_port_number = port;
-	} else if (node == dms_node && port == dms_port_number) {
-		dms_node = dms_port_number = 0;
-	}
 }
 
 /* DMS, once it is there, asked to put the modem online, and its answer waited for. */
@@ -5302,11 +5345,6 @@ dms_set_mode(uint32_t mode)
 	return dms_result == 0;
 }
 
-/*
- * Online. A modem that boots offline (as this one does) does not go straight online: Qualcomm's
- * allow offline -> low power -> online (ModemManager and qmicli users meet the same refusal, error
- * 52, and go the long way), so that is tried when the short way is refused.
- */
 static bool
 dms_online(void)
 {
@@ -5319,6 +5357,314 @@ dms_online(void)
 	}
 	return false;
 }
+
+static void
+dms_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_DMS) {
+		return;
+	}
+	if (arrived) {
+		dms_node = node;
+		dms_port_number = port;
+		printf("mpss: dms: service 2 arrived at node %u port %u, putting modem online immediately...\n", node, port);
+		dms_online();
+	} else if (node == dms_node && port == dms_port_number) {
+		dms_node = dms_port_number = 0;
+	}
+}
+
+static struct hakios_qrtr_port *wlfw_client_port;
+static uint32_t wlfw_modem_node, wlfw_modem_port;
+
+static struct hakios_qrtr_port *pdr_client_port;
+static uint32_t pdr_modem_node, pdr_modem_port;
+
+static void
+pdr_client_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t msg_id = length >= 5 ? (uint16_t)(m[3] | m[4] << 8) : 0;
+	uint8_t type = length > 0 ? m[0] : 0;
+
+	printf("mpss: pdr: packet from node %u port %u (%u bytes, type %u, msg %#x):\n", node, port, (unsigned)length,
+	    type, msg_id);
+	for (size_t i = 0; i < length && i < 64; i += 16) {
+		printf("mpss: pdr:   [%02zx]", i);
+		for (size_t j = i; j < length && j < i + 16; j++) {
+			printf(" %02x", m[j]);
+		}
+		printf("\n");
+	}
+
+	/*
+	 * If Root PD sends SERVREG_STATE_UPDATED_IND (0x0022, QMI_INDICATION = 4),
+	 * we must send SERVREG_SET_ACK_REQ (0x0023, QMI_REQUEST = 0) with the matching transaction_id!
+	 */
+	if (type == 4 && msg_id == 0x0022 && length >= 7) {
+		uint16_t t_id = 0;
+		char path_buf[64] = "";
+		/* Find TLV 0x02 (service_path) and TLV 0x03 (transaction_id) */
+		size_t off = 7;
+		while (off + 3 <= length) {
+			uint8_t t_type = m[off];
+			uint16_t t_len = (uint16_t)(m[off + 1] | m[off + 2] << 8);
+			off += 3;
+			if (off + t_len > length) break;
+			if (t_type == 0x02 && t_len > 0) {
+				unsigned n = t_len < sizeof(path_buf) ? t_len : sizeof(path_buf) - 1;
+
+				/* a top-level QMI string: raw bytes, no length prefix */
+				memcpy(path_buf, &m[off], n);
+				path_buf[n] = 0;
+			} else if (t_type == 0x03 && t_len >= 2) {
+				t_id = (uint16_t)(m[off] | m[off + 1] << 8);
+			}
+			off += t_len;
+		}
+		tell("mpss: pdr: STATE_UPDATED_IND for \"%s\" (txn_id %u)! Replying with SET_ACK_REQ (0x23)...\n", path_buf, t_id);
+
+		/* Send SERVREG_SET_ACK_REQ (0x0023) */
+		uint8_t ack_pkt[64];
+		const char *ack_path = path_buf[0] ? path_buf : "msm/modem/wlan_pd";
+		uint8_t p_len = (uint8_t)strlen(ack_path);
+		uint16_t payload_len = (3 + p_len) + (3 + 2); /* TLV 0x01 + TLV 0x02 */
+		bzero(ack_pkt, sizeof(ack_pkt));
+		ack_pkt[0] = 0; /* QMI_REQUEST */
+		ack_pkt[1] = 3; ack_pkt[2] = 0; /* txn id 3 */
+		ack_pkt[3] = 0x23; ack_pkt[4] = 0; /* msg 0x0023: SERVREG_SET_ACK_REQ */
+		ack_pkt[5] = (uint8_t)payload_len;
+		ack_pkt[6] = (uint8_t)(payload_len >> 8);
+
+		/* TLV 0x01: service_path */
+		ack_pkt[7] = 0x01;
+		ack_pkt[8] = p_len;
+		ack_pkt[9] = 0x00;
+		memcpy(&ack_pkt[10], ack_path, p_len);
+
+		/* TLV 0x02: transaction_id */
+		unsigned a_at = 10 + p_len;
+		ack_pkt[a_at++] = 0x02;
+		ack_pkt[a_at++] = 2; ack_pkt[a_at++] = 0;
+		ack_pkt[a_at++] = (uint8_t)t_id;
+		ack_pkt[a_at++] = (uint8_t)(t_id >> 8);
+
+		int err = qrtr_send(pdr_client_port, node, port, ack_pkt, 7 + payload_len);
+		printf("mpss: pdr: sent SERVREG_SET_ACK_REQ for %s (txn_id %u, err %d)\n", ack_path, t_id, err);
+	}
+}
+
+/*
+ * Registering a listener for a PD makes the modem's PD monitor spawn it, and the spawn's ELF loader
+ * reads the image over RFS at once. The modem's RFS client learns our TFTP port about 200 ms after
+ * its hello, so a registration sent on arrival loses the race and the loader says "RFS SERVER isn't
+ * ready". Wait until the modem has read something over TFTP (it has then found the port) before
+ * registering.
+ */
+static bool pdr_register_wanted, pdr_registered;
+
+static void
+pdr_register_listeners(uint32_t node, uint32_t port)
+{
+	uint8_t req[64];
+	const char *target_names[] = {
+		"msm/modem/root_pd",
+		"msm/modem/wlan_pd",
+		"tms/servreg",
+		"wlan/fw",
+		"kernel/elf_loader"
+	};
+
+	for (unsigned i = 0; i < sizeof(target_names)/sizeof(target_names[0]); i++) {
+		const char *pd_name = target_names[i];
+		uint8_t str_len = (uint8_t)strlen(pd_name);
+		uint16_t tlv_len = 4 + (3 + str_len);
+
+		bzero(req, sizeof(req));
+		req[0] = 0;              /* QMI_REQUEST */
+		req[1] = (uint8_t)(10 + i); req[2] = 0;  /* txn id */
+		req[3] = 0x20; req[4] = 0; /* msg 0x0020: SERVREG_REGISTER_LISTENER_REQ */
+		req[5] = (uint8_t)tlv_len;
+		req[6] = (uint8_t)(tlv_len >> 8);
+
+		/* TLV 0x01: enable */
+		req[7] = 0x01;
+		req[8] = 0x01; req[9] = 0x00;
+		req[10] = 0x01;
+
+		/* TLV 0x02: service_path (a top-level QMI string: raw bytes, no length prefix) */
+		req[11] = 0x02;
+		req[12] = str_len;
+		req[13] = 0x00;
+		memcpy(&req[14], pd_name, str_len);
+
+		int err = qrtr_send(pdr_client_port, node, port, req, 7 + tlv_len);
+		printf("mpss: pdr: sent SERVREG_REGISTER_LISTENER_REQ for \"%s\" (txn %u, err %d)\n", pd_name, 10 + i, err);
+	}
+	pdr_registered = true;
+}
+
+/* The modem has served itself over TFTP, so its RFS client knows our port: a PD spawned from now on can read its image. */
+static void
+pdr_note_rfs_ready(void)
+{
+	if (pdr_register_wanted && !pdr_registered) {
+		tell("mpss: pdr: the modem has used RFS; registering the listeners now\n");
+		pdr_register_listeners(pdr_modem_node, pdr_modem_port);
+	}
+}
+
+static void
+pdr_client_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	printf("mpss: pdr_client_server: service %u (%#x) instance %u node %u port %u %s\n", service, service, instance, node, port,
+	    arrived ? "arrived" : "left");
+	if (service != 0x42) {
+		return;
+	}
+	if (arrived) {
+		pdr_modem_node = node;
+		pdr_modem_port = port;
+		pdr_register_wanted = true;
+		tell("mpss: pdr: SERVREG_NOTIFIER service 0x42 arrived at node %u port %u; registering once the modem has used RFS\n",
+		    node, port);
+	} else {
+		pdr_modem_node = pdr_modem_port = 0;
+		pdr_register_wanted = pdr_registered = false;
+	}
+}
+
+static void
+wlfw_client_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	printf("mpss: wlfw_client_server: service %u instance %u node %u port %u %s\n", service, instance, node, port, arrived ? "arrived" : "left");
+	if (service != 0x45) {
+		return;
+	}
+	if (arrived) {
+		wlfw_modem_node = node;
+		wlfw_modem_port = port;
+		tell("mpss: wlfw: THE WI-FI (WLFW) SERVICE 0x45 ARRIVED at node %u port %u!\n", node, port);
+	} else {
+		wlfw_modem_node = wlfw_modem_port = 0;
+	}
+}
+
+static void
+wlfw_client_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	printf("mpss: wlfw: answer from node %u port %u (%u bytes)\n", node, port, (unsigned)length);
+}
+
+static bool
+step_qrtr(void)
+{
+	unsigned services = 0;
+
+	if (!glink.channel[CHANNEL_QRTR].open) {
+		return false;
+	}
+	PE_parse_boot_argn("modem_listen", &listen_seconds, sizeof(listen_seconds));
+	announce("listen to QRTR on the channel: the DSP's hello (answered from the link's thread), and the services it tells of");
+	if (dms_port == NULL) {
+		dms_port = qrtr_open(dms_receive, dms_server, NULL);
+		if (dms_port != NULL) {
+			qrtr_lookup(dms_port, QMI_DMS, 0, 0);
+		}
+	}
+	if (pdr_client_port == NULL) {
+		pdr_client_port = qrtr_open(pdr_client_receive, pdr_client_server, NULL);
+		if (pdr_client_port != NULL) {
+			qrtr_lookup(pdr_client_port, 0x42, 0, 0);
+		}
+	}
+	if (wlfw_client_port == NULL) {
+		wlfw_client_port = qrtr_open(wlfw_client_receive, wlfw_client_server, NULL);
+		if (wlfw_client_port != NULL) {
+			qrtr_lookup(wlfw_client_port, 0x45, 0, 0);
+		}
+	}
+	for (unsigned ms = 0; ms < listen_seconds * 1000; ms++) {
+		sleep_ms(1);
+	}
+	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
+		services += qrtr_servers[i].there;
+	}
+	printf("mpss: %u: after %u s: %s; the DSP is node %u and has told of %u services; it looked for %u of ours; QRTR received %u "
+	    "and sent %u datagrams\n", step, listen_seconds, qrtr_hellos ? "HELLO BOTH WAYS" : "NO HELLO FROM THE DSP", qrtr_peer,
+	    services, qrtr_lookups, qrtr_in, qrtr_out);
+	return qrtr_hellos != 0;
+}
+
+/* ---- step 11: the modem's services: online, and what the network says ------------------------------ */
+
+/*
+ * QMI, by hand: a message is a byte of flags (0 a request, 2 an answer, 4 a notice), a transaction
+ * of two bytes, the message's number and the length of what follows, then TLVs (a type, a length
+ * of two bytes, the value). The device management service (DMS, 2) is asked to put the modem
+ * online -- message 0x2e, TLV 1 = 0 --: it starts in low power and stays there until somebody
+ * does, which on Android is the RIL's first act. The network access service (NAS, 3) is then
+ * asked, by hakios.nas.c, for the serving system (0x24: registered or not) and the signal (0x4f:
+ * dBm, per radio); both are answers to questions, asked every second here and every two seconds
+ * afterwards (modem=1), since no indication is asked for. What comes back is the kernel's to show:
+ * sysctl kern.hakios.cellular_up, _registered, _bars, _dbm, _radio.
+ */
+static struct hakios_nas_client nas;
+static bool nas_opened;
+static int cellular_up, cellular_registered, cellular_bars, cellular_dbm, cellular_radio;
+static char cellular_operator[40];               /* "MCC MNC name" of the serving network; "" when none */
+static char cellular_ip[20], cellular_gateway[20], cellular_dns[44];  /* the data session's addresses; "" until it is up */
+static int cellular_data, cellular_mtu;         /* 1 once the data session is up */
+static uint32_t nas_polls, nas_changes;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_up, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_up, 0,
+    "the modem runs and its network access service answers");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_registered, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_registered, 0,
+    "registered with a network");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_bars, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_bars, 0, "signal, 0 to 4 bars");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_operator, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_operator, 0,
+    "the serving network: its name as the modem gives it; empty when none");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_data, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_data, 0, "1: the data session is up");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_mtu, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_mtu, 0, "the data session's MTU");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_ip, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_ip, 0, "the data session's IPv4 address");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_gateway, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_gateway, 0, "its gateway");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cellular_dns, CTLFLAG_RD | CTLFLAG_LOCKED, cellular_dns, 0, "its DNS servers, space-separated");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_dbm, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_dbm, 0, "signal, dBm; 0: none read");
+SYSCTL_INT(_kern_hakios, OID_AUTO, cellular_radio, CTLFLAG_RD | CTLFLAG_LOCKED, &cellular_radio, 0,
+    "the radio (QMI NAS): 4 GSM, 5 UMTS, 8 LTE, 12 NR");
+
+static const char *
+radio_name(uint8_t radio)
+{
+	return radio == 4 ? "GSM" : radio == 5 ? "UMTS" : radio == 8 ? "LTE" : radio == 12 ? "NR" : "?";
+}
+
+static void wds_advance(void);
+static volatile bool wds_registered;      /* NAS says the modem is registered (set by nas_changed) */
+static void probe_dump(const char *who, const uint8_t *m, size_t length);
+
+/* From the link's thread, when what NAS says has changed. */
+static void
+nas_changed(__unused void *context, const struct hakios_nas_state *state)
+{
+	nas_changes++;
+	cellular_registered = state->registered;
+	snprintf(cellular_operator, sizeof(cellular_operator), "%s", state->registered ? state->operator_name : "");
+	cellular_bars = state->bars;
+	cellular_dbm = state->has_signal ? state->dbm : 0;
+	cellular_radio = state->has_signal ? state->radio_interface : 0;
+	wds_registered = state->registered;
+	wds_advance();          /* bind once, start the session once registered, retry if refused */
+	tell("mpss: nas: %s%s%s (%u-%u); signal %s%d dBm (%s): %u bars\n", state->registered ? "REGISTERED WITH A NETWORK" : "not registered",
+	    state->operator_name[0] ? ", network " : "", state->operator_name, state->mcc, state->mnc,
+	    state->has_signal ? "" : "none read, ", state->has_signal ? state->dbm : 0, radio_name(state->radio_interface), state->bars);
+}
+
+
 
 /*
  * ---- the data session (QMI WDS, service 1) ----
@@ -6329,6 +6675,7 @@ soc_override(void)
 	PE_parse_boot_argn("soc_smem", &smem_phys, sizeof(smem_phys));
 	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
+	PE_parse_boot_argn("soc_mpss_size", &mpss_memory_size, sizeof(mpss_memory_size));
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
 	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
 	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));
@@ -6351,7 +6698,8 @@ hakios_mpss_init(void)
 	if (last_step == 0 && (!PE_parse_boot_argn("modem", &on, sizeof(on)) || on != 1)) {
 		return;
 	}
-	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
+	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_REDWOOD &&
+	    pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_BLAIR) {
 		printf("mpss: modem=1 and modem_step=N are for the phone's modem, and this is not the phone\n");
 		return;
 	}

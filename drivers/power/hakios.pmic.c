@@ -88,11 +88,11 @@ wr(vm_offset_t address, uint32_t value)
 }
 
 /* the arbiter, as drivers/input/hakios.buttons.c maps it */
-#define ARB_CORE_PHYS           0x0c440000UL
+#define ARB_CORE_PHYS           0x01c40000UL
 #define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL
+#define ARB_CNFG_PHYS           0x01c0a000UL
+#define ARB_CNFG_SIZE           0x2000UL
+#define ARB_OBSERVER_PHYS       0x03e00000UL
 #define ARB_OBSERVER_SIZE       0x10000UL
 #define ARB_SYSTEM              0
 #define ARB_VERSION             0x000

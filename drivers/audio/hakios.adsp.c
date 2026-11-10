@@ -114,7 +114,9 @@ extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with th
 static LCK_GRP_DECLARE(adsp_lock_group, "hakios-adsp");
 
 #define STEPS                   11
-#define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
+#define HAKIOS_SOC_BASE_REDWOOD 0x00400000ul    /* where the loader says redwood's peripherals begin */
+#define HAKIOS_SOC_BASE_BLAIR   0x00200000ul    /* where the loader says blair's peripherals begin */
+#define HAKIOS_SOC_BASE         0x00400000ul
 
 static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
 static uint32_t step;                   /* the one being performed */
@@ -894,6 +896,11 @@ rails(uint32_t level)
 	static const char *const names[2] = { "lcx.lvl", "lmx.lvl" };
 	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
 	uint64_t began;
+
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		printf("adsp: %u: Blair / Moto G85 uses RPM-SMD regulators (not RPMh RSC): rails skipped\n", step);
+		return true;
+	}
 
 	for (unsigned r = 0; r < 2; r++) {
 		int position = level == 0 ? 0 : rail_position(names[r], level, &addresses[r]);
@@ -3268,7 +3275,8 @@ hakios_adsp_init(void)
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;
 	}
-	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
+	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_REDWOOD &&
+	    pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE_BLAIR) {
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
 	}

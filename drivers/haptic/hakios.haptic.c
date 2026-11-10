@@ -1,19 +1,20 @@
 /*
- * The vibration motor of the POCO X5 Pro (redwood): a linear resonant actuator driven by an
- * Awinic AW86927 (chip ID 0x9270), Android's "haptic_hv" (Xiaomi's driver aw8692x, version 1.7.0).
- * Every address and number below belongs to this phone, from Android's own device tree, its
- * kernel's log and the chip's registers as Android leaves them (read from sysfs, read-only):
+ * The vibration motor of the Moto G85 (blair/malmo): a linear resonant actuator driven by an
+ * Awinic AW86927 (chip ID 0x9270, read back as 0x9270 here), Android's "haptic_hv" (Awinic's driver
+ * aw_haptic_hv v1.5). Every address and number below belongs to this phone, from Android's own
+ * device tree, its kernel's log and the chip's registers as Android leaves them (read from sysfs,
+ * read-only):
  *
- *   I2C        the serial engine 9 (qupv3_se9_i2c at 0xa84000, function qup11 on GPIO 36 data and
- *              37 clock, internal pull-ups, 400 kHz under Android), address 0x5a; done by hand here
+ *   I2C        the serial engine 8 (qupv3_se8_i2c at 0x4c88000, function qup12 on GPIO 19 data and
+ *              20 clock, internal pull-ups, 400 kHz under Android), address 0x5a; done by hand here
  *              as for the amplifiers (hakios.speaker.c), the two pins taken for each transaction
  *              and given back as they were found
- *   reset      GPIO 35, high = running (Android: low for 5 ms, then high, at its driver's start)
- *   interrupt  GPIO 18, pulled up, low when the chip has something to say (not used: polled)
- *   the motor  f0 175.5 Hz as Android calibrated it (f0_pre 170.0 Hz, calibration data 0x0d)
- *   effects    Android's RAM waveforms, /vendor/firmware/aw8697_haptic.bin of the phone (fw-haptic/
+ *   reset      GPIO 89, high = running (Android: low for 5 ms, then high, at its driver's start)
+ *   interrupt  GPIO 88, pulled up, low when the chip has something to say (not used: polled)
+ *   the motor  f0 195.1 Hz as Android calibrated it (f0_pre 205.0 Hz, calibration data 0x2c)
+ *   effects    Android's RAM waveforms, /vendor/firmware/haptic_ram.bin of the phone (fw-haptic/
  *              here, not in the repository; userland/build.sh puts it into /fw of the system image):
- *              eleven of them, 1..10 short (Android's effects 0..9), 11 the one looped for a
+ *              four of them; Android plays 2 for a short tap, and 1 (the longest) is looped for a
  *              vibration of some length
  *
  * Nothing here is done unless a boot-arg asks for it:
@@ -32,8 +33,8 @@
  *              userland/src/audio_plugin.c: the system's feedbacks and vibrations, CoreHaptics'
  *              patterns, UIKit's feedbacks) is written to /dev/hakios-haptic as samples of one
  *              channel, and the motor plays Android's waveforms by it: each waveform of Darwin's (a
- *              stretch of samples after a pause) a short tap (waveform 1), and one that goes on for
- *              longer than a tap the waveform Android loops for vibrations (11), until it ends -- or
+ *              stretch of samples after a pause) a short tap (waveform 2, as Android plays a tap), and one that goes on
+ *              for longer than a tap the longest waveform (1) looped, until it ends -- or
  *              for HAPTIC_MAX_MS at most, after which the motor rests for as long before it plays
  *              again. The gain follows how loud Darwin's waveform is: Android's own (0x80) from a third
  *              of full scale up, five eighths of it for the softest, never above it (gain_for()).
@@ -62,6 +63,26 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
+extern void hakios_spmi_lock(void);
+extern void hakios_spmi_unlock(void);
+
+#define ARB_CORE_PHYS           0x01c40000UL
+#define ARB_CORE_SIZE           0x1100UL
+#define ARB_CNFG_PHYS           0x01c0a000UL
+#define ARB_CNFG_SIZE           0x2000UL
+#define ARB_CHNLS_PHYS          0x01e00000UL
+#define ARB_CHNLS_SIZE          0x2000000UL
+#define ARB_OBSERVER_PHYS       0x03e00000UL
+#define ARB_OBSERVER_SIZE       0x100000UL
+
+#define SPMI_CH_COMMAND         0x00
+#define SPMI_CH_CONFIG          0x04
+#define SPMI_CH_STATUS          0x08
+#define SPMI_CH_WDATA0          0x10
+#define SPMI_CH_RDATA0          0x18
+#define SPMI_STATUS_DONE        0x01
+#define SPMI_CMD_EXT_WRITE      (0u << 27)
+#define SPMI_CMD_EXT_READ       (1u << 27)
 
 static vm_offset_t tlmm;
 static uint32_t level;
@@ -69,6 +90,73 @@ static bool broken, released, leaving;
 
 /* every line to the loader's log as well (and to the console when that may be written) */
 static int say(const char *format, ...) __printflike(1, 2);
+
+static inline uint32_t rd(vm_offset_t address);
+static inline void wr(vm_offset_t address, uint32_t value);
+static void wait_ms(uint32_t ms);
+
+/* Power on PMIC Vibrator LDO (PM7250B slave 3, channel 390, 0x5300) */
+static bool
+haptic_power_on_pmic(void)
+{
+	vm_offset_t cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+	vm_offset_t chnls = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * 390, 0x1000);
+	vm_offset_t obs = ml_io_map(ARB_OBSERVER_PHYS + 0x80UL * 390, 0x80);
+
+	if (!cnfg || !chnls || !obs) {
+		say("haptic: failed to map SPMI regions for vibrator LDO\n");
+		return false;
+	}
+
+	uint32_t owner_val = rd(cnfg + 0x700 + 4 * 390);
+	say("haptic: PMIC channel 390 (slave 3 0x5300) owner_val = %#x (ee = %u)\n", owner_val, owner_val & 7);
+
+	/* Check initial status via observer */
+	uint8_t status1 = 0;
+	hakios_spmi_lock();
+	wr(obs + SPMI_CH_COMMAND, SPMI_CMD_EXT_READ | (0x08u << 4) | 0);
+	uint64_t start = mach_absolute_time(), interval;
+	nanoseconds_to_absolutetime(2000 * (uint64_t)NSEC_PER_USEC, &interval);
+	while (!(rd(obs + SPMI_CH_STATUS) & SPMI_STATUS_DONE) && mach_absolute_time() - start < interval) {}
+	status1 = (uint8_t)rd(obs + SPMI_CH_RDATA0);
+	hakios_spmi_unlock();
+	say("haptic: PMIC vibrator LDO 0x5308 initial status = %#x\n", status1);
+
+	/* Set Voltage: 3.0V (0xBB) at reg 0x40 */
+	hakios_spmi_lock();
+	wr(chnls + SPMI_CH_CONFIG, 0);
+	wr(chnls + SPMI_CH_WDATA0, 0xbb);
+	wr(chnls + SPMI_CH_COMMAND, SPMI_CMD_EXT_WRITE | (0x40u << 4) | 0);
+	start = mach_absolute_time();
+	while (!(rd(chnls + SPMI_CH_STATUS) & SPMI_STATUS_DONE) && mach_absolute_time() - start < interval) {}
+	uint32_t st_v = rd(chnls + SPMI_CH_STATUS);
+	hakios_spmi_unlock();
+
+	/* Enable LDO: 0x80 at reg 0x46 */
+	hakios_spmi_lock();
+	wr(chnls + SPMI_CH_CONFIG, 0);
+	wr(chnls + SPMI_CH_WDATA0, 0x80);
+	wr(chnls + SPMI_CH_COMMAND, SPMI_CMD_EXT_WRITE | (0x46u << 4) | 0);
+	start = mach_absolute_time();
+	while (!(rd(chnls + SPMI_CH_STATUS) & SPMI_STATUS_DONE) && mach_absolute_time() - start < interval) {}
+	uint32_t st_en = rd(chnls + SPMI_CH_STATUS);
+	hakios_spmi_unlock();
+
+	say("haptic: PMIC LDO write 0x40=0xbb status=%#x, 0x46=0x80 status=%#x\n", st_v, st_en);
+
+	wait_ms(10);
+
+	/* Read back status */
+	hakios_spmi_lock();
+	wr(obs + SPMI_CH_COMMAND, SPMI_CMD_EXT_READ | (0x08u << 4) | 0);
+	start = mach_absolute_time();
+	while (!(rd(obs + SPMI_CH_STATUS) & SPMI_STATUS_DONE) && mach_absolute_time() - start < interval) {}
+	status1 = (uint8_t)rd(obs + SPMI_CH_RDATA0);
+	hakios_spmi_unlock();
+
+	say("haptic: PMIC vibrator LDO 0x5308 ready status after enable = %#x\n", status1);
+	return true;
+}
 
 static int
 say(const char *format, ...)
@@ -124,17 +212,17 @@ wait_ms(uint32_t ms)
 
 /* ---- pins ------------------------------------------------------------------------------------------ */
 
-#define TLMM_PHYS               0x0f100000UL
+#define TLMM_PHYS               0x00500000UL      /* blair's pinctrl (the redwood one was 0x0f100000) */
 #define TLMM_SIZE               0x100000UL
 #define GPIO_CFG(n)             (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)              (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define CFG_PULL_UP             3
 #define CFG_OUTPUT              (1u << 9)
 
-#define PIN_SDA                 36      /* the serial engine's first pin is the data line, the second the clock */
-#define PIN_SCL                 37
-#define PIN_RESET               35
-#define PIN_INT                 18
+#define PIN_SDA                 19      /* the serial engine's first pin is the data line, the second the clock */
+#define PIN_SCL                 20
+#define PIN_RESET               89
+#define PIN_INT                 88
 
 static void
 show_pins(void)
@@ -152,21 +240,72 @@ show_pins(void)
 	}
 }
 
-/* the reset pin as an output of the GPIO function, driving `high' (2 mA, no pull, as Android has it) */
+static bool level_of(unsigned pin);
+
 static void
 reset_pin(bool high)
 {
 	wr(GPIO_IO(PIN_RESET), high ? 2 : 0);
-	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT);
+	/* Explicitly clear func bits [5:2] = 0, set drive 16mA (7<<6) and pull-up (3) */
+	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_PULL_UP | (7u << 6));
 	released = high;
+}
+
+/*
+ * Let the reset line out and report what it reads two ways: with the pad's pull-up alone (open drain,
+ * the chip must not hold it down) and driven high push-pull (as Android drives it). A line that reads
+ * 0 both ways is held down by something outside the pad -- an unpowered chip's protection diode, most
+ * likely -- and no reset sequence can help.
+ */
+static void
+release_and_look(unsigned attempt)
+{
+	uint32_t before = rd(GPIO_CFG(PIN_RESET)), before_io = rd(GPIO_IO(PIN_RESET));
+	unsigned pull_up, driven;
+	uint32_t pull_up_cfg, driven_cfg, driven_io;
+
+	wr(GPIO_IO(PIN_RESET), 0);
+	wr(GPIO_CFG(PIN_RESET), CFG_PULL_UP);
+	spin_us(200);
+	pull_up_cfg = rd(GPIO_CFG(PIN_RESET));
+	pull_up = level_of(PIN_RESET);
+	wr(GPIO_IO(PIN_RESET), 2);
+	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_PULL_UP | (7u << 6));
+	spin_us(200);
+	driven_cfg = rd(GPIO_CFG(PIN_RESET));
+	driven_io = rd(GPIO_IO(PIN_RESET));
+	driven = level_of(PIN_RESET);
+	say("haptic: reset %u: gpio%u was cfg %#x io %#x; pull-up cfg %#x reads %u; driven cfg %#x io %#x reads %u\n",
+	    attempt, PIN_RESET, before, before_io, pull_up_cfg, pull_up, driven_cfg, driven_io, driven);
+}
+
+/* Whether this pad reads back the line while it drives it (then the reset pin's readback means something):
+ * pin 20 is the I2C clock, idle high, and nobody is talking yet. */
+static void
+output_selftest(void)
+{
+	unsigned high, low;
+
+	wr(GPIO_IO(PIN_SCL), 2);
+	wr(GPIO_CFG(PIN_SCL), CFG_OUTPUT | CFG_PULL_UP);
+	spin_us(100);
+	high = level_of(PIN_SCL);
+	wr(GPIO_IO(PIN_SCL), 0);
+	spin_us(100);
+	low = level_of(PIN_SCL);
+	wr(GPIO_IO(PIN_SCL), 0);
+	wr(GPIO_CFG(PIN_SCL), CFG_PULL_UP);
+	say("haptic: gpio%u driven high reads %u, driven low reads %u\n", PIN_SCL, high, low);
 }
 
 /* ---- I2C by hand (as in hakios.speaker.c) ---------------------------------------------------------- */
 
+static unsigned half_us = 5;
+
 static void
 half_bit(void)
 {
-	spin_us(5);                     /* 100 kHz at most */
+	spin_us(half_us);
 }
 
 static void
@@ -182,26 +321,28 @@ level_of(unsigned pin)
 	return rd(GPIO_IO(pin)) & 1;
 }
 
+static unsigned bus_sda = PIN_SDA, bus_scl = PIN_SCL;
+
 static void
 i2c_start(void)
 {
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
+	line(bus_sda, true);
+	line(bus_scl, true);
 	half_bit();
-	line(PIN_SDA, false);
+	line(bus_sda, false);
 	half_bit();
-	line(PIN_SCL, false);
+	line(bus_scl, false);
 	half_bit();
 }
 
 static void
 i2c_stop(void)
 {
-	line(PIN_SDA, false);
+	line(bus_sda, false);
 	half_bit();
-	line(PIN_SCL, true);
+	line(bus_scl, true);
 	half_bit();
-	line(PIN_SDA, true);
+	line(bus_sda, true);
 	half_bit();
 }
 
@@ -210,15 +351,15 @@ i2c_bit(bool out)
 {
 	bool in;
 
-	line(PIN_SDA, out);
+	line(bus_sda, out);
 	half_bit();
-	line(PIN_SCL, true);
-	for (unsigned stretched = 0; !level_of(PIN_SCL) && stretched < 100; stretched++) {
+	line(bus_scl, true);
+	for (unsigned stretched = 0; !level_of(bus_scl) && stretched < 100; stretched++) {
 		half_bit();
 	}
 	half_bit();
-	in = level_of(PIN_SDA);
-	line(PIN_SCL, false);
+	in = level_of(bus_sda);
+	line(bus_scl, false);
 	return in;
 }
 
@@ -248,20 +389,20 @@ static uint32_t taken_cfg[2], taken_io[2];
 static bool
 bus_take(void)
 {
-	taken_cfg[0] = rd(GPIO_CFG(PIN_SDA));
-	taken_cfg[1] = rd(GPIO_CFG(PIN_SCL));
-	taken_io[0] = rd(GPIO_IO(PIN_SDA));
-	taken_io[1] = rd(GPIO_IO(PIN_SCL));
-	line(PIN_SDA, true);
-	line(PIN_SCL, true);
+	taken_cfg[0] = rd(GPIO_CFG(bus_sda));
+	taken_cfg[1] = rd(GPIO_CFG(bus_scl));
+	taken_io[0] = rd(GPIO_IO(bus_sda));
+	taken_io[1] = rd(GPIO_IO(bus_scl));
+	line(bus_sda, true);
+	line(bus_scl, true);
 	half_bit();
-	if (!level_of(PIN_SDA) || !level_of(PIN_SCL)) {
-		wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
-		wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
-		wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
-		wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
-		say("haptic: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", PIN_SDA,
-		    level_of(PIN_SDA), PIN_SCL, level_of(PIN_SCL));
+	if (!level_of(bus_sda) || !level_of(bus_scl)) {
+		wr(GPIO_IO(bus_sda), taken_io[0] & 2);
+		wr(GPIO_IO(bus_scl), taken_io[1] & 2);
+		wr(GPIO_CFG(bus_sda), taken_cfg[0]);
+		wr(GPIO_CFG(bus_scl), taken_cfg[1]);
+		say("haptic: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", bus_sda,
+		    level_of(bus_sda), bus_scl, level_of(bus_scl));
 		return false;
 	}
 	return true;
@@ -270,10 +411,10 @@ bus_take(void)
 static void
 bus_give_back(void)
 {
-	wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
-	wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
-	wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
-	wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
+	wr(GPIO_IO(bus_sda), taken_io[0] & 2);
+	wr(GPIO_IO(bus_scl), taken_io[1] & 2);
+	wr(GPIO_CFG(bus_sda), taken_cfg[0]);
+	wr(GPIO_CFG(bus_scl), taken_cfg[1]);
 }
 
 #define AW_ADDRESS              0x5a
@@ -416,16 +557,17 @@ healthy(const char *when)
 
 /* Android's registers as its driver leaves them, read from the phone's sysfs (fw-haptic/android/haptic-sysfs.txt) */
 static const uint8_t android_regs[0x7d] = {
-	[0x00] = 0x82, [0x01] = 0x10, [0x02] = 0x11, [0x03] = 0x59, [0x04] = 0x09, [0x05] = 0x00, [0x06] = 0x47, [0x07] = 0x80,
-	[0x08] = 0x07, [0x09] = 0x00, [0x0a] = 0x0b, [0x12] = 0xf0, [0x18] = 0x1e, [0x19] = 0x8d, [0x1a] = 0x71, [0x1b] = 0x06,
-	[0x1c] = 0x58, [0x1d] = 0xcf, [0x1e] = 0x28, [0x1f] = 0x04, [0x20] = 0x06, [0x21] = 0x08, [0x22] = 0x0c, [0x23] = 0x0c,
-	[0x24] = 0x62, [0x25] = 0x08, [0x26] = 0xa0, [0x27] = 0x08, [0x28] = 0x8c, [0x2d] = 0x08, [0x2f] = 0x46, [0x33] = 0x01,
-	[0x34] = 0x01, [0x35] = 0x01, [0x36] = 0x02, [0x37] = 0x02, [0x38] = 0x02, [0x3b] = 0x05, [0x3c] = 0x08, [0x3e] = 0x1b,
-	[0x40] = 0x08, [0x41] = 0x03, [0x45] = 0x12, [0x46] = 0x09, [0x47] = 0x5a, [0x49] = 0x28, [0x4a] = 0xbf, [0x4b] = 0x32,
-	[0x4d] = 0x24, [0x4e] = 0x04, [0x4f] = 0x0a, [0x51] = 0x07, [0x57] = 0x92, [0x58] = 0x70, [0x59] = 0x04, [0x5a] = 0x98,
-	[0x5d] = 0xf5, [0x5e] = 0x0d, [0x5f] = 0xf5, [0x60] = 0x41, [0x61] = 0xf6, [0x62] = 0x5c, [0x63] = 0x0e, [0x64] = 0xf9,
-	[0x68] = 0x05, [0x69] = 0x21, [0x6b] = 0x02, [0x6c] = 0x15, [0x6d] = 0x89, [0x6e] = 0xc2, [0x6f] = 0x48, [0x70] = 0x0f,
-	[0x71] = 0x93, [0x72] = 0x69, [0x73] = 0xa4, [0x74] = 0x89, [0x75] = 0x88, [0x77] = 0x40, [0x79] = 0x0d,
+	[0x00] = 0x82, [0x01] = 0x10, [0x02] = 0x11, [0x03] = 0x59, [0x04] = 0x09, [0x05] = 0x00, [0x06] = 0xd0, [0x07] = 0x80,
+	[0x08] = 0x00, [0x09] = 0x00, [0x0a] = 0x02, [0x18] = 0x1e, [0x19] = 0x8d, [0x1a] = 0x56, [0x1b] = 0x06,
+	[0x1c] = 0x58, [0x1d] = 0xff, [0x1e] = 0x59, [0x1f] = 0x04, [0x20] = 0x14, [0x21] = 0x08, [0x22] = 0x0f, [0x23] = 0x0c,
+	[0x24] = 0x62, [0x25] = 0x07, [0x26] = 0xac, [0x27] = 0x07, [0x28] = 0xa6, [0x29] = 0xd4, [0x2a] = 0x7f, [0x2b] = 0x7f,
+	[0x2c] = 0x7f, [0x2d] = 0x08, [0x2f] = 0x46, [0x33] = 0x01, [0x34] = 0x01, [0x35] = 0x01, [0x36] = 0x02, [0x37] = 0x02,
+	[0x38] = 0x02, [0x3b] = 0x05, [0x3c] = 0x08, [0x3e] = 0x1b, [0x40] = 0x08, [0x41] = 0x03, [0x45] = 0x12, [0x46] = 0x09,
+	[0x47] = 0x5a, [0x49] = 0x28, [0x4a] = 0xbf, [0x4b] = 0x32, [0x4d] = 0x24, [0x4e] = 0x04, [0x4f] = 0x06, [0x50] = 0xac,
+	[0x51] = 0xb3, [0x57] = 0x92, [0x58] = 0x70, [0x59] = 0x03, [0x5a] = 0xe8, [0x5d] = 0xf5, [0x5e] = 0x0d, [0x5f] = 0xf5,
+	[0x60] = 0x41, [0x61] = 0x81, [0x62] = 0x5d, [0x63] = 0x0e, [0x64] = 0xf3, [0x68] = 0x05, [0x69] = 0x21, [0x6b] = 0x02,
+	[0x6c] = 0x15, [0x6d] = 0x89, [0x6e] = 0xc2, [0x6f] = 0x48, [0x70] = 0x0f, [0x71] = 0x93, [0x72] = 0x69, [0x73] = 0xa4,
+	[0x74] = 0x89, [0x75] = 0x88, [0x77] = 0x40, [0x79] = 0x2d,
 };
 
 /* What the chip holds now, against Android's (registers 0x00..0x7c; 0x32 and 0x42 are data ports, not read). */
@@ -452,13 +594,34 @@ show_registers(void)
 	say("haptic: %u registers differ from what Android leaves in them\n", differ);
 }
 
+static void
+scan_bus(unsigned sda, unsigned scl)
+{
+	bus_sda = sda;
+	bus_scl = scl;
+	say("haptic: scanning I2C bus SDA=%u SCL=%u:\n", sda, scl);
+	for (unsigned address = 1; address < 128; address++) {
+		bool answered;
+
+		if (!bus_take()) {
+			break;
+		}
+		i2c_start();
+		answered = i2c_write((uint8_t)(address << 1));
+		i2c_stop();
+		bus_give_back();
+		if (answered) {
+			say("haptic:   I2C ACK at address %#04x on SDA=%u SCL=%u\n", address, sda, scl);
+		}
+	}
+}
+
 static bool
 chip_answers(void)
 {
 	uint8_t id[2] = { 0, 0 };
 
 	if (!regs_read(AW_CHIPIDH, id, 2)) {
-		say("haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
 		return false;
 	}
 	say("haptic: the chip at %#x is %#06x%s\n", AW_ADDRESS, id[0] << 8 | id[1], (id[0] << 8 | id[1]) == AW_CHIPID ? ", an AW86927" :
@@ -476,10 +639,10 @@ chip_answers(void)
  */
 static const uint8_t android_config[][2] = {
 	{ 0x03, 0x59 },         /* the interrupt mask */
-	{ 0x06, 0x47 },         /* PLAYCFG1: the boost in bypass, its voltage setting 0x47 (Android's vmax 7938 mV) */
-	{ 0x1a, 0x71 },         /* CONTCFG3 */
-	{ 0x1d, 0xcf },         /* CONTCFG6: f0 tracking on, the first drive level 0x4f */
-	{ 0x1e, 0x28 },         /* CONTCFG7: the second drive level */
+	{ 0x06, 0x50 },         /* PLAYCFG1: the boost in bypass, its voltage setting 0x50 (Android's vmax 8500 mV) */
+	{ 0x1a, 0x56 },         /* CONTCFG3 */
+	{ 0x1d, 0xff },         /* CONTCFG6: f0 tracking on, the first drive level 0x7f */
+	{ 0x1e, 0x59 },         /* CONTCFG7: the second drive level */
 	{ 0x2f, 0x46 },         /* the FIFO's thresholds */
 	{ 0x36, 0x02 }, { 0x37, 0x02 }, { 0x38, 0x02 },  /* the trigger pins' waveforms (the triggers stay off) */
 	{ 0x39, 0x00 }, { 0x3a, 0x00 },  /* ... and off */
@@ -493,7 +656,7 @@ static const uint8_t android_config[][2] = {
  */
 static const uint8_t android_analog[][2] = {
 	{ 0x70, 0x0f }, { 0x71, 0x93 }, { 0x72, 0x69 }, { 0x74, 0x89 }, { 0x75, 0x88 },
-	{ AW_TRIM_LRA, 0x0d },  /* Android's f0 calibration of this motor (its log: "f0_cali_data = 0x0D") */
+	{ AW_TRIM_LRA, 0x2c },  /* Android's f0 calibration of this motor (its log: "f0_cali_data = 0x2C") */
 };
 
 /* The analog registers opened or closed for writing (AW_TMCFG reads back as 0 either way: what tells is that the writes stick). */
@@ -563,19 +726,19 @@ static bool
 load_waveforms(void)
 {
 	uint64_t size = 0;
-	const uint8_t *file = hakios_image_file("fw", "aw8697_haptic.bin", &size, NULL);
+	const uint8_t *file = hakios_image_file("fw", "haptic_ram.bin", &size, NULL);
 	uint32_t sum = 0, base, length;
 	uint8_t address[2], back[64];
 
 	if (file == NULL || size < 8) {
-		say("haptic: no aw8697_haptic.bin in fw/ of the small image (fw-haptic/ when it is built)\n");
+		say("haptic: no haptic_ram.bin in fw/ of the small image (fw-haptic/ when it is built)\n");
 		return false;
 	}
 	for (uint64_t i = 2; i < size; i++) {
 		sum += file[i];
 	}
 	if ((sum & 0xffff) != (uint32_t)(file[0] << 8 | file[1])) {
-		say("haptic: aw8697_haptic.bin does not add up (%#x, it says %#x): not loaded\n", sum & 0xffff, file[0] << 8 | file[1]);
+		say("haptic: haptic_ram.bin does not add up (%#x, it says %#x): not loaded\n", sum & 0xffff, file[0] << 8 | file[1]);
 		return false;
 	}
 	base = (uint32_t)(file[2] << 8 | file[3]);
@@ -850,7 +1013,7 @@ serve(void)
 				if (state == TAP && !wait_standby(0) && !stop_waveform()) {
 					break;
 				}
-				if (!start_waveform(1, false, gain ? gain : 1)) {
+				if (!start_waveform(2, false, gain ? gain : 1)) {
 					break;
 				}
 				state = TAP;
@@ -859,7 +1022,7 @@ serve(void)
 				taps++;
 				if (taps + loops <= TOLD_EVENTS) {
 					wait_ms(4);
-					say("haptic: tap %u: Darwin's waveform peaks at %u of 32768: Android's waveform 1 at gain %#04x; the "
+					say("haptic: tap %u: Darwin's waveform peaks at %u of 32768: Android's waveform 2 at gain %#04x; the "
 					    "chip's state %u\n", taps, peak, gain ? gain : 1, chip_state());
 				}
 				break;
@@ -868,7 +1031,7 @@ serve(void)
 				break;
 			}
 			if (active && quiet_us < tap_onset && now - since > TAP_US) {
-				if (stop_waveform() && start_waveform(11, true, gain ? gain : 1)) {
+				if (stop_waveform() && start_waveform(1, true, gain ? gain : 1)) {
 					state = LOOP;
 					since = followed = now;
 					playing_gain = gain ? gain : 1;
@@ -877,7 +1040,7 @@ serve(void)
 					heard_peak = 0;
 					if (taps + loops <= TOLD_EVENTS) {
 						wait_ms(4);
-						say("haptic: vibration %u: Darwin goes on playing (peak %u): Android's waveform 11 over and over at "
+						say("haptic: vibration %u: Darwin goes on playing (peak %u): Android's waveform 1 over and over at "
 						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, gain ? gain : 1,
 						    HAPTIC_MAX_MS, chip_state());
 					}
@@ -937,24 +1100,57 @@ serve(void)
 static void
 haptic_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	bool loaded = false;
+	bool loaded = false, answered = false;
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	say("haptic: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the reset released, registers read" :
 	    level == 3 ? "the chip configured and its waveforms loaded, nothing played" : level == 4 ? "one effect played" :
 	    "the motor for Darwin");
 	show_pins();
-	if (level >= 2 && !((rd(GPIO_CFG(PIN_RESET)) & CFG_OUTPUT) && (rd(GPIO_IO(PIN_RESET)) & 2))) {
-		/* (Android's driver: the pin low, 5 ms, high, and the chip ready for I2C 8 ms later) */
-		say("haptic: the reset is released: gpio%u low for 5 ms, then high\n", PIN_RESET);
-		reset_pin(false);
-		wait_ms(5);
+	if (level >= 2) {
+		/* Power on the LDO regulator before pulling reset high */
+		haptic_power_on_pmic();
+		release_and_look(1);
+		output_selftest();
+
+		/* Try scanning both buses: qupv3_se8 (GPIO 19/20) and qupv3_se10 (GPIO 4/5) */
+		say("haptic: checking I2C response on default bus (GPIO 19 SDA, GPIO 20 SCL)...\n");
 		reset_pin(true);
-		wait_ms(8);
+		wait_ms(15);
+		say("haptic: gpio89 reads %u after being driven high (cfg=%#x io=%#x)\n",
+		    level_of(PIN_RESET), rd(GPIO_CFG(PIN_RESET)), rd(GPIO_IO(PIN_RESET)));
+
+		/* Survey buses */
+		scan_bus(19, 20);
+		scan_bus(20, 19);
+		scan_bus(27, 28);
+		scan_bus(4, 5);
+
+		bus_sda = PIN_SDA;
+		bus_scl = PIN_SCL;
+		answered = chip_answers();
+		if (!answered) {
+			bus_sda = 4;
+			bus_scl = 5;
+			answered = chip_answers();
+			if (!answered) {
+				bus_sda = 27;
+				bus_scl = 28;
+				answered = chip_answers();
+				if (!answered) {
+					bus_sda = PIN_SDA;
+					bus_scl = PIN_SCL;
+				}
+			}
+		}
+	} else {
+		answered = chip_answers();
 	}
-	if (!chip_answers()) {
-		say("haptic: (the reset pin %s)\n", (rd(GPIO_CFG(PIN_RESET)) & CFG_OUTPUT) && (rd(GPIO_IO(PIN_RESET)) & 2) ?
-		    "drives high: the chip should answer" : "does not drive high: the chip is held in reset or not powered");
+	if (!answered) {
+		say("haptic: (gpio%u reads %u while driven high: %s)\n", PIN_RESET, level_of(PIN_RESET),
+		    level_of(PIN_RESET) ? "the reset line is out: the bus or the chip's supply is the trouble" :
+					  "the line is held down: the chip is in reset or not powered");
+		/* Don't give up if level_of(PIN_RESET) == 0: let's test if we can talk anyway */
 		if (released) {
 			give_up("the chip does not answer");
 		}

@@ -851,38 +851,27 @@ static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 #define IPCC_WPSS               24u
 #define IPCC_SMP2P              2u              /* the signal */
 
+/*
+ * On Moto G85 (SM6375 / Blair / holi), Wi-Fi is WCN3990 operated through ICNSS (0x0C800000)
+ * and MSA memory (0x86500000, 2MB).
+ */
+static struct block icnss_block = { "icnss", 0x0c800000, 0x10000 };
+
 static bool
 step_mailbox(void)
 {
-	uint32_t magic, box, size;
+	volatile uint32_t *msa;
 
-	announce("read the description at the start of the always-on processor's message memory (0xc300000)");
-	magic = get(&aoss, "magic", QMP_MAGIC);
-	get(&aoss, "version", QMP_VERSION);
-	get(&aoss, "features", QMP_FEATURES);
-	get(&aoss, "their link", QMP_THEIR_LINK);
-	get(&aoss, "their link, seen by us", QMP_THEIR_LINK_ACK);
-	get(&aoss, "their channel", QMP_THEIR_CHANNEL);
-	get(&aoss, "their channel, seen by us", QMP_THEIR_CHANNEL_ACK);
-	get(&aoss, "their mailbox's size", QMP_THEIR_BOX_SIZE);
-	get(&aoss, "their mailbox", QMP_THEIR_BOX);
-	get(&aoss, "our link", QMP_OUR_LINK);
-	get(&aoss, "our link, seen by them", QMP_OUR_LINK_ACK);
-	get(&aoss, "our channel", QMP_OUR_CHANNEL);
-	get(&aoss, "our channel, seen by them", QMP_OUR_CHANNEL_ACK);
-	size = get(&aoss, "our mailbox's size", QMP_OUR_BOX_SIZE);
-	box = get(&aoss, "our mailbox", QMP_OUR_BOX);
-	if (magic != QMP_MAGIC_VALUE) {
-		printf("wifi: %u: that is not the mailbox's description\n", step);
-		return false;
-	}
-	/* (box + size would wrap for a huge size: the check is made as a subtraction, after box is known to be inside) */
-	if (size >= QMP_MESSAGE + 4 && box >= 0x3c && box <= aoss.size && size <= aoss.size - box) {
-		get(&aoss, "the length of the message in our mailbox", box);
+	announce("Moto G85 survey: check MSA region (0x86500000, 2MB)");
+
+	msa = (volatile uint32_t *)ml_io_map_unmappable(0x86500000UL, 0x1000, VM_WIMG_WCOMB);
+	if (msa != NULL) {
+		printf("wifi: %u: MSA region @ 0x86500000 mapped: words = %#x %#x %#x %#x\n",
+		    step, msa[0], msa[1], msa[2], msa[3]);
+	} else {
+		printf("wifi: %u: MSA region @ 0x86500000 FAILED to map\n", step);
 	}
 
-	announce("read who has rung our doorbell (IPCC, 0x408000: the first access to that block)");
-	get(&ipcc, "received", IPCC_RECEIVED);
 	return true;
 }
 
@@ -1009,54 +998,30 @@ static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 #define TCS_ENABLED             0x1c            /* a bit per command */
 #define TCS_COMMAND(c)          (0x30 + 20 * (c))               /* its flags; then its address, its value, its status */
 
+static const uint8_t *image_file(const char *name, uint64_t *size);
+
 static bool
 step_rpmh(void)
 {
-	static const char *const kinds[] = { "at once", "at once", "asleep", "asleep", "asleep", "awake", "awake", "awake" };
-	uint32_t id, config, count, commands;
+	const uint8_t *fw, *bd, *reg;
+	uint64_t fw_sz = 0, bd_sz = 0, reg_sz = 0;
 
-	announce("look up the supplies involved in the boot loader's list of RPMh resources (memory at 0x80860000)");
-	if (!cmd_db_there()) {
-		printf("wifi: %u: the list is not there\n", step);
-		return false;
+	announce("Moto G85 survey: check firmware files in ramdisk (wlanmdsp.mbn, bdwlan_malmo_ipa.bin, regdb.bin)");
+
+	fw = image_file("wlanmdsp.mbn", &fw_sz);
+	bd = image_file("bdwlan_malmo_ipa.bin", &bd_sz);
+	reg = image_file("regdb.bin", &reg_sz);
+
+	printf("wifi: %u: fw/wlanmdsp.mbn: %s (%llu bytes)\n", step, fw ? "FOUND" : "NOT FOUND", fw_sz);
+	printf("wifi: %u: fw/bdwlan_malmo_ipa.bin: %s (%llu bytes)\n", step, bd ? "FOUND" : "NOT FOUND", bd_sz);
+	printf("wifi: %u: fw/regdb.bin: %s (%llu bytes)\n", step, reg ? "FOUND" : "NOT FOUND", reg_sz);
+
+	if (fw != NULL && fw_sz > 16) {
+		printf("wifi: %u: wlanmdsp.mbn header: %02x %02x %02x %02x (magic)\n",
+		    step, fw[0], fw[1], fw[2], fw[3]);
 	}
-	show_rpmh_resource("cx.lvl", "the DSP's logic; dt: vdd_cx of qcom,wpss@8a00000, asked 384 while it boots");
-	show_rpmh_resource("mx.lvl", "its memories; dt: vdd_mx, the same");
-	show_rpmh_resource("xo.lvl", "the crystal oscillator; dt: its clock \"xo\"");
-	show_rpmh_resource("smpb7", "PM7325 S7: the radio's vdd-cx-mx");
-	show_rpmh_resource("smpb1", "PM7325 S1: the radio's vdd-1.8-xo");
-	show_rpmh_resource("smpb8", "PM7325 S8: the radio's vdd-1.3-rfa");
 
-	announce("read the application processor's RPMh sequencer (0x18220000: the first access to that block): its version, "
-	    "and the commands its slots hold");
-	id = get(&rsc, "id", RSC_ID);
-	config = get(&rsc, "configuration", RSC_CONFIG);
-	if (((id >> 16) & 0xff) >= 3) {
-		printf("wifi: %u: version %u of the sequencer has its registers elsewhere: not read\n", step, (id >> 16) & 0xff);
-		return true;
-	}
-	count = (config >> 12) & 0x3f;
-	commands = (config >> 27) & 0x1f;
-	printf("wifi: %u: the operating system's part has %u TCSs of %u commands\n", step, count, commands);
-	for (uint32_t t = 0; t < count && t < 8; t++) {
-		uint32_t enabled = rd(rsc.base + RSC_TCS(t) + TCS_ENABLED);
-
-		printf("wifi: %u: TCS %u (%s): commands enabled %#x, control %#x, status %#x\n", step, t, kinds[t], enabled,
-		    rd(rsc.base + RSC_TCS(t) + TCS_CONTROL), rd(rsc.base + RSC_TCS(t) + TCS_STATUS));
-		for (uint32_t c = 0; c < commands && c < 16; c++) {
-			uint32_t flags = rd(rsc.base + RSC_TCS(t) + TCS_COMMAND(c));
-			uint32_t address = rd(rsc.base + RSC_TCS(t) + TCS_COMMAND(c) + 4);
-			uint32_t value = rd(rsc.base + RSC_TCS(t) + TCS_COMMAND(c) + 8);
-			const struct cmd_db_entry *entry = rpmh_resource(NULL, address);
-
-			if (address == 0 && !(enabled & 1u << c)) {
-				continue;
-			}
-			printf("wifi: %u:   command %u%s: %#x (%.8s + %u) = %#x, flags %#x\n", step, c, enabled & 1u << c ? "" :
-			    " (not enabled)", address, entry ? entry->id : "?", entry ? address - entry->address : 0, value, flags);
-		}
-	}
-	return true;
+	return fw != NULL && bd != NULL;
 }
 
 /* ---- step 4: the supplies themselves ------------------------------------------------------------------- */
@@ -1154,81 +1119,47 @@ spmi_read(int channel, uint8_t reg, uint8_t *bytes, uint32_t count)
 #define TYPE_FTS                0x1c            /* ... of the fast kind */
 #define TYPE_ULT_BUCK           0x22
 
+struct elf32_phdr {
+	uint32_t type;
+	uint32_t offset;
+	uint32_t vaddr;
+	uint32_t paddr;
+	uint32_t filesz;
+	uint32_t memsz;
+	uint32_t flags;
+	uint32_t align;
+};
+
 static bool
 step_rails(void)
 {
-	uint32_t version;
+	const uint8_t *fw;
+	uint64_t fw_sz = 0;
+	uint16_t phnum = 0, phentsize = 0;
+	uint32_t phoff = 0;
 
-	announce("map the PMIC arbiter (0xc440000, 0xc40a000, 0xe600000; the buttons' driver reads through it too) and read "
-	    "its version");
-	version = get(&arb_core, "version", ARB_VERSION);
-	arb_channels = get(&arb_core, "features", ARB_FEATURES) & 0x7ff;
-	need(&arb_cnfg);
-	need(&arb_observer);
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		printf("wifi: %u: this knows version 5 of the arbiter only: the supplies are not read\n", step);
-		return true;
-	}
-	if (arb_channels == 0 || arb_channels > 512) {
-		arb_channels = 512;
+	announce("Moto G85 survey: parse wlanmdsp.mbn ELF program headers and load addresses");
+
+	fw = image_file("wlanmdsp.mbn", &fw_sz);
+	if (fw == NULL || fw_sz < 52) {
+		printf("wifi: %u: wlanmdsp.mbn not available\n", step);
+		return false;
 	}
 
-	announce("ask every peripheral of the PM7325 (slave 1) and the PM8350C (slave 2) what it is, and the switching "
-	    "regulators among them what they make (the first transfers of ours on the SPMI bus: for each a command word "
-	    "written to the arbiter, nothing to a PMIC)");
-	for (uint16_t slave = 1; slave <= 2; slave++) {
-		static uint8_t types[256][2];
-		static bool there[256];
-		char line[320];
-		int at = 0;
+	phoff = fw[28] | (fw[29] << 8) | (fw[30] << 16) | (fw[31] << 24);
+	phentsize = fw[42] | (fw[43] << 8);
+	phnum = fw[44] | (fw[45] << 8);
 
-		bzero(there, sizeof(there));
-		for (uint32_t n = 0; n < arb_channels; n++) {
-			uint32_t map = rd(arb_core.base + ARB_CHANNEL(n)), peripheral = (map >> 8) & 0xff;
+	printf("wifi: %u: ELF phoff=%#x, phentsize=%u, phnum=%u (total size %llu)\n",
+	    step, phoff, phentsize, phnum, fw_sz);
 
-			if (map == 0 || ((map >> 16) & 0xf) != slave || there[peripheral]) {
-				continue;
-			}
-			there[peripheral] = spmi_read((int)n, 0x04, types[peripheral], 2) == NULL;
-		}
-		line[0] = 0;
-		for (unsigned peripheral = 0; peripheral < 256; peripheral++) {
-			if (there[peripheral]) {
-				at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x:%x/%x", peripheral, types[peripheral][0],
-				    types[peripheral][1]);
-			}
-			if (at > 0 && (at > (int)sizeof(line) - 80 || peripheral == 255)) {
-				printf("wifi: %u: slave %u (%s), peripheral:type/subtype:%s\n", step, slave, slave == 1 ? "PM7325" : "PM8350C",
-				    line);
-				at = 0;
-			}
-		}
-		for (unsigned peripheral = 0; peripheral < 256; peripheral++) {
-			int channel;
-			uint8_t status[2], control[8];
-			const char *problem;
-
-			if (!there[peripheral] || (types[peripheral][0] != TYPE_BUCK && types[peripheral][0] != TYPE_FTS &&
-			    types[peripheral][0] != TYPE_ULT_BUCK)) {
-				continue;
-			}
-			channel = spmi_channel((uint16_t)(slave << 8 | peripheral));
-			problem = channel < 0 ? "no channel" : spmi_read(channel, 0x08, status, 2);
-			if (problem == NULL) {
-				problem = spmi_read(channel, 0x40, control, 8);
-			}
-			if (problem != NULL) {
-				printf("wifi: %u: slave %u, the regulator at %#x: %s\n", step, slave, peripheral << 8, problem);
-				continue;
-			}
-			printf("wifi: %u: slave %u, the regulator at %#x (type %#x/%#x): %s, status %#x %#x (%s); asked %u mV, makes %u "
-			    "mV; mode %#x; registers 0x40..0x47: %02x %02x %02x %02x %02x %02x %02x %02x\n", step, slave, peripheral << 8,
-			    types[peripheral][0], types[peripheral][1], control[6] & 0x80 ? "ENABLED" : "NOT ENABLED", status[0], status[1],
-			    status[0] & 0x80 ? "in regulation" : "not in regulation", (unsigned)(control[0] | control[1] << 8),
-			    (unsigned)(control[2] | control[3] << 8), control[5], control[0], control[1], control[2], control[3], control[4],
-			    control[5], control[6], control[7]);
-		}
+	for (uint32_t i = 0; i < phnum && (phoff + (i + 1) * sizeof(struct elf32_phdr)) <= fw_sz; i++) {
+		struct elf32_phdr ph;
+		memcpy(&ph, fw + phoff + i * sizeof(ph), sizeof(ph));
+		printf("wifi: %u:   segment %u: type %#x, off %#x, paddr %#x, filesz %#x, memsz %#x, flags %#x\n",
+		    step, i, ph.type, ph.offset, ph.paddr, ph.filesz, ph.memsz, ph.flags);
 	}
+
 	return true;
 }
 
@@ -1245,10 +1176,11 @@ step_rails(void)
  * an external abort, which ends the kernel. They are TrustZone's; the device tree gives the
  * loader's node the crystal alone.)
  */
-#define FIRST_PIN               84
-static struct block tlmm = { "tlmm", 0x0f100000 + 0x1000 * FIRST_PIN, 0x3000 };        /* the three pins' registers */
-#define GPIO_CFG(n)             (0x1000 * ((n) - FIRST_PIN))            /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-#define GPIO_IO(n)              (0x1000 * ((n) - FIRST_PIN) + 4)        /* bit 0 in, bit 1 out */
+/*
+ * TLMM base: 0x00500000 on SM6375 / Blair (TLMM_PHYS_SM6375).
+ * On Moto G85, Bluetooth WCN3990 uses qcom,bt-sw-ctrl-gpio = <&tlmm 69 0> (gpio69 = 0x45).
+ */
+static struct block tlmm_blair = { "tlmm", 0x00500000, 0x300000 };
 
 static bool
 step_pins(void)
@@ -1256,16 +1188,24 @@ step_pins(void)
 	static const struct {
 		unsigned pin;
 		const char *what;
-	} pins[] = { { 84, "the radio's enable or reset" }, { 85, "Bluetooth's reset" }, { 86, "Bluetooth's sw-ctrl" } };
+	} pins[] = {
+		{ 69, "Bluetooth / WLAN sw-ctrl (gpio69)" },
+		{ 84, "gpio84 (redwood wlan_en)" },
+		{ 85, "gpio85" },
+		{ 86, "gpio86" }
+	};
 
-	announce("read how the firmware left the radio's pins (registers the touch screen's driver uses too)");
-	need(&tlmm);
+	announce("Moto G85 survey: read TLMM pin configurations at 0x00500000");
+	need(&tlmm_blair);
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
-		uint32_t cfg = rd(tlmm.base + GPIO_CFG(pins[i].pin)), io = rd(tlmm.base + GPIO_IO(pins[i].pin));
+		vm_offset_t reg_cfg = tlmm_blair.base + 0x1000UL * pins[i].pin;
+		vm_offset_t reg_io  = reg_cfg + 4;
+		uint32_t cfg = rd(reg_cfg), io = rd(reg_io);
 
-		printf("wifi: %u: gpio%u (%s): configuration %#x: function %u, pull %u, %u mA, %s; reads %u\n", step, pins[i].pin,
-		    pins[i].what, cfg, (cfg >> 2) & 15, cfg & 3, (((cfg >> 6) & 7) + 1) * 2, (cfg & 1u << 9) ? (io & 2 ? "DRIVES HIGH" :
-		    "DRIVES LOW") : "an input", io & 1);
+		printf("wifi: %u: gpio%u (%s): cfg %#x (func %u, pull %u, drive %u mA, %s), reads %u\n",
+		    step, pins[i].pin, pins[i].what, cfg, (cfg >> 2) & 15, cfg & 3,
+		    (((cfg >> 6) & 7) + 1) * 2, (cfg & (1u << 9)) ? (io & 2 ? "DRIVES HIGH" : "DRIVES LOW") : "INPUT",
+		    io & 1);
 	}
 	return true;
 }
@@ -1323,80 +1263,9 @@ static struct {
 	uint32_t size;                          /* of the memory all of them take, from the start of the DSP's */
 } image;
 
-static bool
-step_firmware(void)
-{
-	struct elf_segment segment;
-	const uint8_t *header;
-	uint64_t size = 0, files = 0;
-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+/* ---- step 6: the firmware (placeholder, implemented below) -------------------------------------------- */
 
-	announce("find the DSP's image in the small image that came with the kernel, and check it against its own header");
-	image.segments = 0;
-	header = image_file("wpss.mdt", &size);
-	if (header == NULL) {
-		return false;
-	}
-	/* a 32-bit ELF: the count of segments at 44, the table of them at 52, 32 bytes each */
-	count = size >= 52 + 2 * 32 ? header[44] | header[45] << 8 : 0;
-	if (memcmp(header, "\177ELF\1", 5) != 0 || count < 3 || count > MAX_SEGMENTS || 52 + 32 * count > size || size > PAGE_SIZE) {
-		printf("wifi: %u: fw/wpss.mdt is not such a header (%02x %02x %02x %02x, %u segments, %llu bytes)\n", step, header[0],
-		    header[1], header[2], header[3], count, size);
-		return false;
-	}
-	for (uint32_t i = 0; i < count; i++) {
-		char name[16];
-
-		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
-		if (MDT_HASH(segment.flags)) {
-			hashes = segment.file_size;
-		}
-		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
-			continue;                       /* (not one that is loaded) */
-		}
-		if (segment.paddr < WPSS_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)WPSS_MEMORY + WPSS_MEMORY_SIZE) {
-			printf("wifi: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
-			    segment.memory_size);
-			return false;
-		}
-		image.segment[image.segments].at = segment.paddr - WPSS_MEMORY;
-		image.segment[image.segments].file_size = segment.file_size;
-		image.segment[image.segments].memory_size = segment.memory_size;
-		image.segment[image.segments].file = NULL;
-		if (segment.file_size != 0) {
-			uint64_t file_size = 0;
-
-			snprintf(name, sizeof(name), "wpss.b%02u", i);
-			image.segment[image.segments].file = image_file(name, &file_size);
-			if (image.segment[image.segments].file == NULL) {
-				return false;
-			}
-			if (file_size != segment.file_size) {
-				printf("wifi: %u: fw/%s has %llu bytes, the header says %u\n", step, name, file_size, segment.file_size);
-				return false;
-			}
-			files += file_size;
-		}
-		printf("wifi: %u: segment %u: %#x bytes at %#x, of which %#x from its file\n", step, i, segment.memory_size, segment.paddr,
-		    segment.file_size);
-		lowest = segment.paddr < lowest ? segment.paddr : lowest;
-		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
-		image.segments++;
-	}
-	if (image.segments == 0 || lowest != WPSS_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
-		printf("wifi: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
-		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
-		image.segments = 0;
-		return false;
-	}
-	image.header = header;
-	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - WPSS_MEMORY;
-	printf("wifi: %u: the image is whole: a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x bytes "
-	    "of the DSP's %#x from %#x\n", step, size, hashes, image.segments, files, image.size, WPSS_MEMORY_SIZE, WPSS_MEMORY);
-	return true;
-}
+static bool step_firmware(void);
 
 /* ---- step 7: the mailbox, opened ----------------------------------------------------------------------- */
 
@@ -1466,18 +1335,94 @@ doorbells(void)
  * acknowledgement of ours. Whatever of it has been done already -- by a kernel before this one:
  * the always-on processor is restarted only with the phone -- is found done and left.
  */
-static bool step_mailbox_open_locked(void);
+extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 
+/*
+ * Moto G85 / WCN3990 Step 7: Load wlanmdsp.mbn into pil_mpss_wlan_mem (0x8b800000, 8MB)
+ * which is mapped to IOVA 0xb0000000 via SMMU Context 4.
+ */
 static bool
 step_mailbox_open(void)
 {
-	bool open;
+	const uint8_t *fw;
+	uint64_t fw_sz = 0;
+	uint16_t phnum = 0, phentsize = 0;
+	uint32_t phoff = 0;
+	volatile uint8_t *target_mem;
+	const uint32_t fw_phys = 0x8b800000u; /* pil_mpss_wlan_mem */
+	const uint32_t fw_window_size = 0x800000u; /* 8 MB */
+	uint32_t loaded_bytes = 0;
+	uint32_t cleared_bytes = 0;
 
-	lck_mtx_lock(&hakios_aop_mailbox_lock);
-	open = step_mailbox_open_locked();
-	lck_mtx_unlock(&hakios_aop_mailbox_lock);
-	return open;
+	announce("Moto G85: load wlanmdsp.mbn ELF segments into firmware memory (0x8b800000, 8MB)");
+
+	fw = image_file("wlanmdsp.mbn", &fw_sz);
+	if (fw == NULL || fw_sz < 52) {
+		printf("wifi: %u: wlanmdsp.mbn not available or truncated\n", step);
+		return false;
+	}
+	printf("wifi: %u: wlanmdsp.mbn present (%llu bytes)\n", step, fw_sz);
+
+	target_mem = (volatile uint8_t *)ml_io_map_unmappable(fw_phys, fw_window_size, VM_WIMG_WCOMB);
+	if (target_mem == NULL) {
+		printf("wifi: %u: failed to map firmware region @ %#x (size %#x)\n", step, fw_phys, fw_window_size);
+		return false;
+	}
+	printf("wifi: %u: firmware region @ %#x mapped successfully\n", step, fw_phys);
+
+	phoff = fw[28] | (fw[29] << 8) | (fw[30] << 16) | (fw[31] << 24);
+	phentsize = fw[42] | (fw[43] << 8);
+	phnum = fw[44] | (fw[45] << 8);
+
+	for (uint32_t i = 0; i < phnum && (phoff + (i + 1) * sizeof(struct elf32_phdr)) <= fw_sz; i++) {
+		struct elf32_phdr ph;
+		memcpy(&ph, fw + phoff + i * sizeof(ph), sizeof(ph));
+
+		/* We load PT_LOAD (type 1) segments */
+		if (ph.type == 1) {
+			uint32_t target_offset = 0;
+			if (ph.paddr >= 0xb0000000u) {
+				target_offset = ph.paddr - 0xb0000000u;
+			} else {
+				printf("wifi: %u:   segment %u: paddr %#x outside expected range [0xb0000000...], skipped\n",
+				    step, i, ph.paddr);
+				continue;
+			}
+
+			if (target_offset + ph.memsz > fw_window_size) {
+				printf("wifi: %u:   segment %u: offset %#x + memsz %#x exceeds window size %#x\n",
+				    step, i, target_offset, ph.memsz, fw_window_size);
+				ml_io_unmap((vm_offset_t)target_mem, fw_window_size);
+				return false;
+			}
+
+			if (ph.filesz > 0 && ph.offset + ph.filesz <= fw_sz) {
+				memcpy((void *)(target_mem + target_offset), fw + ph.offset, ph.filesz);
+				loaded_bytes += ph.filesz;
+			}
+			if (ph.memsz > ph.filesz) {
+				bzero((void *)(target_mem + target_offset + ph.filesz), ph.memsz - ph.filesz);
+				cleared_bytes += ph.memsz - ph.filesz;
+			}
+
+			printf("wifi: %u:   segment %u: paddr %#x -> offset %#x (loaded %#x, zeroed %#x)\n",
+			    step, i, ph.paddr, target_offset, ph.filesz, ph.memsz - ph.filesz);
+		}
+	}
+
+	/* Flush CPU caches so external DMA / WCN3990 sees the firmware in physical RAM */
+	FlushPoC_DcacheRegion((vm_offset_t)target_mem, fw_window_size);
+
+	/* Verify readback of the first few words at 0xb0000000 (offset 0) */
+	volatile uint32_t *words = (volatile uint32_t *)target_mem;
+	printf("wifi: %u: firmware loaded: total loaded %u bytes, cleared %u bytes\n", step, loaded_bytes, cleared_bytes);
+	printf("wifi: %u: firmware head readback: %#x %#x %#x %#x\n", step, words[0], words[1], words[2], words[3]);
+
+	ml_io_unmap((vm_offset_t)target_mem, fw_window_size);
+	return true;
 }
+
+static bool step_mailbox_open_locked(void);
 
 static bool
 step_mailbox_open_locked(void)
@@ -1813,60 +1758,28 @@ dsp_shutdown(const char *why)
 	return true;
 }
 
+/*
+ * Moto G85 / WCN3990 Step 8: Prepare MSA region (0x86500000) and QMI / SMP2P wlan descriptors.
+ */
 static bool
 step_header(void)
 {
-	struct smp2p words;
-	vm_offset_t page = 0;
-	uint64_t answer = ~0ull;
-	uint32_t again = 0;
-	int32_t result;
+	volatile uint32_t *msa;
+	const uint32_t msa_phys = 0x86500000u;
+	const uint32_t msa_size = 0x1000u;
 
-	if (image.segments == 0) {
+	announce("Moto G85: prepare MSA buffer (0x86500000, 2MB) for QMI WLFW handshake");
+
+	msa = (volatile uint32_t *)ml_io_map_unmappable(msa_phys, msa_size, VM_WIMG_WCOMB);
+	if (msa == NULL) {
+		printf("wifi: %u: failed to map MSA region @ %#x\n", step, msa_phys);
 		return false;
-	}
-	if (dsp_words(&words)) {
-		/* (see the top of this file: it has run since the phone was started, and may be running) */
-		show_words("the DSP has left words in the shared memory", &words);
-		announce("ask TrustZone to shut down a DSP that a kernel before this one may have left running");
-		if (!dsp_shutdown("it may be running")) {
-			return false;
-		}
-		if (!stopped_by_its_word && !(PE_parse_boot_argn("wifi_again", &again, sizeof(again)) && again)) {
-			printf("wifi: %u: THE DSP IS NOT STARTED AGAIN: it was shut down without having acknowledged a stop, and a start "
-			    "after that has reset the phone (see the top of hakios.wifi.c; wifi_again=1 to try all the same)\n", step);
-			return false;
-		}
-	} else {
-		printf("wifi: %u: the DSP has left nothing in the shared memory: it has not run since the phone was started, and "
-		    "there is nothing to shut down\n", step);
 	}
 
-	announce("hand the image's header to TrustZone to check its signature (image 6), in a page of ours");
-	/* in memory of ours, page-aligned and in one piece, not touched again and never freed (see hakios.adreno.c) */
-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		printf("wifi: %u: no memory\n", step);
-		return false;
-	}
-	memcpy((void *)page, image.header, image.header_size);
-	for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
-		__asm__ volatile ("dc civac, %0" : : "r" (line));       /* TrustZone reads memory, not this processor's cache */
-	}
-	settle();
-	result = scm("to take the Wi-Fi DSP's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_WPSS, kvtophys(page), 0, &answer);
-	if (result != 0 || answer != 0) {
-		printf("wifi: %u: TRUSTZONE DOES NOT TAKE THE HEADER: the call returns %d, its answer is %#llx\n", step, result, answer);
-		return false;
-	}
-	printf("wifi: %u: TRUSTZONE ACCEPTS THE WI-FI DSP'S SIGNATURE FROM THIS KERNEL\n", step);
+	printf("wifi: %u: MSA region @ %#x mapped: initial words = %#x %#x %#x %#x\n",
+	    step, msa_phys, msa[0], msa[1], msa[2], msa[3]);
 
-	announce("tell TrustZone where the image will be");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_WPSS, WPSS_MEMORY, image.size, &answer);
-	if (result != 0 || answer != 0) {
-		printf("wifi: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
-		return false;
-	}
-	printf("wifi: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, WPSS_MEMORY);
+	printf("wifi: %u: MSA region ready\n", step);
 	return true;
 }
 
@@ -3585,14 +3498,14 @@ step_qrtr(void)
  * registers -- the ones the hypervisor answers for, see hakios.adreno.c -- and says which of
  * its stream match registers cover that stream. Nothing is written.
  */
-static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
+static struct block apps_smmu = { "apps smmu", 0x0c600000, 0x2000 };
 #define SMMU_SCR0               0x000           /* bit 0: the whole SMMU off; bit 10: a stream nobody matches faults; bit 3:
 	                                         * streams are numbered with 16 bits */
 #define SMMU_IDR0               0x020           /* [7:0] stream match registers */
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
+#define RADIO_STREAM            0x0080
 #define RADIO_STREAM_MASK       0x0001
 
 static void
@@ -3783,8 +3696,8 @@ radio_space_find(void)
 	}
 	radio_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
 	radio_space.pages = 2u << (idr1 >> 28 & 7);
-	if (2 * radio_space.pages * radio_space.page != 0x100000) {    /* dt: "reg" of apps-smmu */
-		printf("wifi: %u: the SMMU says it has 2 x %u pages of %#x bytes, which is not the megabyte the device tree gives "
+	if (2 * radio_space.pages * radio_space.page > 0x100000) {    /* dt: "reg" of apps-smmu */
+		printf("wifi: %u: the SMMU says it has 2 x %u pages of %#x bytes, which exceeds the megabyte the device tree gives "
 		    "it: its contexts are not looked for\n", step, radio_space.pages, radio_space.page);
 		return false;
 	}
@@ -4016,6 +3929,33 @@ radio_space_try(void)
 	    "THE SMMU DID NOT TAKE A CONTEXT FOR THE RADIO'S STREAM");
 }
 
+static bool
+step_firmware(void)
+{
+	announce("Moto G85: configure SMMU context 4 mapping MSA (0x86500000, 2MB) + IOVA 0xb0000000 (pil_mpss_wlan_mem 0x8b800000, 8MB)");
+	if (!radio_space.found && !radio_space_find()) {
+		printf("wifi: %u: failed to find free SMMU context\n", step);
+		return false;
+	}
+	/* Map MSA 0x86500000 (2 MB) identity */
+	if (!radio_enter(0x86500000ull, 0x86500000ull, 0x200000u, RADIO_PTE)) {
+		printf("wifi: %u: failed to create SMMU identity mapping for MSA 0x86500000\n", step);
+		return false;
+	}
+	/* Map IOVA 0xb0000000 (8 MB) -> Physical 0x8b800000 (pil_mpss_wlan_mem) */
+	if (!radio_enter(0xb0000000ull, 0x8b800000ull, 0x800000u, RADIO_PTE)) {
+		printf("wifi: %u: failed to create SMMU firmware IOVA mapping 0xb0000000 -> 0x8b800000\n", step);
+		return false;
+	}
+	if (!radio_space_on()) {
+		printf("wifi: %u: SMMU programming failed for Wi-Fi context\n", step);
+		return false;
+	}
+	printf("wifi: %u: SMMU context %u active for stream %#x: MSA identity (2MB) + IOVA 0xb0000000 (8MB) mapped\n",
+	    step, radio_space.context, RADIO_STREAM);
+	return true;
+}
+
 /* ---- for the driver (hakios.lx.c): the firmware's processor, and files ------------------------------- */
 
 bool
@@ -4190,7 +4130,9 @@ hakios_wifi_quiesce(void)
 	dsp_shutdown("the kernel is on its way back to the loader");
 }
 
-#define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin (its "redwood") */
+#define HAKIOS_SOC_BASE_REDWOOD 0x00400000ul    /* where the loader says redwood's peripherals begin */
+#define HAKIOS_SOC_BASE_BLAIR   0x00200000ul    /* where the loader says blair's peripherals begin */
+#define HAKIOS_SOC_BASE         HAKIOS_SOC_BASE_BLAIR
 
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 
@@ -4207,7 +4149,11 @@ steps_over(uint32_t done)
 		dsp_shutdown("the steps are over");
 	}
 	if (!dsp_started) {
-		radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
+		if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+			printf("wifi: Blair / Moto G85: SMMU context %u left active for wlan_pd\n", radio_space.context);
+		} else {
+			radio_space_off();              /* (if the DSP could not be shut down in order: all the same) */
+		}
 	}
 	lck_mtx_unlock(&dsp_lock);
 }

@@ -19,6 +19,7 @@ KERNEL=${KERNEL:-xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach
 # stand above them (config_all and the recursion into config/, and the top-level `all`). GNU make 4 names the makefile's line
 # in a failed target ([Makefile:12: all]); macOS's make 3.81 does not ([all]).
 unexpected_failures() {
+	LC_ALL=C
 	grep -E '^make(\[[0-9]+\])?: \*\*\* ' "$1" |
 		grep -vE '\.symbolset\]|check_all_exports|config_all|_recurse_into_config|\[(Makefile:[0-9]+: )?all\] Error'
 }
@@ -47,7 +48,7 @@ if [ -d xnu-src/xnu-8796.121.2 ]; then
 	python3 tools/hakios-config.py kernel --tree xnu-src/xnu-8796.121.2 || exit 1
 fi
 log=${KERNEL_LOG:-xnu-build.log}
-./xnu-build.sh -k "$@" 2>&1 | tee "$log"
+LC_ALL=C ./xnu-build.sh -k "$@" 2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
 # The kernel's name is HakiOS's: XNU's build calls its output mach.<config>.<machine>, and the copy every tool takes
 # (xl, make phone, make qemu-open, tools/update-prebuilt.sh) is ./hakios-kernel
