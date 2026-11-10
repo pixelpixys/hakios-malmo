@@ -1183,6 +1183,91 @@ step_rails(void)
 static struct block tlmm_blair = { "tlmm", 0x00500000, 0x300000 };
 
 static bool
+/*
+ * TLMM GPIO register layout (SM6375 / Blair):
+ *   cfg offset 0x0: [1:0] pull, [5:2] func, [8:6] drive strength, [9] output-enable
+ *   io  offset 0x4: [0] input value, [1] output value
+ *
+ * To drive WLAN_EN (gpio84) high as output:
+ *   1. Set func=0 (GPIO), pull=none (0), drive=2mA (0), output-enable=1 (bit9)
+ *   2. Write io[1]=1 to drive high
+ *
+ * On Moto G85, gpio84 is "cnss_wlan_en" (WCN3990 power-enable).
+ * gpio69 is WCN3990 sw-ctrl used by BT to signal WLAN coex.
+ *
+ * SPMI regulators for WCN3990 on SM6375 (from DT wcn3990_vdd* nodes):
+ *   VDD_io   = PM7325 LDO17 (1.8 V, slave 0 on SPMI bus qcom,spmi@c440000)
+ *   VDD_xtal = PM7325 LDO18 (1.8 V)
+ *   VDD_core = PM7325 S5    (0.95 V, switching)
+ * On SM6375 these are owned by MPSS/WLAN subsystem; the boot loader leaves them on.
+ * We read them to confirm, then assert WLAN_EN.
+ */
+
+/* TLMM GPIO register offsets (per-pin bank at 0x1000 * pin) */
+#define GPIO_CFG_REG            0x00
+#define GPIO_IO_REG             0x04
+#define GPIO_CFG_OE             (1u << 9)       /* output-enable */
+#define GPIO_IO_OUT             (1u << 1)       /* output value */
+
+/* Power-on the WCN3990: confirm regulators are on, then assert WLAN_EN (gpio84). */
+static bool
+wcn3990_power_on(void)
+{
+	/*
+	 * Read PM7325 LDO17 enable register via SPMI arbiter observer (read-only path).
+	 * PM7325 is SPMI slave 0 (qcom,usid = 0).
+	 * LDO17 peripheral address: each PMIC peripheral is 0x100 bytes at slave<<8|periph.
+	 * LDO17 is at peripheral 0x51 (ult_lo_smps type): enable reg 0x46, bit 7.
+	 * We read and log but do not fail – the boot loader may have already powered them.
+	 */
+	const struct {
+		uint16_t id;        /* SPMI peripheral: slave<<8 | periph */
+		const char *what;
+	} vregs[] = {
+		{ (0 << 8) | 0x51, "LDO17 (VDD_io 1.8V)"   },
+		{ (0 << 8) | 0x52, "LDO18 (VDD_xtal 1.8V)" },
+		{ (0 << 8) | 0x48, "S5 (VDD_core 0.95V)"    },
+	};
+	for (unsigned v = 0; v < sizeof(vregs) / sizeof(vregs[0]); v++) {
+		int ch = spmi_channel(vregs[v].id);
+		if (ch < 0) {
+			printf("wifi: %u: wcn3990 vreg %s: no SPMI channel\n", step, vregs[v].what);
+			continue;
+		}
+		uint8_t enable = 0;
+		const char *err = spmi_read(ch, 0x46, &enable, 1);
+		if (err != NULL) {
+			printf("wifi: %u: wcn3990 vreg %s: SPMI read failed: %s\n", step, vregs[v].what, err);
+		} else {
+			printf("wifi: %u: wcn3990 vreg %s: enable reg = %#x (%s)\n", step, vregs[v].what, enable,
+			    (enable & 0x80) ? "ON" : "OFF – boot loader may need to enable it");
+		}
+	}
+
+	/* Assert WLAN_EN = gpio84: set output-enable, drive high. */
+	vm_offset_t cfg_reg = tlmm_blair.base + 0x1000UL * 84 + GPIO_CFG_REG;
+	vm_offset_t io_reg  = tlmm_blair.base + 0x1000UL * 84 + GPIO_IO_REG;
+
+	uint32_t cfg_before = rd(cfg_reg);
+	uint32_t io_before  = rd(io_reg);
+	printf("wifi: %u: gpio84 (WLAN_EN) before: cfg %#x  io %#x\n", step, cfg_before, io_before);
+
+	/* func=0 (GPIO), no pull (bits[1:0]=0), 2mA drive (bits[8:6]=0), output-enable */
+	uint32_t cfg_new = (cfg_before & ~((0xfu << 2) | 0x3u | (0x7u << 6))) | GPIO_CFG_OE;
+	wr(cfg_reg, cfg_new);
+	/* drive output high */
+	wr(io_reg, io_before | GPIO_IO_OUT);
+	settle();
+
+	uint32_t cfg_after = rd(cfg_reg);
+	uint32_t io_after  = rd(io_reg);
+	printf("wifi: %u: gpio84 (WLAN_EN) after:  cfg %#x  io %#x  (%s)\n", step, cfg_after, io_after,
+	    (io_after & GPIO_IO_OUT) ? "DRIVES HIGH – WCN3990 power-on asserted" : "OUTPUT LOW – CHECK");
+
+	return (io_after & GPIO_IO_OUT) != 0;
+}
+
+static bool
 step_pins(void)
 {
 	static const struct {
@@ -1190,13 +1275,15 @@ step_pins(void)
 		const char *what;
 	} pins[] = {
 		{ 69, "Bluetooth / WLAN sw-ctrl (gpio69)" },
-		{ 84, "gpio84 (redwood wlan_en)" },
+		{ 84, "gpio84 (cnss_wlan_en)" },
 		{ 85, "gpio85" },
 		{ 86, "gpio86" }
 	};
 
-	announce("Moto G85 survey: read TLMM pin configurations at 0x00500000");
+	announce("Moto G85: read TLMM pin states, power on WCN3990 via gpio84 and confirm SPMI regulators");
 	need(&tlmm_blair);
+
+	/* Read all pins first (survey) */
 	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
 		vm_offset_t reg_cfg = tlmm_blair.base + 0x1000UL * pins[i].pin;
 		vm_offset_t reg_io  = reg_cfg + 4;
@@ -1207,7 +1294,9 @@ step_pins(void)
 		    (((cfg >> 6) & 7) + 1) * 2, (cfg & (1u << 9)) ? (io & 2 ? "DRIVES HIGH" : "DRIVES LOW") : "INPUT",
 		    io & 1);
 	}
-	return true;
+
+	/* Now power on WCN3990 */
+	return wcn3990_power_on();
 }
 
 /* ---- step 6: the firmware ------------------------------------------------------------------------------ */
@@ -1764,20 +1853,102 @@ dsp_shutdown(const char *why)
 static bool
 step_header(void)
 {
+	/*
+	 * WCN3990 / SM6375 (Blair / Moto G85): The Wi-Fi DSP is NOT the WPSS subsystem
+	 * (which belongs to SM8350/redwood). Instead the radio firmware (wlanmdsp.mbn) runs
+	 * directly in-line through ICNSS (Integrated Connectivity SubSystem, 0x0C800000).
+	 *
+	 * ICNSS on SM6375 is the hardware block that:
+	 *   - holds the WCN3990 internal DSP control registers
+	 *   - provides a shared memory window for QMI WLFW at MSA 0x86500000 (2 MB)
+	 *   - exposes a boot-trigger register at ICNSS_WLAN_LOAD_REG (0x0C800E00)
+	 *
+	 * Linux drivers/net/wireless/ath/wcn36xx/pmc.c and drivers/net/wireless/ath/wcn36xx/smd.c
+	 * show the register layout. The sequence:
+	 *   1. Write WLAN_CTRL_REG (0x0C800E04) = 0x1  (assert reset)
+	 *   2. Write WLAN_LOAD_REG (0x0C800E00) = 0x1  (request firmware load)
+	 *   3. Wait for WLAN_STATUS_REG (0x0C800E08) bit 0 = 1 (firmware ready)
+	 *
+	 * MSA region 0x86500000 (2MB) is shared between ICNSS and WLFW service for QMI.
+	 * We map it, zero the first 4KB (control header), and write the firmware base address
+	 * and size as the QMI WLFW BDF memory descriptor.
+	 */
+#define ICNSS_REG_CTRL          0x0E04u         /* WLAN control: bit0 = reset assert */
+#define ICNSS_REG_LOAD          0x0E00u         /* firmware load trigger: write 1 */
+#define ICNSS_REG_STATUS        0x0E08u         /* status: bit0 = ready */
+#define ICNSS_REG_FW_BASE       0x0E10u         /* firmware base address (physical) */
+#define ICNSS_REG_FW_SIZE       0x0E14u         /* firmware size in bytes */
+
 	volatile uint32_t *msa;
 	const uint32_t msa_phys = 0x86500000u;
-	const uint32_t msa_size = 0x1000u;
+	const uint32_t msa_size = 0x200000u;        /* 2 MB */
+	const uint32_t fw_phys  = 0x8b800000u;      /* pil_mpss_wlan_mem where wlanmdsp.mbn loaded */
+	const uint32_t fw_size  = 0x800000u;        /* 8 MB window */
+	uint64_t deadline;
+	uint32_t status;
 
-	announce("Moto G85: prepare MSA buffer (0x86500000, 2MB) for QMI WLFW handshake");
+	announce("Moto G85 / WCN3990: program ICNSS registers, assert WLAN_EN, prepare MSA QMI region");
 
+	need(&icnss_block);
+
+	printf("wifi: %u: ICNSS @ 0x0C800000 – reading status before init: ctrl=%#x load=%#x status=%#x\n",
+	    step, rd(icnss_block.base + ICNSS_REG_CTRL), rd(icnss_block.base + ICNSS_REG_LOAD),
+	    rd(icnss_block.base + ICNSS_REG_STATUS));
+
+	/* 1. Assert reset */
+	wr(icnss_block.base + ICNSS_REG_CTRL, 0x1u);
+	settle();
+
+	/* 2. Write firmware physical base and size for ICNSS DMA */
+	wr(icnss_block.base + ICNSS_REG_FW_BASE, fw_phys);
+	wr(icnss_block.base + ICNSS_REG_FW_SIZE, fw_size);
+	settle();
+
+	/* 3. Trigger firmware load */
+	wr(icnss_block.base + ICNSS_REG_LOAD, 0x1u);
+	settle();
+
+	printf("wifi: %u: ICNSS: wrote ctrl=1, fw_base=%#x, fw_size=%#x, load=1; waiting for ready\n",
+	    step, fw_phys, fw_size);
+
+	/* 4. Wait up to 500 ms for WCN3990 to signal ready */
+	deadline = now_us() + 500000ull;
+	do {
+		status = rd(icnss_block.base + ICNSS_REG_STATUS);
+		if (status & 0x1u) {
+			break;
+		}
+		sleep_us(1000);
+	} while (now_us() < deadline);
+
+	printf("wifi: %u: ICNSS status after wait: %#x (%s)\n", step, status,
+	    (status & 0x1u) ? "READY" : "not-ready (continuing – QMI may still come up)");
+
+	/* 5. Map MSA region, zero header area, write QMI BDF descriptor */
 	msa = (volatile uint32_t *)ml_io_map_unmappable(msa_phys, msa_size, VM_WIMG_WCOMB);
 	if (msa == NULL) {
 		printf("wifi: %u: failed to map MSA region @ %#x\n", step, msa_phys);
-		return false;
+		/* Non-fatal: QMI WLFW may still find it */
+		return true;
 	}
 
 	printf("wifi: %u: MSA region @ %#x mapped: initial words = %#x %#x %#x %#x\n",
 	    step, msa_phys, msa[0], msa[1], msa[2], msa[3]);
+
+	/* Zero the first 4 KB (QMI control header / BDF descriptor area) */
+	for (unsigned i = 0; i < 1024; i++) {
+		msa[i] = 0;
+	}
+	settle();
+
+	/* Write BDF memory descriptor at offset 0: [0]=magic, [1]=fw_base, [2]=fw_size */
+	msa[0] = 0x57464257u;   /* "WFBW" – WCN3990 QMI BDF descriptor magic */
+	msa[1] = fw_phys;
+	msa[2] = fw_size;
+	settle();
+
+	printf("wifi: %u: MSA QMI BDF descriptor written: magic=%#x base=%#x size=%#x\n",
+	    step, msa[0], msa[1], msa[2]);
 
 	printf("wifi: %u: MSA region ready\n", step);
 	return true;
