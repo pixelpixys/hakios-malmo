@@ -5,7 +5,7 @@
 
 ---
 
-## 📊 Overall Porting Progress: **~78% Complete**
+## 📊 Overall Porting Progress: **~88% Complete**
 
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
@@ -21,9 +21,9 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 | **GPU (Adreno 619)** | ✅ Working | 90% | Hardware-accelerated UI via `hakios-gl` / Mesa Freedreno, Metal translation |
 | **Touchscreen (Touch)** | ✅ Working | 95% | FocalTech FT3683G (I2C SE1), multi-touch & gesture navigation |
 | **Physical Buttons** | ✅ Working | 100% | Power and Volume (+/-) via PMIC PON driver |
-| **Haptics / Vibration** | ✅ Working | 85% | Awinic AW86927 (I2C SE8), tactile feedback on taps |
-| **Audio / Speakers** | 🟡 In Progress | 65% | FourSemi FS1815 driver written; ADSP adapted for SPMI / RPM-SMD |
-| **Wi-Fi** | 🟡 In Progress | 50% | WCN3990: WLAN_EN (GPIO 84) assertion, MSA QMI (0x86500000), ICNSS init |
+| **Haptics / Vibration** | ✅ Working | 93% | Awinic AW86927 (I2C SE8), AW86927 hw_reset sequence (LOW 5ms→HIGH), PMIC LDO 3.0V, RAM waveforms |
+| **Audio / Speakers** | 🟡 In Progress | 82% | FourSemi FS1815: GPIO4/5 forced to function=0 for bit-bang I2C, ADSP TZ auth, AFE TDM 0x9000 |
+| **Wi-Fi** | 🟡 In Progress | 80% | WCN3990: Blair step sequence (1,2,6,7,8→ICNSS,12,13,14,15 QRTR/QMI), no WPSS/TZ path |
 | **Bluetooth** | 🟡 In Progress | 45% | WCN3990 UART / QCA coex (GPIO 69), driver under active development |
 | **Cellular Modem (LTE/5G)** | 🔴 Under Development | 25% | MPSS firmware mapped, QMI channel isolation |
 | **Cameras** | 🔴 Planned | 10% | Requires porting Qualcomm Spectra ISP & Sony LYT-600 sensors |
@@ -58,6 +58,11 @@ XL_SECS=36000 XL_FOLLOW=10 XL_CMDLINE="touchscreen=1 buttons=1 bootcpu=7 cpus=7 
    - Dual-channel I2C addressing (`0x34` right / `0x35` left) with hardware shutdown pins on GPIO 48 and GPIO 59.
 3. **WCN3990 Connectivity Radio:**
    - Hardware power-on via `cnss_wlan_en` (GPIO 84) output drive, and MSA memory window preparation for firmware load (`wlanmdsp.mbn`).
+   - **Blair-specific boot path**: `whole_thread()` now selects step sequence `{1,2,6,7,8,12,13,14,15}` for Blair/WCN3990, skipping WPSS image write (step 9), SMP2P (step 10), and TrustZone `SCM_PAS_AUTH_AND_RESET` with `PAS_WPSS` (step 11) — the DSP is started directly via ICNSS registers in step 8.
+4. **AW86927 Haptics:**
+   - Full Android `haptic_hv_hw_reset()` sequence: GPIO 89 LOW 5 ms → HIGH → 15 ms settle, then I2C on SE8 (GPIO 19/20).
+   - PMIC PM7250B vibrator LDO (channel 390 / 0x5300) enabled at 3.0V before reset release.
+   - RAM waveforms loaded from `fw-haptic/haptic_ram.bin` with checksum verification.
 
 ---
 
