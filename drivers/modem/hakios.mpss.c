@@ -3156,7 +3156,7 @@ static thread_t link_thread_is;
 /* The name service's side: our servers, told of on hello and on lookup (the one there is: rmtfs, below). */
 static struct {
 	uint32_t service, instance, port;
-} our_servers[4];
+} our_servers[5];
 static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_sectors_read, rmtfs_sectors_written, rmtfs_refused;
 static uint32_t tftp_requests, tftp_served, tftp_refused, servreg_requests;
 
@@ -3606,6 +3606,11 @@ link_stop(void)
 #define RMTFS_RW_IOVEC          3
 #define RMTFS_ALLOC_BUFF        4
 #define RMTFS_GET_DEV_ERROR     5
+/* RFSA: how the modem learns where that buffer is (Android's sharedmem_qmi; Linux's rmtfs_mem) */
+#define RFSA_SERVICE            0x1c
+#define RFSA_INSTANCE           0x101           /* version 1, instance 1 */
+#define RFSA_GET_BUFF_ADDR      0x23
+#define RFSA_RELEASE_BUFF_ADDR  0x24
 #define QMI_REQUEST             0
 #define QMI_RESPONSE            2
 #define QMI_RESULT_FAILURE      1
@@ -3627,7 +3632,8 @@ static struct {
 	{ "/boot/modem_fs1", "modemst1" }, { "/boot/modem_fs2", "modemst2" }, { "/boot/modem_fsc", "fsc" },
 	{ "/boot/modem_fsg", "fsg" },
 };
-static struct hakios_qrtr_port *rmtfs_port;
+static struct hakios_qrtr_port *rmtfs_port, *rfsa_port;
+static uint32_t rfsa_requests;
 static vm_offset_t rmtfs_buffer;                /* the buffer, as this kernel sees it; 0: none yet */
 static volatile uint8_t *rmtfs_window;          /* ... and the uncached one it is used through */
 static uint64_t rmtfs_buffer_pa;
@@ -3941,8 +3947,11 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
 		for (unsigned e = 0; e < count && result == 0; e++) {
 			uint64_t sector = le32(entries + 1 + 12 * e), physical = le32(entries + 5 + 12 * e), sectors = le32(entries + 9 + 12 * e);
 			uint64_t bytes = sectors * RMTFS_SECTOR;
+			/* (the old client sends the buffer's address, the new one an offset into it -- from RFSA, such a request
+			 * follows -- and the offset is far below the buffer's address, so the two tell apart) */
+			uint64_t offset = physical >= rmtfs_buffer_pa ? physical - rmtfs_buffer_pa : physical;
 
-			if (physical < rmtfs_buffer_pa || physical - rmtfs_buffer_pa + bytes > RMTFS_BUFFER_SIZE ||
+			if (offset + bytes > RMTFS_BUFFER_SIZE ||
 			    sector * RMTFS_SECTOR + bytes > rmtfs_files[file].size) {
 				printf("mpss: rmtfs: %s %llu sectors from %llu of %s at %#llx: OUTSIDE THE FILE OR THE BUFFER\n", write ? "write" :
 				    "read", sectors, sector, rmtfs_files[file].partition, physical);
@@ -3953,12 +3962,12 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
 			}
 			if (write) {
 				for (uint64_t i = 0; i < bytes; i++) {
-					rmtfs_files[file].data[sector * RMTFS_SECTOR + i] = rmtfs_window[physical - rmtfs_buffer_pa + i];
+					rmtfs_files[file].data[sector * RMTFS_SECTOR + i] = rmtfs_window[offset + i];
 				}
 				rmtfs_sectors_written += sectors;
 			} else {
 				for (uint64_t i = 0; i < bytes; i++) {
-					rmtfs_window[physical - rmtfs_buffer_pa + i] = rmtfs_files[file].data[sector * RMTFS_SECTOR + i];
+					rmtfs_window[offset + i] = rmtfs_files[file].data[sector * RMTFS_SECTOR + i];
 				}
 				rmtfs_sectors_read += sectors;
 			}
@@ -4009,6 +4018,65 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
 			printf("mpss: rmtfs: the answer to %#x is NOT SENT (%d)\n", message, sent);
 		}
 	}
+}
+
+/* The modem asking where our file buffer is: answered with its physical address. From the link's thread. */
+static void
+rfsa_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *value;
+	uint8_t answer[32];
+	uint16_t message, size = 0, result = 0, error = 0;
+	unsigned at = 7 + 7;
+
+	if (length < 7 || m[0] != QMI_REQUEST) {
+		return;
+	}
+	message = (uint16_t)(m[3] | m[4] << 8);
+	rfsa_requests++;
+	bzero(answer, sizeof(answer));
+	answer[0] = QMI_RESPONSE;
+	answer[1] = m[1];
+	answer[2] = m[2];
+	answer[3] = m[3];
+	answer[4] = m[4];
+	answer[7] = 2;                          /* result: success, unless below */
+	answer[8] = 4;
+	if (message == RFSA_GET_BUFF_ADDR) {
+		value = qmi_tlv(m, length, 1, &size);
+		uint32_t client = value != NULL && size == 4 ? le32(value) : 0;
+		value = qmi_tlv(m, length, 2, &size);
+		uint32_t wanted = value != NULL && size == 4 ? le32(value) : 0;
+
+		if (client == 1 && wanted <= RMTFS_BUFFER_SIZE && rmtfs_buffer != 0 && rmtfs_shared) {
+			tell("mpss: rfsa: the modem asks for client %u's buffer (%u bytes): given ours at %#llx\n", client, wanted,
+			    rmtfs_buffer_pa);
+			answer[at++] = 1;               /* the address */
+			answer[at++] = 8;
+			answer[at++] = 0;
+			for (unsigned b = 0; b < 8; b++) {
+				answer[at++] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
+			}
+		} else {
+			printf("mpss: rfsa: the modem asks for client %u's buffer (%u bytes): NOT GIVEN (ours is %u, %s)\n", client, wanted,
+			    RMTFS_BUFFER_SIZE, rmtfs_shared ? "shared" : "NOT SHARED");
+			result = QMI_RESULT_FAILURE;
+			error = QMI_ERR_INTERNAL;
+		}
+	} else if (message == RFSA_RELEASE_BUFF_ADDR) {
+		/* (nothing to take back: the buffer stays ours and the modem's until it is shut down) */
+	} else {
+		printf("mpss: rfsa: a request this does not know (%#x, %zu bytes)\n", message, length);
+		result = QMI_RESULT_FAILURE;
+		error = QMI_ERR_MALFORMED;
+	}
+	answer[9] = (uint8_t)result;
+	answer[10] = (uint8_t)(result >> 8);
+	answer[11] = (uint8_t)error;
+	answer[12] = (uint8_t)(error >> 8);
+	answer[5] = (uint8_t)(at - 7);
+	answer[6] = (uint8_t)((at - 7) >> 8);
+	qrtr_send(rfsa_port, node, port, answer, at);
 }
 
 /* Our service announced to a node (its control port): a "new server", or the empty one that ends an answer to a lookup. */
@@ -4064,6 +4132,14 @@ rmtfs_start(void)
 	our_servers[0].service = RMTFS_SERVICE;
 	our_servers[0].instance = RMTFS_VERSION | RMTFS_INSTANCE << 8;
 	our_servers[0].port = rmtfs_port->number;
+	if (rfsa_port == NULL) {
+		rfsa_port = qrtr_open(rfsa_receive, NULL, NULL);
+	}
+	if (rfsa_port != NULL) {
+		our_servers[4].service = RFSA_SERVICE;
+		our_servers[4].instance = RFSA_INSTANCE;
+		our_servers[4].port = rfsa_port->number;
+	}
 	if (!option("modem_no_tftp")) {
 		if (tftp_port == NULL) {
 			tftp_port = qrtr_open(tftp_receive, NULL, NULL);
@@ -4111,6 +4187,10 @@ rmtfs_stop(void)
 	if (rmtfs_port != NULL) {
 		qrtr_close(rmtfs_port);
 		rmtfs_port = NULL;
+	}
+	if (rfsa_port != NULL) {
+		qrtr_close(rfsa_port);
+		rfsa_port = NULL;
 	}
 	if (tftp_port != NULL) {
 		qrtr_close(tftp_port);
