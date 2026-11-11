@@ -892,139 +892,15 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 /* The two rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done. */
 
 /*
- * On SM6375 / Blair (Moto G85) the regulators are RPM-SMD resources, not RPMh.
- * The RPM message RAM is at 0x00778000 (from dt: qcom,rpm-msg-ram@778000 / "msgram").
- * Linux's rpm_smd.c speaks to it: a request goes into the message RAM, the
- * doorbell (APCS_GPBL_SOFT_RESET at 0x00178008 bit 2, or the SMD channel interrupt)
- * is rung, and the RPM echoes the message back when it has acted.
- *
- * The two LPASS rails on Blair are:
- *   ldoa1  = PM7325 LDO1  (CX rail, 1P2 VDD_CX)  – RPM resource "ldoa" id 1
- *   ldoa17 = PM7325 LDO17 (MX rail, 1P8 VDD_MX)  – RPM resource "ldoa" id 17
- *
- * The boot loader enables both before handing control to us (checked via SPMI observer).
- * Android's kernel asks RPM-SMD for them at "active" (corner 7 = SVS_NOM); we confirm
- * they are on through SPMI reads and return true – the DSP starts fine as long as the
- * boot loader has not gated them, which it does not for LPASS on this platform.
- *
- * Full RPM-SMD mailbox protocol would require implementing SMD + XPC IPC, which is a
- * significant driver; instead we follow the same approach as wcn3990 power: read SPMI
- * to verify, then proceed (the DSP's TrustZone call will time out if the rails are truly
- * off, giving a clear diagnostic).
+ * On SM6375 / Blair the rails are RPM-SMD resources, not RPMh. Speaking RPM-SMD means the
+ * SMD/XPC mailbox, which this driver does not have; the boot loader leaves the LPASS rails on.
+ * (The earlier SPMI reads here named PM7325 LDO1/LDO17, which this phone does not have: its
+ * PMICs are the PM6125 and PMR735A. Nothing is read instead of reading the wrong thing.)
  */
-
-/* SPMI arbiter observer (read path) for PM7325, shared with hakios.wifi.c via extern */
-
-/*
- * Minimal SPMI arbiter observer for ADSP driver – mirrors the implementation in
- * hakios.wifi.c but as local static functions so the two TUs compile independently.
- * The register map is the same (qcom,spmi@c440000 on Blair / SM6375).
- */
-static struct block adsp_arb_core     = { "arb-core",     0x0c440000, 0x1100 };
-static struct block adsp_arb_cnfg     = { "arb-cnfg",     0x0c40a000, 0x1000 };
-static struct block adsp_arb_observer = { "arb-observer", 0x0e600000, 0x10000 };
-
-#define ADSP_ARB_CHANNEL(n)   (0x900 + 4 * (n))
-#define ADSP_ARB_OWNER(n)     (0x700 + 4 * (n))
-#define ADSP_ARB_FEATURES     0x004
-#define ADSP_ARB_SYSTEM       0
-#define ADSP_OBS_COMMAND      0x00
-#define ADSP_OBS_STATUS       0x08
-#define ADSP_OBS_DATA0        0x18
-#define ADSP_STATUS_DONE      0x1
-#define ADSP_STATUS_FAILURE   0x2
-#define ADSP_STATUS_DENIED    0x4
-#define ADSP_CMD_READ         (1u << 27)
-
-static int
-adsp_spmi_channel(uint16_t id)
-{
-	uint32_t nch;
-	int found = -1;
-
-	need(&adsp_arb_core);
-	nch = rd(adsp_arb_core.base + ADSP_ARB_FEATURES) & 0x7ff;
-	for (uint32_t n = 0; n < nch; n++) {
-		uint32_t map = rd(adsp_arb_core.base + ADSP_ARB_CHANNEL(n));
-		if (map == 0 || ((map >> 8) & 0xfff) != id) {
-			continue;
-		}
-		if (found < 0 || (rd(adsp_arb_cnfg.base + ADSP_ARB_OWNER(n)) & 7) == ADSP_ARB_SYSTEM) {
-			found = (int)n;
-		}
-	}
-	return found;
-}
-
-static const char *
-adsp_spmi_read(int channel, uint8_t reg, uint8_t *bytes, uint32_t count)
-{
-	vm_offset_t at = adsp_arb_observer.base + 0x10000UL * ADSP_ARB_SYSTEM + 0x80UL * (uint32_t)channel;
-	uint64_t start = now_us();
-	uint32_t status, data[2];
-
-	need(&adsp_arb_observer);
-	wr(at + ADSP_OBS_COMMAND, ADSP_CMD_READ | (uint32_t)reg << 4 | (count - 1));
-	do {
-		status = rd(at + ADSP_OBS_STATUS);
-	} while (!(status & ADSP_STATUS_DONE) && now_us() - start < 2000);
-	if (!(status & ADSP_STATUS_DONE)) return "no answer";
-	if (status & ADSP_STATUS_DENIED)  return "denied";
-	if (status & ADSP_STATUS_FAILURE) return "failure";
-	data[0] = rd(at + ADSP_OBS_DATA0);
-	data[1] = rd(at + ADSP_OBS_DATA0 + 4);
-	for (uint32_t i = 0; i < count && i < 8; i++) {
-		bytes[i] = (uint8_t)(data[i / 4] >> (8 * (i & 3)));
-	}
-	return NULL;
-}
-
 static bool
 rails_blair_check(uint32_t level)
 {
-	/*
-	 * PM7325 LDO1 (CX)  = SPMI slave 0, peripheral 0x41 (ult_lo_smps)
-	 * PM7325 LDO17 (MX) = SPMI slave 0, peripheral 0x51 (ult_lo_smps)
-	 * Enable register = 0x46, bit 7: regulator enabled.
-	 * We check and log. If either is off and level != 0, we warn but do not fail:
-	 * the boot loader on SM6375 leaves both on before XBL hands over to XBL_S4.
-	 */
-	const struct {
-		uint16_t periph_id;
-		const char *name;
-	} ldo[] = {
-		{ (0u << 8) | 0x41u, "ldoa1  (CX / VDD_CX,  PM7325 LDO1)" },
-		{ (0u << 8) | 0x51u, "ldoa17 (MX / VDD_MX,  PM7325 LDO17)" },
-	};
-
-	if (level == 0) {
-		/* giving back: on Blair the boot loader owns these; we just log */
-		printf("adsp: %u: Blair: RPM-SMD rails given-back request (level 0) – skipped (boot loader holds them)\n", step);
-		return true;
-	}
-
-	printf("adsp: %u: Blair / SM6375: checking LPASS rails via SPMI observer (RPM-SMD owns them)\n", step);
-
-	for (unsigned r = 0; r < sizeof(ldo) / sizeof(ldo[0]); r++) {
-		int ch = adsp_spmi_channel(ldo[r].periph_id);
-		if (ch < 0) {
-			printf("adsp: %u: SPMI: no channel for %s\n", step, ldo[r].name);
-			continue;
-		}
-		uint8_t en = 0, mode = 0;
-		const char *err_en   = adsp_spmi_read(ch, 0x46, &en,   1);
-		const char *err_mode = adsp_spmi_read(ch, 0x45, &mode, 1);
-		if (err_en || err_mode) {
-			printf("adsp: %u: SPMI read %s: en=%s mode=%s\n", step, ldo[r].name,
-			    err_en ? err_en : "ok", err_mode ? err_mode : "ok");
-		} else {
-			printf("adsp: %u: SPMI %s: enable=%#x (%s)  mode=%#x\n", step, ldo[r].name,
-			    en, (en & 0x80u) ? "ON" : "OFF", mode);
-			if (!(en & 0x80u)) {
-				printf("adsp: %u: WARNING: %s is OFF – DSP may not come up\n", step, ldo[r].name);
-			}
-		}
-	}
+	printf("adsp: %u: Blair: the LPASS rails are RPM-SMD's and left on by the boot loader (level %u)\n", step, level);
 	return true;
 }
 

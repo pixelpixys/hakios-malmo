@@ -853,12 +853,6 @@ static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 #define IPCC_WPSS               24u
 #define IPCC_SMP2P              2u              /* the signal */
 
-/*
- * On Moto G85 (SM6375 / Blair / holi), Wi-Fi is WCN3990 operated through ICNSS (0x0C800000)
- * and MSA memory (0x86500000, 2MB).
- */
-static struct block icnss_block = { "icnss", 0x0c800000, 0x10000 };
-
 static bool
 step_mailbox(void)
 {
@@ -1030,12 +1024,12 @@ step_rpmh(void)
 
 /*
  * The PMIC arbiter, as in hakios.buttons.c: reads go through the "observer" channels, which
- * every system has for every peripheral, whoever owns it. dt: qcom,spmi@c440000; on the bus the
- * PM7325 is slave 1 and the PM8350C slave 2.
+ * every system has for every peripheral, whoever owns it. dt: qcom,spmi@1c40000 (Blair);
+ * the PM6125 is slave 0 and the PMR735A slave 4.
  */
-static struct block arb_core = { "arbiter", 0x0c440000, 0x1100 };
-static struct block arb_cnfg = { "arbiter's owners", 0x0c40a000, 0x1000 };
-static struct block arb_observer = { "arbiter's observer", 0x0e600000, 0x10000 };
+static struct block arb_core = { "arbiter", 0x01c40000, 0x1100 };
+static struct block arb_cnfg = { "arbiter's owners", 0x01c0a000, 0x1000 };
+static struct block arb_observer = { "arbiter's observer", 0x03e00000, 0x10000 };
 #define ARB_VERSION             0x000
 #define ARB_VERSION_5           0x50000000u     /* what follows is version 5's; 7 moved things again */
 #define ARB_VERSION_7           0x70000000u
@@ -1061,6 +1055,14 @@ spmi_channel(uint16_t id)
 {
 	int found = -1;
 
+	if (arb_channels == 0) {
+		need(&arb_core);
+		need(&arb_cnfg);
+		arb_channels = rd(arb_core.base + ARB_FEATURES) & 0x7ff;
+		if (arb_channels == 0 || arb_channels > 512) {
+			arb_channels = 512;
+		}
+	}
 	for (uint32_t n = 0; n < arb_channels; n++) {
 		uint32_t map = rd(arb_core.base + ARB_CHANNEL(n));
 
@@ -1849,109 +1851,30 @@ dsp_shutdown(const char *why)
 }
 
 /*
- * Moto G85 / WCN3990 Step 8: Prepare MSA region (0x86500000) and QMI / SMP2P wlan descriptors.
+ * Moto G85 / WCN3990 Step 8: the MSA region (0x86500000), looked at and left alone.
+ *
+ * The radio's DSP is not WPSS here: the modem loads wlanmdsp.mbn over TFTP and starts the
+ * WLAN user PD. WLFW then picks its BDF up through QMI (step 13), so nothing needs to be
+ * written into the radio's memory from this side. In particular the offsets tried before
+ * (0xc800e00 and on) are the copy engine's, not a boot trigger, and the "WFBW" descriptor
+ * was invented: zeroing that memory or writing to those registers can only break things.
  */
 static bool
 step_header(void)
 {
-	/*
-	 * WCN3990 / SM6375 (Blair / Moto G85): The Wi-Fi DSP is NOT the WPSS subsystem
-	 * (which belongs to SM8350/redwood). Instead the radio firmware (wlanmdsp.mbn) runs
-	 * directly in-line through ICNSS (Integrated Connectivity SubSystem, 0x0C800000).
-	 *
-	 * ICNSS on SM6375 is the hardware block that:
-	 *   - holds the WCN3990 internal DSP control registers
-	 *   - provides a shared memory window for QMI WLFW at MSA 0x86500000 (2 MB)
-	 *   - exposes a boot-trigger register at ICNSS_WLAN_LOAD_REG (0x0C800E00)
-	 *
-	 * Linux drivers/net/wireless/ath/wcn36xx/pmc.c and drivers/net/wireless/ath/wcn36xx/smd.c
-	 * show the register layout. The sequence:
-	 *   1. Write WLAN_CTRL_REG (0x0C800E04) = 0x1  (assert reset)
-	 *   2. Write WLAN_LOAD_REG (0x0C800E00) = 0x1  (request firmware load)
-	 *   3. Wait for WLAN_STATUS_REG (0x0C800E08) bit 0 = 1 (firmware ready)
-	 *
-	 * MSA region 0x86500000 (2MB) is shared between ICNSS and WLFW service for QMI.
-	 * We map it, zero the first 4KB (control header), and write the firmware base address
-	 * and size as the QMI WLFW BDF memory descriptor.
-	 */
-#define ICNSS_REG_CTRL          0x0E04u         /* WLAN control: bit0 = reset assert */
-#define ICNSS_REG_LOAD          0x0E00u         /* firmware load trigger: write 1 */
-#define ICNSS_REG_STATUS        0x0E08u         /* status: bit0 = ready */
-#define ICNSS_REG_FW_BASE       0x0E10u         /* firmware base address (physical) */
-#define ICNSS_REG_FW_SIZE       0x0E14u         /* firmware size in bytes */
-
 	volatile uint32_t *msa;
 	const uint32_t msa_phys = 0x86500000u;
-	const uint32_t msa_size = 0x200000u;        /* 2 MB */
-	const uint32_t fw_phys  = 0x8b800000u;      /* pil_mpss_wlan_mem where wlanmdsp.mbn loaded */
-	const uint32_t fw_size  = 0x800000u;        /* 8 MB window */
-	uint64_t deadline;
-	uint32_t status;
 
-	announce("Moto G85 / WCN3990: program ICNSS registers, assert WLAN_EN, prepare MSA QMI region");
+	announce("Moto G85 / WCN3990: look at the MSA region (0x86500000); it is the modem's to fill");
 
-	need(&icnss_block);
-
-	printf("wifi: %u: ICNSS @ 0x0C800000 – reading status before init: ctrl=%#x load=%#x status=%#x\n",
-	    step, rd(icnss_block.base + ICNSS_REG_CTRL), rd(icnss_block.base + ICNSS_REG_LOAD),
-	    rd(icnss_block.base + ICNSS_REG_STATUS));
-
-	/* 1. Assert reset */
-	wr(icnss_block.base + ICNSS_REG_CTRL, 0x1u);
-	settle();
-
-	/* 2. Write firmware physical base and size for ICNSS DMA */
-	wr(icnss_block.base + ICNSS_REG_FW_BASE, fw_phys);
-	wr(icnss_block.base + ICNSS_REG_FW_SIZE, fw_size);
-	settle();
-
-	/* 3. Trigger firmware load */
-	wr(icnss_block.base + ICNSS_REG_LOAD, 0x1u);
-	settle();
-
-	printf("wifi: %u: ICNSS: wrote ctrl=1, fw_base=%#x, fw_size=%#x, load=1; waiting for ready\n",
-	    step, fw_phys, fw_size);
-
-	/* 4. Wait up to 500 ms for WCN3990 to signal ready */
-	deadline = now_us() + 500000ull;
-	do {
-		status = rd(icnss_block.base + ICNSS_REG_STATUS);
-		if (status & 0x1u) {
-			break;
-		}
-		sleep_us(1000);
-	} while (now_us() < deadline);
-
-	printf("wifi: %u: ICNSS status after wait: %#x (%s)\n", step, status,
-	    (status & 0x1u) ? "READY" : "not-ready (continuing – QMI may still come up)");
-
-	/* 5. Map MSA region, zero header area, write QMI BDF descriptor */
-	msa = (volatile uint32_t *)ml_io_map_unmappable(msa_phys, msa_size, VM_WIMG_WCOMB);
+	msa = (volatile uint32_t *)ml_io_map_unmappable(msa_phys, 0x1000, VM_WIMG_WCOMB);
 	if (msa == NULL) {
 		printf("wifi: %u: failed to map MSA region @ %#x\n", step, msa_phys);
-		/* Non-fatal: QMI WLFW may still find it */
-		return true;
+		return false;
 	}
 
-	printf("wifi: %u: MSA region @ %#x mapped: initial words = %#x %#x %#x %#x\n",
+	printf("wifi: %u: MSA region @ %#x: words %#x %#x %#x %#x (read only)\n",
 	    step, msa_phys, msa[0], msa[1], msa[2], msa[3]);
-
-	/* Zero the first 4 KB (QMI control header / BDF descriptor area) */
-	for (unsigned i = 0; i < 1024; i++) {
-		msa[i] = 0;
-	}
-	settle();
-
-	/* Write BDF memory descriptor at offset 0: [0]=magic, [1]=fw_base, [2]=fw_size */
-	msa[0] = 0x57464257u;   /* "WFBW" – WCN3990 QMI BDF descriptor magic */
-	msa[1] = fw_phys;
-	msa[2] = fw_size;
-	settle();
-
-	printf("wifi: %u: MSA QMI BDF descriptor written: magic=%#x base=%#x size=%#x\n",
-	    step, msa[0], msa[1], msa[2]);
-
-	printf("wifi: %u: MSA region ready\n", step);
 	return true;
 }
 

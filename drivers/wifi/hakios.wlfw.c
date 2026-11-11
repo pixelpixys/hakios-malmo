@@ -363,6 +363,9 @@ mission(void)
 	return true;
 }
 
+#define HAKIOS_SOC_BASE_BLAIR   0x00200000ul
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+
 bool
 hakios_wlfw_exchange(uint32_t step)
 {
@@ -379,6 +382,8 @@ hakios_wlfw_exchange(uint32_t step)
 	uint32_t calibrate = 0, seconds = 5, to_mission = 0, board_id;
 	bool far = false, board = false;
 	int ret;
+	bool is_blair = (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR);
+	uint32_t ins_id = is_blair ? 0 : ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750;
 
 	if (handle_open) {
 		return false;
@@ -395,11 +400,10 @@ hakios_wlfw_exchange(uint32_t step)
 		return false;
 	}
 	handle_open = true;
-	ret = qmi_add_lookup(&handle, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01,
-	    ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750);
+	ret = qmi_add_lookup(&handle, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ins_id);
 	if (ret < 0 || !wait_for(&wlfw.server, 3000)) {
 		say("wifi: %u: THE SERVICE (%#x, version %u, instance %u) DOES NOT APPEAR within 3 s (lookup: %d)\n", step,
-		    ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750, ret);
+		    ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ins_id, ret);
 		goto out;
 	}
 
@@ -476,8 +480,19 @@ hakios_wlfw_exchange(uint32_t step)
 	 * the board's data. ath11k would look in "board-2.bin" for an entry named after the ids above
 	 * and fall back to "board.bin"; here it is the file this phone's Android sends.
 	 */
-	send_file("the regulatory database", "regdb_xiaomi.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
-	board = send_file("the board's data", "bd_m20gl.elf", ATH11K_QMI_BDF_TYPE_ELF, board_id);
+	/*
+	 * ath11k_qmi_event_load_bdf(): the regulatory database, then the board's data.
+	 * Blair / Moto G85: regdb.bin and bdwlan_malmo_ipa.bin (WCN3990 BDF).
+	 * Redwood / Poco X5 Pro: regdb_xiaomi.bin and bd_m20gl.elf (WCN6750 BDF).
+	 */
+	if (is_blair) {
+		send_file("the regulatory database", "regdb.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
+		/* malmo's BDF is a raw bdwlan image, not an ELF blob (ath11k's qmi.h: BIN is 0, ELF is 1) */
+		board = send_file("the board's data", "bdwlan_malmo_ipa.bin", ATH11K_QMI_BDF_TYPE_BIN, board_id);
+	} else {
+		send_file("the regulatory database", "regdb_xiaomi.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
+		board = send_file("the board's data", "bd_m20gl.elf", ATH11K_QMI_BDF_TYPE_ELF, board_id);
+	}
 	if (!board) {
 		goto out;
 	}
