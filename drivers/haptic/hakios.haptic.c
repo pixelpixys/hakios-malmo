@@ -1113,12 +1113,23 @@ haptic_thread(__unused void *parameter, __unused wait_result_t result)
 		release_and_look(1);
 		output_selftest();
 
+		/*
+		 * AW86927 reset sequence (Android aw86927 driver: haptic_hv_hw_reset()):
+		 *   1. Drive GPIO89 LOW for 5 ms  (hold chip in reset)
+		 *   2. Drive GPIO89 HIGH           (release reset)
+		 *   3. Wait ≥1 ms for chip to boot (Android uses 1 ms; we use 15 ms to be safe)
+		 * Without the LOW phase the chip may boot into an indeterminate state.
+		 */
+		say("haptic: AW86927 reset sequence: gpio89 LOW 5 ms then HIGH (Android hw_reset sequence)\n");
+		reset_pin(false);       /* LOW: assert reset */
+		wait_ms(5);
+		reset_pin(true);        /* HIGH: release reset */
+		wait_ms(15);            /* ≥1 ms required; 15 ms to be safe */
+		say("haptic: gpio89 reads %u after AW86927 reset sequence (cfg=%#x io=%#x)\n",
+		    level_of(PIN_RESET), rd(GPIO_CFG(PIN_RESET)), rd(GPIO_IO(PIN_RESET)));
+
 		/* Try scanning both buses: qupv3_se8 (GPIO 19/20) and qupv3_se10 (GPIO 4/5) */
 		say("haptic: checking I2C response on default bus (GPIO 19 SDA, GPIO 20 SCL)...\n");
-		reset_pin(true);
-		wait_ms(15);
-		say("haptic: gpio89 reads %u after being driven high (cfg=%#x io=%#x)\n",
-		    level_of(PIN_RESET), rd(GPIO_CFG(PIN_RESET)), rd(GPIO_IO(PIN_RESET)));
 
 		/* Survey buses */
 		scan_bus(19, 20);

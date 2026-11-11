@@ -2217,6 +2217,20 @@ step_our_item(void)
 static bool
 step_start(void)
 {
+	/*
+	 * Blair / WCN3990: The DSP is already started by ICNSS in step_header (step 8) via
+	 * ICNSS_WLAN_LOAD_REG. TrustZone PAS_WPSS auth is for the WPSS subsystem (WCN6750/redwood)
+	 * only. For WCN3990 we simply mark the DSP as started and let GLINK/QRTR come up.
+	 */
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		announce("Blair/WCN3990: DSP started via ICNSS in step 8; marking dsp_started, skipping TZ PAS_WPSS");
+		lck_mtx_lock(&dsp_lock);
+		dsp_started = true;
+		lck_mtx_unlock(&dsp_lock);
+		printf("wifi: %u: Blair/WCN3990: dsp_started set; proceeding to GLINK/QRTR (steps 12-15)\n", step);
+		return true;
+	}
+
 	struct smp2p words, last;
 	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
 	uint32_t state = 0, rang, changes = 0, wait_seconds = 10;
@@ -4382,11 +4396,31 @@ join_given(uint64_t began)
 /*
  * wifi=1: the whole of it on a thread of its own, so that the system starts meanwhile (the
  * firmware's calibration alone takes seven seconds). The steps that only look are left out.
+ *
+ * Blair / SM6375 / WCN3990 path: steps 9 (image write to WPSS 0x9ae00000), 10 (SMP2P our_item)
+ * and 11 (TrustZone SCM_PAS_AUTH_AND_RESET with PAS_WPSS=6) do NOT apply – WCN3990 is not the
+ * WPSS subsystem. The DSP is started by ICNSS registers in step_header (step 8). After that we
+ * go straight to the GLINK/QRTR/QMI steps (12-15).
+ *
+ * Redwood / SM8350 / WCN6750 path: the original sequence, unchanged.
  */
 static void
 whole_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	static const uint8_t needed[] = { 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	/* Blair/WCN3990: skip steps 9 (WPSS image write), 10 (SMP2P), 11 (TZ PAS_WPSS start) */
+	static const uint8_t needed_blair[]   = { 1, 2, 6, 7, 8, 12, 13, 14, 15 };
+	/* Redwood/WCN6750: original full sequence */
+	static const uint8_t needed_redwood[] = { 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	const uint8_t *needed;
+	unsigned needed_count;
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		needed       = needed_blair;
+		needed_count = sizeof(needed_blair);
+		tell("wifi: Blair/WCN3990 path: steps 1,2,6,7,8,12,13,14,15 (WPSS/TZ steps skipped)\n");
+	} else {
+		needed       = needed_redwood;
+		needed_count = sizeof(needed_redwood);
+	}
 	uint64_t began = now_us();
 	uint32_t done = 0, failed = 0;
 
@@ -4396,7 +4430,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		whole_runs = false;
 		thread_terminate(current_thread());
 	}
-	for (unsigned i = 0; i < sizeof(needed) && failed == 0; i++) {
+	for (unsigned i = 0; i < needed_count && failed == 0; i++) {
 		step = needed[i];
 		if (step == 15) {
 			tell("wifi: the radio's DSP is up and linked, %llu ms in; now the driver\n", (now_us() - began) / 1000);
@@ -4407,7 +4441,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 			failed = step;
 		}
 	}
-	last_step = needed[sizeof(needed) - 1];
+	last_step = needed[needed_count - 1];
 	if (failed == 0) {
 		tell("wifi: THE RADIO IS UP, %llu.%llu s after the kernel began on it\n", (now_us() - began) / 1000000,
 		    (now_us() - began) / 100000 % 10);
@@ -4455,8 +4489,12 @@ hakios_wifi_init(void)
 	}
 	hakios_qmi_set_transport(&qrtr_ops);
 	if (last_step == 0) {
-		if (image_file("wpss.mdt", &size) == NULL) {
-			printf("wifi: wifi=1, but the radio's firmware is not in the small image (fw-wifi/, see the README): no Wi-Fi\n");
+		/* Blair/WCN3990 uses wlanmdsp.mbn; Redwood/WCN6750 uses wpss.mdt */
+		const char *fw_check = (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR)
+		    ? "wlanmdsp.mbn" : "wpss.mdt";
+		if (image_file(fw_check, &size) == NULL) {
+			printf("wifi: wifi=1, but the radio's firmware (%s) is not in the small image (fw-wifi/, see the README): no Wi-Fi\n",
+			    fw_check);
 			return;
 		}
 		whole = whole_runs = true;

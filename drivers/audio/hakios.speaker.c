@@ -826,6 +826,22 @@ hakios_speaker_prepare(__unused const uint8_t *acf, __unused uint64_t size)
 	}
 	broken = false;
 	say("speaker: preparing FourSemi FS1815 smart amplifiers (malmo)...\n");
+
+	/*
+	 * Force GPIO 4 (SDA) and GPIO 5 (SCL) to GPIO function (function=0, pull-up, input)
+	 * before bus_take(). On malmo these pins start life on qup hardware function; unless
+	 * they are switched to function 0 first, level() reads 0 and bus_take() refuses to work.
+	 */
+	say("speaker: switching gpio4(SDA)/gpio5(SCL) to GPIO function (function=0, pull-up)...\n");
+	wr(GPIO_IO(PIN_SDA), 0);
+	wr(GPIO_CFG(PIN_SDA), CFG_PULL_UP);          /* function=0, pull-up, input */
+	wr(GPIO_IO(PIN_SCL), 0);
+	wr(GPIO_CFG(PIN_SCL), CFG_PULL_UP);
+	spin_us(50);
+	say("speaker: gpio4 cfg=%#x io=%#x reads %u; gpio5 cfg=%#x io=%#x reads %u\n",
+	    rd(GPIO_CFG(PIN_SDA)), rd(GPIO_IO(PIN_SDA)), (rd(GPIO_IO(PIN_SDA)) & 1),
+	    rd(GPIO_CFG(PIN_SCL)), rd(GPIO_IO(PIN_SCL)), (rd(GPIO_IO(PIN_SCL)) & 1));
+
 	show_pins();
 
 	sdz_pins(true);
