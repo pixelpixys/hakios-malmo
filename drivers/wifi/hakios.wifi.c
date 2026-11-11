@@ -164,6 +164,8 @@
 #include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
+
+#define HAKIOS_SOC_BASE_BLAIR   0x00200000ul    /* where the loader says blair's peripherals begin */
 #include <sys/hakios.input.h>
 #include <sys/hakios.qrtr.h>
 #include <sys/hakios.sta.h>
@@ -1182,7 +1184,6 @@ step_rails(void)
  */
 static struct block tlmm_blair = { "tlmm", 0x00500000, 0x300000 };
 
-static bool
 /*
  * TLMM GPIO register layout (SM6375 / Blair):
  *   cfg offset 0x0: [1:0] pull, [5:2] func, [8:6] drive strength, [9] output-enable
