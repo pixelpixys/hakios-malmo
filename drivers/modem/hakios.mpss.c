@@ -4051,9 +4051,10 @@ rfsa_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 		if (client == 1 && wanted <= RMTFS_BUFFER_SIZE && rmtfs_buffer != 0 && rmtfs_shared) {
 			tell("mpss: rfsa: the modem asks for client %u's buffer (%u bytes): given ours at %#llx\n", client, wanted,
 			    rmtfs_buffer_pa);
-			answer[at++] = 1;               /* the address */
-			answer[at++] = 8;
+			answer[at++] = 0x10;            /* address_valid and address share one TLV: the flag, then the address */
+			answer[at++] = 9;
 			answer[at++] = 0;
+			answer[at++] = 1;
 			for (unsigned b = 0; b < 8; b++) {
 				answer[at++] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
 			}
