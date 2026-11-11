@@ -3893,13 +3893,13 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
 			break;
 		}
 		tell("mpss: rmtfs: the modem asks for a buffer of %u bytes: given ours at %#llx\n", le32(value), rmtfs_buffer_pa);
-		tlv[0] = 0x10;
-		tlv[1] = 8;
-		tlv[2] = 0;
+		tlv[0] = 0x10;                  /* address_valid and address share one TLV: the flag, then the address */
+		tlv[1] = 9;
+		tlv[2] = 1;
 		for (unsigned b = 0; b < 8; b++) {
 			tlv[3 + b] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
 		}
-		extra = 11;
+		extra = 12;
 		break;
 	case RMTFS_RW_IOVEC: {
 		const uint8_t *direction = qmi_tlv(m, length, 2, &size), *entries;
@@ -4053,7 +4053,6 @@ rfsa_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 			    rmtfs_buffer_pa);
 			answer[at++] = 0x10;            /* address_valid and address share one TLV: the flag, then the address */
 			answer[at++] = 9;
-			answer[at++] = 0;
 			answer[at++] = 1;
 			for (unsigned b = 0; b < 8; b++) {
 				answer[at++] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
