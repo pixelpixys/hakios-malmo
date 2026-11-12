@@ -3868,7 +3868,7 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
 		rmtfs_files[file].open = true;
 		printf("mpss: rmtfs: the modem opens %s (%s, %llu bytes): caller %u\n", rmtfs_files[file].path, rmtfs_files[file].partition,
 		    rmtfs_files[file].size, file + 1);
-		tlv[0] = 0x10;                  /* the caller's id: the file's number plus one */
+		tlv[0] = 0x10;                  /* the caller's id: the file's number plus one (a TLV is type, 2 bytes of length, value) */
 		tlv[1] = 4;
 		tlv[2] = 0;
 		tlv[3] = (uint8_t)(file + 1);
@@ -3893,13 +3893,13 @@ rmtfs_receive(__unused void *context, uint32_t node, uint32_t port, const void *
 			break;
 		}
 		tell("mpss: rmtfs: the modem asks for a buffer of %u bytes: given ours at %#llx\n", le32(value), rmtfs_buffer_pa);
-		tlv[0] = 0x10;                  /* address_valid and address share one TLV: the flag, then the address */
-		tlv[1] = 9;
-		tlv[2] = 1;
+		tlv[0] = 0x10;                  /* the address, little endian (the optional's presence is its flag: qmi_encdec.c) */
+		tlv[1] = 8;
+		tlv[2] = 0;
 		for (unsigned b = 0; b < 8; b++) {
 			tlv[3 + b] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
 		}
-		extra = 12;
+		extra = 11;
 		break;
 	case RMTFS_RW_IOVEC: {
 		const uint8_t *direction = qmi_tlv(m, length, 2, &size), *entries;
@@ -4051,9 +4051,9 @@ rfsa_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 		if (client == 1 && wanted <= RMTFS_BUFFER_SIZE && rmtfs_buffer != 0 && rmtfs_shared) {
 			tell("mpss: rfsa: the modem asks for client %u's buffer (%u bytes): given ours at %#llx\n", client, wanted,
 			    rmtfs_buffer_pa);
-			answer[at++] = 0x10;            /* address_valid and address share one TLV: the flag, then the address */
-			answer[at++] = 9;
-			answer[at++] = 1;
+			answer[at++] = 0x10;            /* the address, little endian (the optional's presence is its flag: qmi_encdec.c) */
+			answer[at++] = 8;
+			answer[at++] = 0;
 			for (unsigned b = 0; b < 8; b++) {
 				answer[at++] = (uint8_t)(rmtfs_buffer_pa >> (8 * b));
 			}

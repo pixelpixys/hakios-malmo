@@ -234,6 +234,14 @@ static TUNABLE(uint32_t, gTouchLat, "touch_lat", 0);
  * reads the same physical memory the display scans, so if it shows apple and not magenta, the kernel's
  * writes are not reaching DRAM (cache or wrong address), not a CoreAnimation problem. */
 static TUNABLE(uint32_t, gFBSolid, "fbsolid", 0);
+/*
+ * Boot-arg fb_brightness=N (0 to 100): the picture is dimmed in software to N per cent. The panel's own
+ * brightness is a DCS command (dt: bl_ctrl_dcs) sent over DSI, which this driver cannot send yet; the
+ * boot loader's level stands. This scales what is drawn, and 100 (the default) costs nothing.
+ */
+static TUNABLE_WRITEABLE(uint32_t, gBrightness, "fb_brightness", 100);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, brightness, CTLFLAG_RW | CTLFLAG_LOCKED, &gBrightness, 0,
+    "how many per cent of its brightness the picture is drawn at (0 to 100)");
 
 static inline uint64_t
 micros(uint64_t absolute)
@@ -879,6 +887,22 @@ blend(uint32_t a, uint32_t b, uint32_t w)
 }
 
 /*
+ * A pixel at `scale` of 256 of its brightness (fb_brightness): the picture is dimmed, the panel's own
+ * brightness is left as the boot loader set it. Two of the four channels at a time, as in blend().
+ */
+static inline uint32_t
+dimmed(uint32_t c, uint32_t scale)
+{
+	if (scale >= 256) {
+		return c;
+	}
+	uint32_t rb = ((c & 0xff00ff) * scale >> 8) & 0xff00ff;
+	uint32_t ga = (((c >> 8) & 0xff00ff) * scale >> 8) & 0xff00ff;
+
+	return rb | ga << 8;
+}
+
+/*
  * Where the middle of the `i`th of `out` pixels falls among `in` of them, in 256ths of a pixel,
  * kept within the first and the last.
  */
@@ -915,6 +939,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 	int32_t sx = job->sx, sy = job->sy, sw = job->sw, sh = job->sh;
 	int32_t px0 = job->px0, py0 = job->py0, px1 = job->px1, py1 = job->py1, cx0 = job->cx0, cx1 = job->cx1;
 	bool filter = job->filter;
+	uint32_t scale = gBrightness >= 100 ? 256 : gBrightness * 256 / 100;
 
 	for (int32_t y = y0; y < y1; y++) {
 		const uint32_t * from;
@@ -926,7 +951,15 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 		to = (uint32_t *) (fDraw + (size_t) y * fRowBytes);
 		if (job->unscaled) {
 			/* not scaled at all */
-			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
+			const uint32_t * fromRow = (const uint32_t *) (pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4);
+
+			if (scale >= 256) {
+				memcpy(to + px0, fromRow, (size_t) sw * 4);
+			} else {
+				for (int32_t x = 0; x < sw; x++) {
+					to[px0 + x] = dimmed(fromRow[x], scale);
+				}
+			}
 			continue;
 		}
 		if (filter) {
@@ -974,11 +1007,11 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
 				uint32_t c = column[i], w = weights[i], a = from[c];
 
-				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
+				out[i] = dimmed(w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w), scale);
 			}
 		} else {
 			for (int32_t x = cx0; x < cx1; x++) {
-				to[x] = from[fColumn[x]];
+				to[x] = dimmed(from[fColumn[x]], scale);
 			}
 		}
 	}
