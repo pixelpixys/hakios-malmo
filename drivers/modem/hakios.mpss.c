@@ -1753,19 +1753,7 @@ step_our_item(void)
 			smem_poke(our_item + SMP2P_AT_VALUE(1), ipa);
 			printf("mpss: %u: our entry \"ipa\" = %#x\n", step, ipa);
 		}
-		/*
-		 * A third entry, "wlan" (dt: smp2p_wlan_1_in / qcom,smp2p-wlan-1-in of qcom,smp2p-modem):
-		 * informs Hexagon modem DSP that WLAN subsystem / wlan_pd is active.
-		 */
-		bzero(name, sizeof(name));
-		strlcpy((char *)name, "wlan", sizeof(name));
-		for (uint32_t word = 0; word < 4; word++) {
-			smem_poke(our_item + SMP2P_AT_NAME(2) + 4 * word, name[word]);
-		}
-		smem_poke(our_item + SMP2P_AT_VALUE(2), 1);
-		printf("mpss: %u: our entry \"wlan\" = 1\n", step);
-
-		smem_poke(our_item + SMP2P_AT_COUNTS, 16 | (ipa != 0 ? 3u : 2u) << 16);
+		smem_poke(our_item + SMP2P_AT_COUNTS, 16 | (ipa != 0 ? 2u : 1u) << 16);
 	}
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8);
 	settle();
@@ -4586,7 +4574,6 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 		{ "/readwrite/dhob_report.txt", { 0 } },
 		{ "/readwrite/datablock/id_00", { 0 } },
 		{ "/readwrite/mot_rfs/imei_sv", { 0 } },
-		{ "/readwrite/ota_firewall/ruleset", { 0 } },
 	};
 	for (unsigned d = 0; d < sizeof(dummies) / sizeof(dummies[0]) && file == NULL; d++) {
 		if (strcmp(name, dummies[d].name) == 0) {
@@ -4851,10 +4838,6 @@ servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void
 		for (unsigned i = 0; i < servreg_maps; i++) {
 			found += strcmp(servreg_map[i].service, wanted) == 0;
 		}
-		if (found == 0 && strcmp(wanted, "tms/pddump_disabled") == 0) {
-			/* Modem root PD asks where dump is disabled */
-			found = 1;
-		}
 		/* TLV 0x10: how many domains in all; 0x11: the table's revision; 0x12: the list, each a string with a
 		 * byte of length, the service data (a byte of validity, 4 bytes), and the instance (4 bytes) */
 		answer[at++] = 0x10;
@@ -4873,15 +4856,11 @@ servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void
 			answer[at++] = 0x12;
 			at += 2;                        /* the length, filled in below */
 			answer[at++] = (uint8_t)found;  /* array length: 1 byte */
-			if (strcmp(wanted, "tms/pddump_disabled") == 0) {
-				servreg_entry(answer, &at, "msm/modem/root_pd", 180);
-			} else {
-				for (unsigned i = 0; i < servreg_maps && at + 64 < sizeof(answer); i++) {
-					if (strcmp(servreg_map[i].service, wanted) != 0) {
-						continue;
-					}
-					servreg_entry(answer, &at, servreg_map[i].domain, servreg_map[i].instance);
+			for (unsigned i = 0; i < servreg_maps && at + 64 < sizeof(answer); i++) {
+				if (strcmp(servreg_map[i].service, wanted) != 0) {
+					continue;
 				}
+				servreg_entry(answer, &at, servreg_map[i].domain, servreg_map[i].instance);
 			}
 			answer[list + 1] = (uint8_t)(at - list - 3);
 			answer[list + 2] = (uint8_t)((at - list - 3) >> 8);
@@ -5568,10 +5547,7 @@ pdr_register_listeners(uint32_t node, uint32_t port)
 	uint8_t req[64];
 	const char *target_names[] = {
 		"msm/modem/root_pd",
-		"msm/modem/wlan_pd",
-		"tms/servreg",
-		"wlan/fw",
-		"kernel/elf_loader"
+		"msm/modem/wlan_pd"
 	};
 
 	for (unsigned i = 0; i < sizeof(target_names)/sizeof(target_names[0]); i++) {
