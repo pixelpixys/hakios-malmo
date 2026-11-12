@@ -4801,6 +4801,25 @@ servreg_load(void)
 	}
 }
 
+/* One domain of the locator's answer: the name, the instance, and the service data (the order of Linux's
+ * servreg_location_entry_ei: name, instance, service_data_valid, service_data). */
+static void
+servreg_entry(uint8_t *answer, unsigned *at, const char *domain, uint32_t instance)
+{
+	answer[(*at)++] = (uint8_t)strlen(domain);
+	memcpy(answer + *at, domain, strlen(domain));
+	*at += (unsigned)strlen(domain);
+	for (unsigned b = 0; b < 4; b++) {
+		answer[(*at)++] = (uint8_t)(instance >> (8 * b));
+	}
+	answer[(*at)++] = 0;                    /* service_data_valid */
+	answer[(*at)++] = 0;                    /* service_data, 4 bytes */
+	answer[(*at)++] = 0;
+	answer[(*at)++] = 0;
+	answer[(*at)++] = 0;
+	printf("mpss: servreg:   -> %s, instance %u\n", domain, instance);
+}
+
 /* A question to the locator, answered. From the link's thread. */
 static void
 servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
@@ -4855,35 +4874,13 @@ servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void
 			at += 2;                        /* the length, filled in below */
 			answer[at++] = (uint8_t)found;  /* array length: 1 byte */
 			if (strcmp(wanted, "tms/pddump_disabled") == 0) {
-				const char *dom = "msm/modem/root_pd";
-				answer[at++] = (uint8_t)strlen(dom);
-				memcpy(answer + at, dom, strlen(dom));
-				at += (unsigned)strlen(dom);
-				uint32_t inst = 180;
-				answer[at++] = 0;       /* service_data_valid = 0 (1 byte) */
-				answer[at++] = 0;       /* service_data = 0 (4 bytes) */
-				answer[at++] = 0;
-				answer[at++] = 0;
-				answer[at++] = 0;
-				for (unsigned b = 0; b < 4; b++) {
-					answer[at++] = (uint8_t)(inst >> (8 * b));
-				}
+				servreg_entry(answer, &at, "msm/modem/root_pd", 180);
 			} else {
 				for (unsigned i = 0; i < servreg_maps && at + 64 < sizeof(answer); i++) {
 					if (strcmp(servreg_map[i].service, wanted) != 0) {
 						continue;
 					}
-					answer[at++] = (uint8_t)strlen(servreg_map[i].domain);
-					memcpy(answer + at, servreg_map[i].domain, strlen(servreg_map[i].domain));
-					at += (unsigned)strlen(servreg_map[i].domain);
-					answer[at++] = 0;       /* service_data_valid = 0 (1 byte) */
-					answer[at++] = 0;       /* service_data = 0 (4 bytes) */
-					answer[at++] = 0;
-					answer[at++] = 0;
-					answer[at++] = 0;
-					for (unsigned b = 0; b < 4; b++) {
-						answer[at++] = (uint8_t)(servreg_map[i].instance >> (8 * b));
-					}
+					servreg_entry(answer, &at, servreg_map[i].domain, servreg_map[i].instance);
 				}
 			}
 			answer[list + 1] = (uint8_t)(at - list - 3);
