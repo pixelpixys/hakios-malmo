@@ -5460,6 +5460,9 @@ static uint32_t wlfw_modem_node, wlfw_modem_port;
 
 static struct hakios_qrtr_port *pdr_client_port;
 static uint32_t pdr_modem_node, pdr_modem_port;
+static uint32_t wlan_pd_state = 0x7fffffffu;    /* what its listener said: uninit until the modem spawns it */
+static bool wlan_pd_known;
+static unsigned pdr_restarts;
 
 static void
 pdr_client_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
@@ -5478,10 +5481,28 @@ pdr_client_receive(__unused void *context, uint32_t node, uint32_t port, const v
 		printf("\n");
 	}
 
-	/*
-	 * If Root PD sends SERVREG_STATE_UPDATED_IND (0x0022, QMI_INDICATION = 4),
-	 * we must send SERVREG_SET_ACK_REQ (0x0023, QMI_REQUEST = 0) with the matching transaction_id!
-	 */
+	/* The answer to a registration says the service's state: 0x1fffffff up, 0x7fffffff uninit (servreg's values). */
+	if (type == QMI_RESPONSE && msg_id == 0x0020 && length >= 7) {
+		uint16_t txn = (uint16_t)(m[1] | m[2] << 8), size = 0;
+		const uint8_t *state = qmi_tlv(m, length, 0x10, &size);
+		uint32_t value = state != NULL && size >= 4 ? le32(state) : 0;
+
+		printf("mpss: pdr: registration %u: state %#x\n", txn, value);
+		if (txn == 11) {                /* "msm/modem/wlan_pd", the second of pdr_register_listeners */
+			wlan_pd_state = value;
+			wlan_pd_known = true;
+		}
+	}
+
+	/* The answer to a restart: the result TLV, whose error says why the modem would not (0x39: not supported). */
+	if (type == QMI_RESPONSE && msg_id == 0x0024 && length >= 7) {
+		uint16_t size = 0;
+		const uint8_t *result = qmi_tlv(m, length, 0x02, &size);
+
+		tell("mpss: pdr: the modem's answer to the restart: result %u, error %#x\n", result != NULL && size >= 2 ? result[0] : 0,
+		    result != NULL && size >= 4 ? (unsigned)(result[2] | result[3] << 8) : 0);
+	}
+
 	if (type == 4 && msg_id == 0x0022 && length >= 7) {
 		uint16_t t_id = 0;
 		char path_buf[64] = "";
@@ -5595,6 +5616,42 @@ pdr_note_rfs_ready(void)
 	}
 }
 
+/*
+ * The modem's PD monitor spawns a user PD when the notifier is asked to restart it: Linux's icnss2 does this to bring
+ * WLAN up (service-notifier.c, "Proceeding with PDR" in the modem). Asked a few times, since a spawn frees memory first.
+ */
+static void
+pdr_restart_wlan_pd(void)
+{
+	static const char name[] = "msm/modem/wlan_pd";
+	uint8_t req[32];
+	uint16_t len = 3 + sizeof(name) - 1;
+
+	if (!wlan_pd_known || wlan_pd_state == 0x1fffffffu || pdr_modem_port == 0 || pdr_restarts >= 4) {
+		static bool said;
+
+		if (!said) {            /* once: a silent loop is what made the last run's two attempts look like a hang */
+			said = true;
+			tell("mpss: pdr: no restart yet (known %d, state %#x, port %u, sent %u)\n", wlan_pd_known, wlan_pd_state,
+			    pdr_modem_port, pdr_restarts);
+		}
+		return;
+	}
+	bzero(req, sizeof(req));
+	req[0] = QMI_REQUEST;
+	req[1] = (uint8_t)(0x40 + pdr_restarts);        /* a transaction of our own: the answers are told apart by it */
+	req[3] = 0x24;                                  /* SERVREG_RESTART_PD_REQ */
+	req[5] = (uint8_t)len;
+	req[6] = (uint8_t)(len >> 8);
+	req[7] = 0x01;                                  /* service_name: a top-level QMI string, its bytes alone (qmi_encdec.c) */
+	req[8] = (uint8_t)(sizeof(name) - 1);
+	req[9] = 0;
+	memcpy(&req[10], name, sizeof(name) - 1);
+	tell("mpss: pdr: the wlan PD is not up (%#x): asking the modem to restart it (%u)\n", wlan_pd_state, pdr_restarts + 1);
+	qrtr_send(pdr_client_port, pdr_modem_node, pdr_modem_port, req, 7 + len);
+	pdr_restarts++;
+}
+
 static void
 pdr_client_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, uint32_t instance, uint32_t node,
     uint32_t port)
@@ -5613,6 +5670,7 @@ pdr_client_server(__unused void *context, bool arrived, uint32_t service, __unus
 	} else {
 		pdr_modem_node = pdr_modem_port = 0;
 		pdr_register_wanted = pdr_registered = false;
+		tell("mpss: pdr: SERVREG_NOTIFIER service 0x42 LEFT: no more restarts until it returns\n");
 	}
 }
 
@@ -5669,6 +5727,9 @@ step_qrtr(void)
 	}
 	for (unsigned ms = 0; ms < listen_seconds * 1000; ms++) {
 		sleep_ms(1);
+		if (ms != 0 && ms % 2000 == 0) {
+			pdr_restart_wlan_pd();
+		}
 	}
 	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 		services += qrtr_servers[i].there;

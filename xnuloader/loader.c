@@ -3266,7 +3266,22 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_identity(&w, identity_root, sizeof(identity_root) / sizeof(identity_root[0]), identity_root_data);
 	dt_prop_str(&w, "platform-name", "t8015");
 	/* what iBoot takes from the factory configuration of a real phone; fixed size fields */
-	dt_prop_padded(&w, "serial-number", "RDW00POCOX5P", 32);
+	/* serial_number=XXXX in the boot-args replaces the serial (Darwin's IOPlatformSerialNumber, and part of its UDID) */
+	static char serial_number[32] = "RDW00POCOX5P";
+	for (const char *c = pi.cmdline; *c; c++) {
+		if (starts_with(c, "serial_number=") && (c == pi.cmdline || c[-1] == ' ')) {
+			unsigned i = 0;
+
+			for (c += sizeof("serial_number=") - 1; *c != 0 && *c != ' ' && i < sizeof(serial_number) - 1; c++) {
+				serial_number[i++] = *c;
+			}
+			if (i == 0) {
+				memcpy(serial_number, "RDW00POCOX5P", sizeof("RDW00POCOX5P"));
+			}
+			break;
+		}
+	}
+	dt_prop_padded(&w, "serial-number", serial_number, 32);
 	dt_prop_padded(&w, "mlb-serial-number", "RDW00POCOX5PMLB00", 32);
 	dt_prop_padded(&w, "model-number", "MQAC2", 32);
 	dt_prop_padded(&w, "region-info", "LL/A", 32);

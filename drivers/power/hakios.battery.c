@@ -87,6 +87,28 @@ battery_snapshot(struct loader_battery *out)
 	return false;
 }
 
+extern void HakiosBatteryReport(const void *state, unsigned size);     /* drivers/power/hakios.battery.cpp */
+
+/* Darwin sees the same reading through the power source, or it shows no battery at all (only the DSP path used to tell it). */
+static void
+battery_tell_darwin(const struct loader_battery *sample)
+{
+	struct hakios_battery_state state;
+	bool external = (sample->flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
+
+	bzero(&state, sizeof(state));
+	state.size = sizeof(state);
+	state.percent_hundredths = sample->soc_percent * 100;
+	state.voltage_uv = (sample->flags & LOADER_BATTERY_VOLTAGE_VALID) ? sample->voltage_mv * 1000 : 0;
+	state.current_ua = sample->current_ma * 1000;
+	state.temperature_hundredths = sample->temperature_c * 100;
+	state.present = (sample->flags & LOADER_BATTERY_PRESENT) != 0;
+	state.external = external;
+	state.status = (sample->flags & LOADER_BATTERY_CHARGING) ? 1 :          /* charging */
+	    external ? (sample->soc_percent >= 100 ? 4 : 3) : 2;                /* full / not charging / discharging */
+	HakiosBatteryReport(&state, sizeof(state));
+}
+
 static void
 battery_poll(void)
 {
@@ -108,6 +130,7 @@ battery_poll(void)
 	battery_soc_estimated = (sample.flags & LOADER_BATTERY_SOC_ESTIMATED) != 0;
 	battery_charger_action = (int)sample.charger_action;
 	battery_updates++;
+	battery_tell_darwin(&sample);
 }
 
 /*
@@ -125,8 +148,6 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_cycles, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_cycles, 0, "the battery's charge cycles (0 if unknown)");
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_source_dsp, 0, "1 when the values come from the audio DSP's battery manager");
-
-extern void HakiosBatteryReport(const void *state, unsigned size);     /* drivers/power/hakios.battery.cpp */
 
 void
 hakios_battery_report(const struct hakios_battery_state *b)
