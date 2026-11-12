@@ -1800,22 +1800,18 @@ step_our_item(void)
 /*
  * The IPA (the SoC's packet engine, the modem's path for data) has a small firmware of its own,
  * which Android's IPA driver has TrustZone load before the modem starts (dt: qcom,ipa_fws, image
- * 15, yupik_ipa_fws.mdt + .b*, into reserved-memory ipa_fw@8b700000 and ipa_gsi@8b710000). A modem
- * that goes online without it dies in its LTE downlink task (23 October: "EX:kernel:0x0:enl2_dl",
- * a null pointer, twice of two). Nothing else of the IPA is done here yet: no clock, no tables.
- * modem_ipa_fw=0 leaves it out.
+ * 15, ipa_fws.mdt + .b*, into reserved-memory pil_ipa_fw_mem). A modem that goes online without it
+ * dies in its LTE downlink task (23 October: "EX:kernel:0x0:enl2_dl", a null pointer, twice of two).
+ * Nothing else of the IPA is done here yet: no clock, no tables. modem_ipa_fw=0 leaves it out.
  */
 #define PAS_IPA_DEFAULT         15              /* dt: qcom,pas-id of qcom,ipa_fws */
 static uint32_t pas_ipa = PAS_IPA_DEFAULT;
 /*
- * Where the image goes. Android's pil (its dmesg: "yupik_ipa_fws: loading from 0x8b710000 to 0x8b717000")
- * puts it at the ipa_gsi reservation (0x8b710000, 0xa000; gpu_micro_code follows at 0x8b71a000), not at
- * ipa_fw@8b700000 as the reservations' names suggest; loaded at 0x8b700000 (runs up to 23 of 24 October)
- * TrustZone started it and GSI came up, but the microcontroller never wrote "booted" and the modem,
- * which starts it, never answered INIT_DRIVER. Should the microcontroller fetch its code from DDR at
- * the address Android uses, this is why. modem_ipa_fw_at=ADDRESS chooses (0x8b700000 allows 0x1a000).
+ * Where the image goes: this phone's reservation (dt: pil_ipa_fw_mem, from the phone's own live.dts;
+ * mainline sm6375 puts it at 0x8aa00000, the first phone's yupik at 0x8b700000/0x8b710000).
+ * modem_ipa_fw_at=ADDRESS chooses.
  */
-static uint32_t ipa_fw_memory = 0x8b710000u, ipa_fw_size = 0xa000u;
+static uint32_t ipa_fw_memory = 0x8ac00000u, ipa_fw_size = 0x10000u;
 
 
 /*
@@ -2208,25 +2204,27 @@ ipa_firmware_load(void)
 	uint32_t count, loaded = 0, highest = 0, size;
 	int32_t result;
 	bool ok = false;
+	char fw[80];
 
 	PE_parse_boot_argn("modem_ipa_fw_at", &ipa_fw_memory, sizeof(ipa_fw_memory));
-	ipa_fw_size = ipa_fw_memory == 0x8b700000u ? 0x1a000u : 0xa000u;
+	ipa_fw_size = ipa_fw_memory == 0x8b700000u ? 0x1a000u : 0x10000u;
 	announce("turn the IPA's clock on (RPMh), load the IPA's firmware (image 15) into its memory and have TrustZone start it, as "
 	    "Android does before the modem");
 	printf("mpss: %u: the IPA's image goes at %#x (%#x bytes allowed)\n", step, ipa_fw_memory, ipa_fw_size);
 	if (!ipa_clock(true)) {
-		printf("mpss: %u: the IPA's clock is not on: its firmware is not loaded (a start without the clock ends the kernel)\n", step);
-		return false;
+		/* This phone's device tree has no command database, so the RPMh vote cannot be made; the boot
+		 * firmware leaves the clock on (the modem's IPA service answers there), so loading is tried. */
+		printf("mpss: %u: the IPA's clock cannot be asked for (no command database): going on without the vote\n", step);
 	}
 	if (!option("modem_ipa_smmu_off")) {
 		ipa_space_on();
 	}
 	{
-		/* the IPA's firmware file is SoC-specific (dt: qcom,firmware-name of qcom,ipa_fws; "yupik_ipa_fws"
-		 * on the first phone, something else on another SoC); soc_ipa_fw= overrides the name */
-		char fw[80], path[96];
+		/* the IPA's firmware file is SoC-specific (dt: qcom,firmware-name of qcom,ipa_fws; "ipa_fws"
+		 * here, "yupik_ipa_fws" on the first phone); soc_ipa_fw= overrides the name */
+		char path[96];
 
-		strlcpy(fw, "yupik_ipa_fws", sizeof(fw));
+		strlcpy(fw, "ipa_fws", sizeof(fw));
 		PE_parse_boot_argn("soc_ipa_fw", fw, sizeof(fw));
 		snprintf(path, sizeof(path), "image/%s.mdt", fw);
 		header = root_file(path, &header_size);
@@ -2237,7 +2235,7 @@ ipa_firmware_load(void)
 	}
 	count = header_size >= 52 ? header[44] | header[45] << 8 : 0;
 	if (memcmp(header, "\177ELF\1", 5) != 0 || count == 0 || count > 8 || 52 + 32 * count > header_size) {
-		printf("mpss: %u: yupik_ipa_fws.mdt is not such a header (%u segments)\n", step, count);
+		printf("mpss: %u: ipa_fws.mdt is not such a header (%u segments)\n", step, count);
 		goto out;
 	}
 	/* (the image is relocatable, bit 27 of the flags: its addresses count from the lowest, which goes at the region's start) */
@@ -2272,7 +2270,7 @@ ipa_firmware_load(void)
 			goto out;
 		}
 		if (segments[i].file_size != 0) {
-			snprintf(name, sizeof(name), "image/yupik_ipa_fws.b%02u", i);
+			snprintf(name, sizeof(name), "image/%s.b%02u", fw, i);
 			segment_file[i] = root_file(name, &segment_size[i]);
 			if (segment_file[i] == NULL || segment_size[i] != segments[i].file_size) {
 				printf("mpss: %u: fw/%s: %s\n", step, name, segment_file[i] == NULL ? "not there" : "not the size the header says");
@@ -2328,13 +2326,13 @@ ipa_firmware_load(void)
 	tell("mpss: %u: THE IPA'S FIRMWARE IS LOADED AND STARTED (image 15, %u segments)\n", step, loaded);
 	/*
 	 * Whether TrustZone has copied the segments where the image says they run (their virtual addresses:
-	 * GSI's instruction memory at 0x1e1f000 and the microcontroller's at 0x1e81000, both in the IPA's
+	 * GSI's instruction memory at 0x581f000 and the microcontroller's at 0x5881000, both in the IPA's
 	 * register space) is checked by reading them back: the GSI's status bit alone does not prove its
 	 * firmware runs (24 October: the modem's IPA_CTL task never answers, as if GSI answered nothing).
 	 */
 	for (uint32_t i = 0; i < count; i++) {
 		if (segments[i].type == 1 && !MDT_HASH(segments[i].flags) && segment_file[i] != NULL && segments[i].file_size >= 16 &&
-		    segments[i].vaddr >= 0x01e00000u && segments[i].vaddr < 0x01f00000u) {
+		    segments[i].vaddr >= 0x05800000u && segments[i].vaddr < 0x05900000u) {
 			struct block iram = { "ipa iram", segments[i].vaddr & ~0xfffu, 0x8000 };
 			uint32_t n = segments[i].file_size < 256 ? segments[i].file_size : 256, same = 0, first[4];
 
@@ -2353,7 +2351,7 @@ ipa_firmware_load(void)
 			    first[0], first[1], first[2], first[3]);
 		}
 	}
-	{
+	if (!option("modem_ipa_quiet")) {       /* (these are the first phone's addresses; this SoC's GSI is elsewhere: not read) */
 		struct block gsi = { "gsi", 0x01e04000, 0xc000 };       /* GSI_CFG at 0, MCS_CFG at 0xb000 (the panic of cycle 26: 0x1000 mapped) */
 
 		need(&gsi);
