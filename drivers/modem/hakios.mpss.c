@@ -1819,10 +1819,13 @@ static uint32_t ipa_fw_memory = 0x8ac00000u, ipa_fw_size = 0x10000u;
  * memory is), the microcontroller's area at the start of that memory (Linux's ipa_uc.c: command,
  * response -- 1 once it has booted --, event, error, hardware state, interface version) and GSI's
  * status (bit 0: the GSI firmware is enabled) and error log, for our execution environment.
+ * Blair's addresses, from its device tree (qcom,ipa@0x5800000: ipa-base 0x5800000 +0x84000, gsi-base
+ * 0x5804000 +0x23000; the shared memory is at the IPA's base +0x10000, GSI's EE0 at its +0x12000).
+ * The first phone (redwood): 0x1e40000, 0x1e50000, 0x1e16000; soc_ipa_regs= and so on choose.
  */
-static struct block ipa_regs = { "ipa", 0x01e40000, 0x1000 };
-static struct block ipa_sram = { "ipa-shared", 0x01e50000, 0x4000 };  /* the local memory: 0x3000 bytes (SHARED_MEM_SIZE) */
-static struct block gsi_ee0 = { "gsi-ee0", 0x01e16000, 0x1000 };
+static struct block ipa_regs = { "ipa", 0x05800000, 0x1000 };
+static struct block ipa_sram = { "ipa-shared", 0x05810000, 0x4000 };  /* the local memory: 0x3000 bytes (SHARED_MEM_SIZE) */
+static struct block gsi_ee0 = { "gsi-ee0", 0x05816000, 0x1000 };
 
 static void
 ipa_status(const char *when)
@@ -1871,6 +1874,27 @@ ipa_memory_init(void)
 
 	need(&ipa_sram);
 	need(&ipa_regs);
+	/* The register that says where that memory is (SHARED_MEM_SIZE, 0x54: size [15:0] and offset [31:16]
+	 * in 8-byte units) reads 0 after this phone's boot loader -- the Android driver reads it and gives up
+	 * if the size is too small, so something must have written it there. But writing it here hangs this
+	 * phone (the read works, the write never returns), so it is only tried when asked. */
+	if ((rd(ipa_regs.base + 0x54) & 0xffff) == 0) {
+		if (option("modem_ipa_shared_mem_write")) {
+			wr(ipa_regs.base + 0x54, size / 8);
+			printf("mpss: ipa: its memory register was 0: told it %u bytes at offset 0\n", size);
+		}
+		ipa_mem_offset = 0;
+	}
+	if (option("modem_ipa_probe")) {        /* reads only: which of these is memory (zeroes) and which is empty space (all ones) */
+		static const uint32_t at[] = { 0x05810000u, 0x05850000u, 0x05860000u, 0x05870000u, 0x05880000u, 0x05890000u };
+
+		for (unsigned i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
+			struct block b = { "ipa probe", at[i], 0x1000 };
+
+			need(&b);
+			printf("mpss: ipa: at %#x: %#x %#x %#x %#x\n", at[i], rd(b.base + 0), rd(b.base + 4), rd(b.base + 0x288), rd(b.base + 0x2ffc));
+		}
+	}
 	/* from 0x288: the microcontroller's own area (its shared words at 0, its info at 0x80) is left alone, as Linux leaves it */
 	for (uint32_t at = 0x288; at < size; at += 4) {
 		wr(ipa_sram.base + ipa_mem_offset + at, 0);
@@ -2351,8 +2375,8 @@ ipa_firmware_load(void)
 			    first[0], first[1], first[2], first[3]);
 		}
 	}
-	if (!option("modem_ipa_quiet")) {       /* (these are the first phone's addresses; this SoC's GSI is elsewhere: not read) */
-		struct block gsi = { "gsi", 0x01e04000, 0xc000 };       /* GSI_CFG at 0, MCS_CFG at 0xb000 (the panic of cycle 26: 0x1000 mapped) */
+	if (!option("modem_ipa_quiet")) {
+		struct block gsi = { "gsi", 0x05804000, 0xc000 };       /* GSI_CFG at 0, MCS_CFG at 0xb000 (redwood's offsets, unverified here) */
 
 		need(&gsi);
 		tell("mpss: %u: GSI_CFG %#x (bit 0 GSI enable, 1 MCS enable, 2 double MCS clock, 3 uC is MCS, 4 power collapse, 5 bypass matrix off, "
@@ -2376,10 +2400,14 @@ ipa_firmware_load(void)
 		ipa_status("after its firmware's start");
 	}
 	if (!option("modem_ipa_raw")) {
-		ipa_memory_init();
-		ipa_hardware_init();
+		if (!option("modem_ipa_nomem")) {
+			ipa_memory_init();
+		}
+		if (!option("modem_ipa_nohw")) {
+			ipa_hardware_init();
+		}
 		/* this processor's own channels and endpoints, and the IPA's tables, before the modem (hakios.ipa.c); then en1 on them */
-		if (hakios_ipa_data_setup()) {
+		if (!option("modem_ipa_tables") && hakios_ipa_data_setup()) {
 			hakios_cell_attach();
 		}
 	}
