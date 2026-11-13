@@ -171,8 +171,12 @@ fetch_log() { # fetch_log <file>
 # whatever its arguments, gave no answer within 5 s; every first run of a session lived). Restart the phone into its own
 # bootloader between runs ("xl run" warns when this session has run a kernel already).
 run() { # run <oem command> <label>
+	# A second kernel in the same session dies at once (see above). Warn was not enough: the run then hung and
+	# the phone reset, which reads as "it rebooted two seconds after ./xl run". Put a fresh loader there instead.
 	if [ "$(state)" = loader ] && [ -f $PHONE.ran ]; then
-		echo "xl: warning: a kernel has already run in this session of the loader, and a second one has died at once every time it was tried"
+		echo "xl: a kernel has already run in this session of the loader; restarting it for a fresh one"
+		fb reboot >/dev/null
+		wait_for android 150 || { echo "xl: the phone did not come back (state: $(state)); hold power for 15 s"; return 1; }
 	fi
 	enter || return 1
 	exec 8> $PHONE.run
@@ -251,6 +255,7 @@ run() { # run <oem command> <label>
 		result=$(FB_TIMEOUT=$(( ${XL_SECS:-8} + 100 )) fb getvar result | grep '^result:')
 	fi
 	if [ -z "$result" ]; then
+		touch $PHONE.ran            # (a kernel ran here even though it never answered: see run() and fresh_session)
 		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"
 		[ -f "$log.live" ] && echo "xl: what the kernel said before it stopped answering: $log.live"
 		recover_phone
