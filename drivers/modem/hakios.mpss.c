@@ -2299,6 +2299,292 @@ ipa_space_off(void)
 	printf("mpss: ipa: the IPA's streams and context %u of the SMMU are put back as they were found\n", ipa_space.context);
 }
 
+/*
+ * Blair (SM6375): RPM-SMD over glink-rpm in rpm_msg_ram@0x045f0000 (0x7000 bytes, IPCC client 0 signal 0).
+ * Used to enable IPA core_clk (rpmcc-holi RPM_SMD_IPA_CLK: resource "ipa", id 0, key "KHz", 100000).
+ * All accesses to rpm_msg_ram are 32-bit aligned.
+ */
+#define RPM_MSG_RAM_PHYS        0x045f0000u
+#define RPM_MSG_RAM_SIZE        0x00007000u
+#define RPM_TOC_SIZE            256u
+#define RPM_TOC_MAGIC           0x67727430u     /* "grt0" */
+#define RPM_TX_FIFO_ID          0x61703272u     /* "ap2r" */
+#define RPM_RX_FIFO_ID          0x72326170u     /* "r2ap" */
+#define RPM_GLINK_INTENTLESS    2u
+
+struct rpm_glink_pipe {
+	uintptr_t tail, head, fifo;
+	uint32_t size;
+};
+
+static uint32_t
+rpm_pipe_avail(const struct rpm_glink_pipe *p)
+{
+	uint32_t h = rd(p->head), t = rd(p->tail);
+
+	return h >= t ? h - t : p->size - t + h;
+}
+
+static uint32_t
+rpm_pipe_room(const struct rpm_glink_pipe *p)
+{
+	return p->size - rpm_pipe_avail(p) - 4;
+}
+
+static void
+rpm_pipe_read(const struct rpm_glink_pipe *p, void *dst, uint32_t bytes, bool advance)
+{
+	uint32_t t = rd(p->tail);
+	uint32_t words = (bytes + 3) / 4;
+	uint32_t *out = dst;
+
+	for (uint32_t i = 0; i < words; i++) {
+		uint32_t w = rd(p->fifo + ((t + i * 4) % p->size));
+
+		if (i * 4 + 4 <= bytes) {
+			out[i] = w;
+		} else {
+			memcpy((uint8_t *)dst + i * 4, &w, bytes - i * 4);
+		}
+	}
+	if (advance) {
+		uint32_t adv = (bytes + 7) & ~7u;
+
+		settle();
+		wr(p->tail, (t + adv) % p->size);
+		settle();
+	}
+}
+
+static bool
+rpm_pipe_write(const struct rpm_glink_pipe *p, const void *h1, uint32_t l1, const void *h2, uint32_t l2)
+{
+	uint32_t total = l1 + l2;
+	uint32_t padded = (total + 7) & ~7u;
+	uint32_t head = rd(p->head);
+	uint8_t buf[128];
+
+	if (padded > sizeof(buf) || rpm_pipe_room(p) < padded) {
+		return false;
+	}
+	bzero(buf, padded);
+	if (l1 > 0) {
+		memcpy(buf, h1, l1);
+	}
+	if (l2 > 0) {
+		memcpy(buf + l1, h2, l2);
+	}
+	for (uint32_t i = 0; i < padded / 4; i++) {
+		uint32_t w;
+
+		memcpy(&w, buf + i * 4, 4);
+		wr(p->fifo + ((head + i * 4) % p->size), w);
+	}
+	settle();
+	wr(p->head, (head + padded) % p->size);
+	settle();
+	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
+	return true;
+}
+
+static bool
+blair_rpm_enable_ipa_clk(void)
+{
+	static struct block rpm_ram = { "rpm_msg_ram", RPM_MSG_RAM_PHYS, RPM_MSG_RAM_SIZE };
+	struct rpm_glink_pipe tx = { 0 }, rx = { 0 };
+	uintptr_t toc_at;
+	uint32_t magic, count, features = RPM_GLINK_INTENTLESS;
+	bool ver_ack = false, peer_ver = false, open_ack = false, peer_open = false, got_reply = false;
+	uint32_t tx_intent_id = 0, peer_rcid = 0;
+
+	need(&rpm_ram);
+	toc_at = rpm_ram.base + RPM_MSG_RAM_SIZE - RPM_TOC_SIZE;
+	magic = rd(toc_at);
+	count = rd(toc_at + 4);
+	if (magic != RPM_TOC_MAGIC || count > 16) {
+		printf("mpss: rpm: TOC at %#x has magic %#x count %u (expected %#x); base=%#x\n",
+		    RPM_MSG_RAM_PHYS + RPM_MSG_RAM_SIZE - RPM_TOC_SIZE, magic, count, RPM_TOC_MAGIC, rd(rpm_ram.base));
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t id = rd(toc_at + 8 + i * 12);
+		uint32_t off = rd(toc_at + 8 + i * 12 + 4);
+		uint32_t sz = rd(toc_at + 8 + i * 12 + 8);
+
+		if (off + sz > RPM_MSG_RAM_SIZE || sz <= 8) {
+			continue;
+		}
+		if (id == RPM_TX_FIFO_ID) {
+			tx.tail = rpm_ram.base + off;
+			tx.head = rpm_ram.base + off + 4;
+			tx.fifo = rpm_ram.base + off + 8;
+			tx.size = sz - 8;
+		} else if (id == RPM_RX_FIFO_ID) {
+			rx.tail = rpm_ram.base + off;
+			rx.head = rpm_ram.base + off + 4;
+			rx.fifo = rpm_ram.base + off + 8;
+			rx.size = sz - 8;
+		}
+	}
+	if (tx.fifo == 0 || rx.fifo == 0) {
+		printf("mpss: rpm: TOC missing ap2r/r2ap pipes (count %u)\n", count);
+		return false;
+	}
+	printf("mpss: rpm: TOC ok (%u entries): tx %u B (h=%u t=%u), rx %u B (h=%u t=%u)\n",
+	    count, tx.size, rd(tx.head), rd(tx.tail), rx.size, rd(rx.head), rd(rx.tail));
+
+	{
+		uint16_t ver[4] = { 0, 1, 0, 0 }; /* GLINK_VERSION = 0, version 1, features = 2 */
+		uint32_t feat = features;
+
+		memcpy(&ver[2], &feat, 4);
+		rpm_pipe_write(&tx, ver, 8, NULL, 0);
+	}
+	for (unsigned ms = 0; ms < 1500 && !(ver_ack && peer_ver && open_ack && peer_open); ms++) {
+		while (rpm_pipe_avail(&rx) >= 8) {
+			uint16_t hdr[4];
+			uint16_t cmd, p1;
+			uint32_t p2, skip = 8;
+
+			rpm_pipe_read(&rx, hdr, 8, false);
+			cmd = hdr[0];
+			p1 = hdr[1];
+			memcpy(&p2, &hdr[2], 4);
+			if (cmd == 2 && p2 <= 64) { /* OPEN: name follows */
+				skip = 8 + p2;
+			} else if (cmd == 5) { /* INTENT: 8 bytes follow */
+				skip = 16;
+			} else if (cmd == 9) { /* DATA */
+				uint32_t dhdr[4];
+
+				if (rpm_pipe_avail(&rx) < 16) {
+					break;
+				}
+				rpm_pipe_read(&rx, dhdr, 16, false);
+				skip = 16 + dhdr[2];
+			}
+			if (rpm_pipe_avail(&rx) < ((skip + 7) & ~7u)) {
+				break;
+			}
+			if (cmd == 0) { /* VERSION */
+				uint16_t ack[4] = { 1, 1, 0, 0 };
+				uint32_t f = p2 & features;
+
+				features = f;
+				memcpy(&ack[2], &f, 4);
+				rpm_pipe_read(&rx, hdr, 8, true);
+				rpm_pipe_write(&tx, ack, 8, NULL, 0);
+				peer_ver = true;
+			} else if (cmd == 1) { /* VERSION_ACK */
+				rpm_pipe_read(&rx, hdr, 8, true);
+				ver_ack = true;
+				{
+					uint16_t op[4] = { 2, 1, 13, 0 }; /* OPEN lcid=1, "rpm_requests\0" */
+					rpm_pipe_write(&tx, op, 8, "rpm_requests", 13);
+				}
+			} else if (cmd == 2) { /* OPEN from RPM */
+				uint8_t buf[72];
+
+				rpm_pipe_read(&rx, buf, skip, true);
+				peer_rcid = p1;
+				peer_open = true;
+				{
+					uint16_t oack[4] = { 4, p1, 0, 0 };
+					rpm_pipe_write(&tx, oack, 8, NULL, 0);
+				}
+			} else if (cmd == 4) { /* OPEN_ACK */
+				rpm_pipe_read(&rx, hdr, 8, true);
+				open_ack = true;
+			} else if (cmd == 5) { /* INTENT */
+				uint32_t ihdr[4];
+
+				rpm_pipe_read(&rx, ihdr, 16, true);
+				tx_intent_id = ihdr[3];
+			} else {
+				uint8_t trash[128];
+
+				rpm_pipe_read(&rx, trash, skip < sizeof(trash) ? skip : sizeof(trash), true);
+			}
+		}
+		sleep_ms(1);
+	}
+	if (!ver_ack || !open_ack) {
+		printf("mpss: rpm: GLINK handshake incomplete (ver_ack=%d peer_ver=%d open_ack=%d peer_open=%d)\n",
+		    ver_ack, peer_ver, open_ack, peer_open);
+		return false;
+	}
+	{
+		/* struct rpm_request_header (8B) + struct rpm_message_header (20B) + TLV "KHz\0" (12B) = 40B */
+		struct {
+			uint16_t cmd, param1;
+			uint32_t param2;
+			uint32_t chunk, left;
+			uint32_t service_type, request_len;
+			uint32_t msg_id, set, resource_type, resource_id, data_len;
+			uint32_t key, val_len, val;
+		} req = {
+			.cmd = 9, .param1 = 1, .param2 = tx_intent_id,
+			.chunk = 40, .left = 0,
+			.service_type = 0x00716572u,    /* "req\0" */
+			.request_len = 32,
+			.msg_id = 1, .set = 0,
+			.resource_type = 0x00617069u,   /* "ipa\0" */
+			.resource_id = 0, .data_len = 12,
+			.key = 0x007a484bu,             /* "KHz\0" */
+			.val_len = 4, .val = 100000,
+		};
+
+		if (!rpm_pipe_write(&tx, &req, sizeof(req), NULL, 0)) {
+			printf("mpss: rpm: failed to write IPA_CLK request\n");
+			return false;
+		}
+	}
+	for (unsigned ms = 0; ms < 500 && !got_reply; ms++) {
+		while (rpm_pipe_avail(&rx) >= 8) {
+			uint16_t hdr[4];
+			uint32_t p2, skip = 8;
+
+			rpm_pipe_read(&rx, hdr, 8, false);
+			memcpy(&p2, &hdr[2], 4);
+			if (hdr[0] == 9) {
+				uint32_t dhdr[4];
+
+				if (rpm_pipe_avail(&rx) < 16) {
+					break;
+				}
+				rpm_pipe_read(&rx, dhdr, 16, false);
+				skip = 16 + dhdr[2];
+				if (rpm_pipe_avail(&rx) < ((skip + 7) & ~7u)) {
+					break;
+				}
+				{
+					uint8_t msg[96];
+
+					rpm_pipe_read(&rx, msg, skip < sizeof(msg) ? skip : sizeof(msg), true);
+					got_reply = true;
+					printf("mpss: rpm: IPA_CLK (100 MHz) reply: %u bytes\n", dhdr[2]);
+					break;
+				}
+			} else if (hdr[0] == 5) {
+				skip = 16;
+			}
+			if (rpm_pipe_avail(&rx) < ((skip + 7) & ~7u)) {
+				break;
+			}
+			{
+				uint8_t trash[64];
+				rpm_pipe_read(&rx, trash, skip < sizeof(trash) ? skip : sizeof(trash), true);
+			}
+		}
+		sleep_ms(1);
+	}
+	if (!got_reply) {
+		printf("mpss: rpm: no reply to IPA_CLK request (tx h=%u t=%u, rx h=%u t=%u)\n",
+		    rd(tx.head), rd(tx.tail), rd(rx.head), rd(rx.tail));
+	}
+	return got_reply;
+}
+
 static bool
 ipa_firmware_load(void)
 {
@@ -2561,7 +2847,8 @@ step_start(void)
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	{
-		uint32_t ipa_fw = pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR ? 0 : 1;
+		uint32_t ipa_fw = pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR ?
+		    (blair_rpm_enable_ipa_clk() ? 1 : 0) : 1;
 
 		PE_parse_boot_argn("modem_ipa_fw", &ipa_fw, sizeof(ipa_fw));
 		ipa_loaded = ipa_fw != 0 && ipa_firmware_load();
