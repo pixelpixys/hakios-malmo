@@ -225,10 +225,18 @@ run() { # run <oem command> <label>
 		# XL_FOLLOW=N: fetch the log as it stands every N seconds as well, so that a phone that
 		# resets without a word leaves all it said up to then ($log.live)
 		local XL_FOLLOW=${XL_FOLLOW-10}      # (a run that hangs leaves $log.live: what the kernel said up to a few seconds before)
-		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s)
+		local deadline=$(( $(date +%s) + ${XL_SECS:-8} + 100 )) followed=$(date +%s) silent=0
 		while :; do
 			result=$(FB_TIMEOUT=15 fb getvar result | grep '^result:')
-			case "$result" in ""|"result: "|*running*) ;; *) break ;; esac
+			case "$result" in
+			""|"result: ")
+				# (a phone that has reset is not in this loader any more: waiting for it to answer again only
+				# spends the rest of XL_SECS + 100 doing nothing. Two silences and no loader: the run is over.)
+				silent=$(( silent + 1 ))
+				if [ "$silent" -ge 2 ] && [ "$(state)" != loader ]; then result=; break; fi ;;
+			*running*) silent=0 ;;
+			*) break ;;
+			esac
 			[ "$(date +%s)" -ge "$deadline" ] && { result=; break; }
 			if [ -n "$XL_FOLLOW" ] && [ $(( $(date +%s) - followed )) -ge "$XL_FOLLOW" ]; then
 				followed=$(date +%s)
@@ -373,7 +381,14 @@ stop) not_anothers_run stop && fb oem stop | grep -q OKAY && echo "xl: asked the
 memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
 hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;
 reboot) not_anothers_run reboot && fb reboot ;;
-reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
+reload)
+	# (a loader that has already run a kernel gives the next one no answer at all: the run must start in a
+	# loader this "reload" put there, so the old one must really be gone first)
+	if [ "$(state)" = loader ]; then
+		fb reboot >/dev/null
+		wait_for android 150 || { echo "xl: the phone did not come back from this loader (state: $(state))"; exit 1; }
+	fi
+	enter && echo "xl: loader is up" ;;
 state) state ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;
 esac

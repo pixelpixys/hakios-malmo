@@ -1563,11 +1563,14 @@ segment_put(volatile uint8_t *dsp_memory, unsigned s)
 	}
 }
 
-/* ... and read back: how many words of eight (or bytes, where it is not written by words) differ. */
+/* ... and read back: how many words of eight (or bytes, where it is not written by words) differ.
+ * Only the bytes that came from the file are read back: the zero-filled tails reach the very top of
+ * the reservation (the last segment ends exactly at 0x9b800000) and reading across that boundary hung
+ * the bus on 13 November -- the zeroes are written, just not read again. */
 static uint64_t
 segment_check(volatile uint8_t *dsp_memory, unsigned s)
 {
-	uint32_t at = image.segment[s].at, size = image.segment[s].memory_size, i = 0;
+	uint32_t at = image.segment[s].at, size = image.segment[s].file_size, i = 0;
 	uint64_t wrong = 0;
 
 	if ((at & 7) == 0) {
@@ -1601,17 +1604,35 @@ step_image(void)
 	}
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, mpss_memory);
 	began = now_us();
+	printf("mpss: %u: %#x mapped, writing %u segments\n", step, mpss_memory, image.segments);
 	for (unsigned s = 0; s < image.segments; s++) {
 		segment_put(dsp_memory, s);
 		written += image.segment[s].file_size;
 		cleared += image.segment[s].memory_size - image.segment[s].file_size;
 	}
 	settle();
-	for (unsigned s = 0; s < image.segments; s++) {
-		wrong += segment_check(dsp_memory, s);
+	{
+		uint64_t end = 0;
+
+		for (unsigned s = 0; s < image.segments; s++) {
+			uint64_t e = (uint64_t)image.segment[s].at + image.segment[s].memory_size;
+
+			end = e > end ? e : end;
+		}
+		printf("mpss: %u: the segments reach %#llx (the memory is %#x)\n", step, end, image.size);
 	}
-	printf("mpss: %u: %u segments, %llu bytes written and %llu cleared in %llu ms; read back, %llu words or bytes differ\n", step,
-	    image.segments, written, cleared, (now_us() - began) / 1000, wrong);
+	printf("mpss: %u: %u segments written (%llu bytes, %llu cleared), reading them back\n", step, image.segments, written, cleared);
+	if (!option("modem_image_nocheck")) {
+		for (unsigned s = 0; s < image.segments; s++) {
+			uint64_t began_check = now_us();
+
+			wrong += segment_check(dsp_memory, s);
+			printf("mpss: %u: segment %u of %u read back in %llu ms, %llu differ so far\n", step, s + 1, image.segments,
+			    (now_us() - began_check) / 1000, wrong);
+		}
+	}
+	printf("mpss: %u: %u segments, %llu bytes written and %llu cleared in %llu ms; read back, %llu words or bytes differ%s\n", step,
+	    image.segments, written, cleared, (now_us() - began) / 1000, wrong, option("modem_image_nocheck") ? " (the read-back was skipped)" : "");
 	settle();
 	ml_io_unmap((vm_offset_t)dsp_memory, image.size);
 	image_written = wrong == 0;
@@ -1823,9 +1844,53 @@ static uint32_t ipa_fw_memory = 0x8ac00000u, ipa_fw_size = 0x10000u;
  * 0x5804000 +0x23000; the shared memory is at the IPA's base +0x10000, GSI's EE0 at its +0x12000).
  * The first phone (redwood): 0x1e40000, 0x1e50000, 0x1e16000; soc_ipa_regs= and so on choose.
  */
-static struct block ipa_regs = { "ipa", 0x05800000, 0x1000 };
-static struct block ipa_sram = { "ipa-shared", 0x05810000, 0x4000 };  /* the local memory: 0x3000 bytes (SHARED_MEM_SIZE) */
+static struct block ipa_regs = { "ipa", 0x05840000, 0x1000 };
+static struct block ipa_sram = { "ipa-shared", 0x05850000, 0x4000 };  /* the local memory: 0x3000 bytes (SHARED_MEM_SIZE) */
 static struct block gsi_ee0 = { "gsi-ee0", 0x05816000, 0x1000 };
+
+/*
+ * Where the IPA's own registers are. The device tree's "ipa-base" region (0x5800000, 0x84000) holds
+ * more than them: downstream Qualcomm puts the registers 0x40000 into it (ipa_reg.h, IPA_REG_BASE_OFST
+ * for v2.5 on; the same +0x40000 the project's tools/soc-args.py passes as soc_ipa_base), which is
+ * 0x5840000 here -- while this driver had been reading and writing the region's start, where nothing
+ * answers (version 0) and where a write hung the phone. Both candidates are read (read-only) and the
+ * one that returns a version is kept; its first register is 0x32 on this phone's Android.
+ */
+static void
+ipa_regs_find(void)
+{
+	static const uint32_t tries[] = { 0x05840000u, 0x05800000u };
+	uint32_t forced = 0;
+
+	PE_parse_boot_argn("soc_ipa_regs", &forced, sizeof(forced));
+	if (forced != 0) {
+		ipa_regs.phys = forced;
+		ipa_regs.base = 0;
+		need(&ipa_regs);
+		printf("mpss: ipa: registers at %#x (soc_ipa_regs): version %#x\n", forced, rd(ipa_regs.base + 0x0));
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
+		struct block b = { "ipa probe", tries[i], 0x1000, 0 };
+		uint32_t version;
+
+		printf("mpss: ipa: reading %#x\n", tries[i]);
+		need(&b);
+		version = rd(b.base + 0x0);
+		tell("mpss: ipa: %#x: version %#x, hardware version %#x, shared memory %#x\n",
+		    tries[i], version, rd(b.base + 0x8), rd(b.base + 0x54));
+		if (version != 0 && version != 0xffffffffu) {
+			ipa_regs.phys = tries[i];
+			ipa_regs.base = b.base;
+			ipa_sram.phys = tries[i] + 0x10000;   /* the local memory follows the registers */
+			ipa_sram.base = 0;
+			printf("mpss: ipa: its registers are at %#x (version %#x), its memory at %#x\n", tries[i], version, ipa_sram.phys);
+			return;
+		}
+	}
+	printf("mpss: ipa: NO VERSION AT %#x OR %#x: the block does not answer, its hardware will be left alone\n",
+	    tries[0], tries[1]);
+}
 
 static void
 ipa_status(const char *when)
@@ -1847,6 +1912,9 @@ ipa_status(const char *when)
 	    "hw_state %u warnings %u, interface %#x; GSI status %#x (%s), error log %#x\n", when, shared, 8 * (shared >> 16),
 	    8 * (shared & 0xffff), uc0 & 0xff, uc3 & 0xff, uc5 & 0xff, uc7, uc8 & 0xff, (uc8 >> 8) & 0xff, rd(ipa_sram.base + 0x24) & 0xffff,
 	    gsi, gsi & 1 ? "ENABLED" : "NOT ENABLED", error);
+	/* the block's own identification (this phone's Android: 0x32 and 0x400b0000): zeroes here mean the block is not
+	 * answering -- no clock, most likely -- which is also why a write into it never returns */
+	tell("mpss: ipa: %s: version %#x, hardware version %#x\n", when, rd(ipa_regs.base + 0x0), rd(ipa_regs.base + 0x8));
 	ipa_mem_offset = 8 * (shared >> 16);
 }
 
@@ -1942,33 +2010,44 @@ ipa_hardware_init(void)
 	uint32_t value;
 
 	need(&ipa_regs);
+	/* A write into this block that hangs the phone (found 13 November: the thread of the modem goes quiet at the
+	 * first one, the QSB register, while reads of the same register answer) means the block has no clock: its own
+	 * version registers then read 0 (this phone's Android reads 0x32 and 0x400b0000). Skip all of it rather than
+	 * hang, and say why: what is left is the firmware already started by TrustZone. */
+	if (rd(ipa_regs.base + 0x0) == 0) {
+		printf("mpss: ipa: THE BLOCK DOES NOT ANSWER (version 0): it has no clock, so its hardware is left alone\n");
+		return;
+	}
+	/* each of these prints before it writes: a write into this block hangs the phone (the whole thread of
+	 * the modem goes quiet), so the last line seen names the register responsible. */
 	/* QSB: 12 outstanding writes, 13 reads of 120 beats on the DDR master (ipa3_qmb_outstanding[IPA_4_11]) */
-	value = rd(ipa_regs.base + IPA_QSB_MAX_WRITES);
-	wr(ipa_regs.base + IPA_QSB_MAX_WRITES, (value & ~0xfu) | 12);
-	value = rd(ipa_regs.base + IPA_QSB_MAX_READS);
-	wr(ipa_regs.base + IPA_QSB_MAX_READS, (value & ~0x00ff000fu) | 13 | 120u << 16);
+	value = get(&ipa_regs, "qsb max writes", IPA_QSB_MAX_WRITES);
+	put(&ipa_regs, "qsb max writes", IPA_QSB_MAX_WRITES, (value & ~0xfu) | 12);
+	value = get(&ipa_regs, "qsb max reads", IPA_QSB_MAX_READS);
+	put(&ipa_regs, "qsb max reads", IPA_QSB_MAX_READS, (value & ~0x00ff000fu) | 13 | 120u << 16);
 	/* Qtime: the divider off, the timestamps and pulse generators as Android leaves them, the divider 192 on */
-	wr(ipa_regs.base + IPA_TIMERS_XO_CLK_DIV_CFG, 0);
-	wr(ipa_regs.base + IPA_QTIME_TIMESTAMP_CFG, 0x180e8e);
-	wr(ipa_regs.base + IPA_TIMERS_PULSE_GRAN_CFG, 0x123);
-	wr(ipa_regs.base + IPA_TIMERS_XO_CLK_DIV_CFG, 0xbf);
-	wr(ipa_regs.base + IPA_TIMERS_XO_CLK_DIV_CFG, 0x800000bf);
+	put(&ipa_regs, "timers xo div (off)", IPA_TIMERS_XO_CLK_DIV_CFG, 0);
+	put(&ipa_regs, "qtime timestamp cfg", IPA_QTIME_TIMESTAMP_CFG, 0x180e8e);
+	put(&ipa_regs, "timers pulse gran", IPA_TIMERS_PULSE_GRAN_CFG, 0x123);
+	put(&ipa_regs, "timers xo div 0xbf", IPA_TIMERS_XO_CLK_DIV_CFG, 0xbf);
+	put(&ipa_regs, "timers xo div on", IPA_TIMERS_XO_CLK_DIV_CFG, 0x800000bf);
 	/* COMP_CFG: GSI_MULTI_INORDER_RD_DIS and _WR_DIS */
-	value = rd(ipa_regs.base + IPA_COMP_CFG);
-	wr(ipa_regs.base + IPA_COMP_CFG, value | 1u << 7 | 1u << 8);
+	value = get(&ipa_regs, "comp cfg", IPA_COMP_CFG);
+	put(&ipa_regs, "comp cfg", IPA_COMP_CFG, value | 1u << 7 | 1u << 8);
 	/* dynamic clock division: enter idle after 256, no constant non-idle */
-	wr(ipa_regs.base + IPA_IDLE_INDICATION_CFG, 256);
+	put(&ipa_regs, "idle indication", IPA_IDLE_INDICATION_CFG, 256);
 	/* the resource groups: the sources' five types for group 0 alone; the destinations' data sectors 3 for group 0
 	 * and 25 for group 2 (DRB_IP), DPS DMARs 2 for group 0 */
 	for (unsigned n = 0; n < 5; n++) {
-		wr(ipa_regs.base + IPA_SRC_RSRC_GRP_01(n), RSRC(source[n], source[n], 0, 0));
+		put(&ipa_regs, "source resource group", IPA_SRC_RSRC_GRP_01(n), RSRC(source[n], source[n], 0, 0));
 	}
-	wr(ipa_regs.base + IPA_DST_RSRC_GRP_01(0), RSRC(3, 3, 0, 0));
-	wr(ipa_regs.base + IPA_DST_RSRC_GRP_23(0), RSRC(25, 25, 0, 0));
-	wr(ipa_regs.base + IPA_DST_RSRC_GRP_01(1), RSRC(2, 2, 0, 0));
-	wr(ipa_regs.base + IPA_DST_RSRC_GRP_23(1), 0);
-	/* the default route as Android's: not disabled, default pipe 9, header table 1, fragments to pipe 9, header retained */
-	wr(ipa_regs.base + IPA_ROUTE, 0x1120052);
+	put(&ipa_regs, "destination group 0 sectors", IPA_DST_RSRC_GRP_01(0), RSRC(3, 3, 0, 0));
+	put(&ipa_regs, "destination group 0 dmars", IPA_DST_RSRC_GRP_23(0), RSRC(25, 25, 0, 0));
+	put(&ipa_regs, "destination group 1 sectors", IPA_DST_RSRC_GRP_01(1), RSRC(2, 2, 0, 0));
+	put(&ipa_regs, "destination group 1 dmars", IPA_DST_RSRC_GRP_23(1), 0);
+	/* the default route as this phone's Android leaves it (debugfs ipa/gen_reg: IPA_ROUTE 0x1120012): not disabled,
+	 * default pipe 9, header table 0, fragments to pipe 9, header retained */
+	put(&ipa_regs, "route", IPA_ROUTE, 0x1120012);
 	settle();
 	printf("mpss: ipa: the hardware set up as Android's driver does before the modem: QSB %#x %#x, COMP_CFG %#x, idle %#x, route %#x, "
 	    "source group 0 %u/%u/%u/%u/%u, destination sectors %#x %#x\n", rd(ipa_regs.base + IPA_QSB_MAX_WRITES),
@@ -2396,6 +2475,7 @@ ipa_firmware_load(void)
 		}
 	}
 	sleep_ms(50);
+	ipa_regs_find();
 	if (!option("modem_ipa_quiet")) {
 		ipa_status("after its firmware's start");
 	}
