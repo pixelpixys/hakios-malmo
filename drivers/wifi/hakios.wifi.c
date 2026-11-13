@@ -3386,7 +3386,7 @@ step_exchange(void)
 		const struct hakios_qrtr_ops *mpss_qrtr = NULL;
 
 		announce("Blair/WCN3990: wait for modem QRTR link (hakios_mpss_qrtr) and run WLFW QMI exchange");
-		for (unsigned ms = 0; ms < 30000; ms += 100) {
+		for (unsigned ms = 0; ms < 45000; ms += 100) {
 			mpss_qrtr = hakios_mpss_qrtr();
 			if (mpss_qrtr != NULL) {
 				break;
@@ -3394,7 +3394,7 @@ step_exchange(void)
 			sleep_ms(100);
 		}
 		if (mpss_qrtr == NULL) {
-			printf("wifi: %u: Blair/WCN3990: modem QRTR link not up after 30 s (is modem=1 enabled?)\n", step);
+			printf("wifi: %u: Blair/WCN3990: modem QRTR link not up after 45 s (is modem=1 enabled?)\n", step);
 			return false;
 		}
 		hakios_qmi_set_transport(mpss_qrtr);
@@ -3609,8 +3609,8 @@ smmu_look(void)
 		                             "(the number is", "of a reserved kind (the number is" };
 	uint32_t scr0, idr0, idr1, matches, valid = 0, covering = 0;
 
-	printf("wifi: 0: read the global registers of the application processors' SMMU (0x15000000: the first access of ours to "
-	    "that block; the hypervisor answers for them)\n");
+	printf("wifi: 0: read the global registers of the application processors' SMMU (%#x: the first access of ours to "
+	    "that block; the hypervisor answers for them)\n", apps_smmu.phys);
 	sleep_ms(pause_ms);
 	scr0 = get(&apps_smmu, "scr0", SMMU_SCR0);
 	idr0 = get(&apps_smmu, "idr0", SMMU_IDR0);

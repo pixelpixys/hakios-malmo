@@ -6891,6 +6891,9 @@ soc_override(void)
 	 * thread on 13 November right after the IPA's clock. Boot-args below still win.
 	 */
 	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		if (smem_lock.base == 0) {
+			smem_lock.phys = 0x00343000u;
+		}
 		if (apps_smmu.base == 0) {
 			apps_smmu.phys = 0x0c600000u;
 		}
@@ -6942,7 +6945,7 @@ hakios_mpss_init(void)
 		/* all of it, on a thread of its own, and left up */
 		last_step = STEPS;
 		keep = true;
-		quiet = true;
+		quiet = !option("modem_loud");
 		pause_ms = 0;
 		listen_seconds = 1;
 		new_from = STEPS + 1;
