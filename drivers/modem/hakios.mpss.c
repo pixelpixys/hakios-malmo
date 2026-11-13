@@ -1426,6 +1426,9 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	printf("mpss: %u: %s after %llu.%03llu ms; its entry says %#x\n", step, state & DSP_STOP_ACK ?
 	    "THE MODEM ACKNOWLEDGES THE STOP" : "THE MODEM DOES NOT ACKNOWLEDGE THE STOP", (now - asked) / 1000,
 	    (now - asked) % 1000, state);
+	if (!(state & DSP_STOP_ACK)) {
+		show_crash_reason();
+	}
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
 	wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_SMP2P);
@@ -5806,7 +5809,7 @@ step_qrtr(void)
 	}
 	for (unsigned ms = 0; ms < listen_seconds * 1000; ms++) {
 		sleep_ms(1);
-		if (ms != 0 && ms % 2000 == 0) {
+		if (ms == 500 || (ms != 0 && ms % 2000 == 0)) {
 			pdr_restart_wlan_pd();
 		}
 	}
@@ -6650,6 +6653,14 @@ step_nas(void)
 		}
 		if (nas.connected) {
 			nas_polls += hakios_nas_client_poll(&nas) == 0;
+		}
+		if (wlan_pd_state != 0x1fffffffu) {
+			static uint64_t pd_asked_at;
+
+			if (now_us() - pd_asked_at > 3000000ull) {
+				pd_asked_at = now_us();
+				pdr_restart_wlan_pd();
+			}
 		}
 		wds_advance();          /* bind / start / retry the data session on its own clock */
 		sleep_ms(1000);
