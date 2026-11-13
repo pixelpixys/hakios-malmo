@@ -6884,6 +6884,20 @@ soc_override(void)
 	};
 	unsigned said = 0;
 
+	/*
+	 * Blair's own values (dt of the Moto G85: apps-smmu@0c600000, iommus of ipa_smmu_ap/uc 0x4a0/0x4a2,
+	 * qcom,msm-imem@c000000), so that a run without devices/moto-g85/soc.args does not touch the first
+	 * phone's 0x15000000 -- nothing answers there on this SoC, and the first read of it hung the modem's
+	 * thread on 13 November right after the IPA's clock. Boot-args below still win.
+	 */
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		if (apps_smmu.base == 0) {
+			apps_smmu.phys = 0x0c600000u;
+		}
+		ipa_imem = 0x0c000000u;
+		ipa_stream = 0x4a0u;
+		ipa_stream_uc = 0x4a2u;
+	}
 	for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
 		uint32_t phys = 0;
 

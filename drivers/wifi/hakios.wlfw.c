@@ -401,9 +401,9 @@ hakios_wlfw_exchange(uint32_t step)
 	}
 	handle_open = true;
 	ret = qmi_add_lookup(&handle, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ins_id);
-	if (ret < 0 || !wait_for(&wlfw.server, 3000)) {
-		say("wifi: %u: THE SERVICE (%#x, version %u, instance %u) DOES NOT APPEAR within 3 s (lookup: %d)\n", step,
-		    ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ins_id, ret);
+	if (ret < 0 || !wait_for(&wlfw.server, is_blair ? 15000 : 3000)) {
+		say("wifi: %u: THE SERVICE (%#x, version %u, instance %u) DOES NOT APPEAR within %u s (lookup: %d)\n", step,
+		    ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ins_id, is_blair ? 15 : 3, ret);
 		goto out;
 	}
 
@@ -465,15 +465,23 @@ hakios_wlfw_exchange(uint32_t step)
 	bzero(&device, sizeof(device));
 	if (!ask("where the radio's registers are", QMI_WLANFW_DEVICE_INFO_REQ_V01, QMI_WLANFW_DEVICE_INFO_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_device_info_req_msg_v01_ei, &where, qmi_wlfw_device_info_resp_msg_v01_ei, &device, false)) {
-		goto out;
+		if (!is_blair) {
+			goto out;
+		}
+		/* WCN3990 on Blair is an ICNSS/SNOC device (DT reg = 0x0c800000, 0x800000), not PCIe BAR */
+		registers_at = 0x0c800000ull;
+		registers_size = 0x800000u;
+		say("wifi: %u: Blair/WCN3990: DEVICE_INFO skipped, using ICNSS DT reg %#llx (%#x bytes)\n",
+		    step, (unsigned long long)registers_at, registers_size);
+	} else {
+		if (device.bar_addr_valid && device.bar_size_valid) {
+			registers_at = device.bar_addr;
+			registers_size = device.bar_size;
+		}
+		say("wifi: %u:   registers at %#llx (%s), %#x bytes (%s; ath11k wants exactly %#x)\n", step,
+		    (unsigned long long)device.bar_addr, device.bar_addr_valid ? "given" : "not given", device.bar_size,
+		    device.bar_size_valid ? "given" : "not given", ATH11K_QMI_DEVICE_BAR_SIZE);
 	}
-	if (device.bar_addr_valid && device.bar_size_valid) {
-		registers_at = device.bar_addr;
-		registers_size = device.bar_size;
-	}
-	say("wifi: %u:   registers at %#llx (%s), %#x bytes (%s; ath11k wants exactly %#x)\n", step,
-	    (unsigned long long)device.bar_addr, device.bar_addr_valid ? "given" : "not given", device.bar_size,
-	    device.bar_size_valid ? "given" : "not given", ATH11K_QMI_DEVICE_BAR_SIZE);
 
 	/*
 	 * ath11k_qmi_event_load_bdf(): the regulatory database, whose fate qmi.c does not look at, then

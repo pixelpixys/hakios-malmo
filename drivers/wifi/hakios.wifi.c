@@ -1212,62 +1212,22 @@ static struct block tlmm_blair = { "tlmm", 0x00500000, 0x300000 };
 #define GPIO_CFG_OE             (1u << 9)       /* output-enable */
 #define GPIO_IO_OUT             (1u << 1)       /* output value */
 
-/* Power-on the WCN3990: confirm regulators are on, then assert WLAN_EN (gpio84). */
+/*
+ * Power-on survey for WCN3990 on SM6375 (malmo):
+ * Note: on Moto G85 (malmo), GPIO 84 is focaltech,vdd-gpio (touchscreen AVDD), NOT WLAN_EN.
+ * WCN3990 power is controlled by RPM-SMD regulators (pm6125_s5, pm6125_l2, pm6125_l16,
+ * pm6125_l21, pm6125_l23, pmr735a_l2) and brought up by MPSS wlan_pd.
+ * Do not touch GPIO 84 here.
+ */
 static bool
 wcn3990_power_on(void)
 {
-	/*
-	 * Read PM7325 LDO17 enable register via SPMI arbiter observer (read-only path).
-	 * PM7325 is SPMI slave 0 (qcom,usid = 0).
-	 * LDO17 peripheral address: each PMIC peripheral is 0x100 bytes at slave<<8|periph.
-	 * LDO17 is at peripheral 0x51 (ult_lo_smps type): enable reg 0x46, bit 7.
-	 * We read and log but do not fail – the boot loader may have already powered them.
-	 */
-	const struct {
-		uint16_t id;        /* SPMI peripheral: slave<<8 | periph */
-		const char *what;
-	} vregs[] = {
-		{ (0 << 8) | 0x51, "LDO17 (VDD_io 1.8V)"   },
-		{ (0 << 8) | 0x52, "LDO18 (VDD_xtal 1.8V)" },
-		{ (0 << 8) | 0x48, "S5 (VDD_core 0.95V)"    },
-	};
-	for (unsigned v = 0; v < sizeof(vregs) / sizeof(vregs[0]); v++) {
-		int ch = spmi_channel(vregs[v].id);
-		if (ch < 0) {
-			printf("wifi: %u: wcn3990 vreg %s: no SPMI channel\n", step, vregs[v].what);
-			continue;
-		}
-		uint8_t enable = 0;
-		const char *err = spmi_read(ch, 0x46, &enable, 1);
-		if (err != NULL) {
-			printf("wifi: %u: wcn3990 vreg %s: SPMI read failed: %s\n", step, vregs[v].what, err);
-		} else {
-			printf("wifi: %u: wcn3990 vreg %s: enable reg = %#x (%s)\n", step, vregs[v].what, enable,
-			    (enable & 0x80) ? "ON" : "OFF – boot loader may need to enable it");
-		}
-	}
+	vm_offset_t cfg_reg = tlmm_blair.base + 0x1000UL * 69 + GPIO_CFG_REG;
+	vm_offset_t io_reg  = tlmm_blair.base + 0x1000UL * 69 + GPIO_IO_REG;
 
-	/* Assert WLAN_EN = gpio84: set output-enable, drive high. */
-	vm_offset_t cfg_reg = tlmm_blair.base + 0x1000UL * 84 + GPIO_CFG_REG;
-	vm_offset_t io_reg  = tlmm_blair.base + 0x1000UL * 84 + GPIO_IO_REG;
-
-	uint32_t cfg_before = rd(cfg_reg);
-	uint32_t io_before  = rd(io_reg);
-	printf("wifi: %u: gpio84 (WLAN_EN) before: cfg %#x  io %#x\n", step, cfg_before, io_before);
-
-	/* func=0 (GPIO), no pull (bits[1:0]=0), 2mA drive (bits[8:6]=0), output-enable */
-	uint32_t cfg_new = (cfg_before & ~((0xfu << 2) | 0x3u | (0x7u << 6))) | GPIO_CFG_OE;
-	wr(cfg_reg, cfg_new);
-	/* drive output high */
-	wr(io_reg, io_before | GPIO_IO_OUT);
-	settle();
-
-	uint32_t cfg_after = rd(cfg_reg);
-	uint32_t io_after  = rd(io_reg);
-	printf("wifi: %u: gpio84 (WLAN_EN) after:  cfg %#x  io %#x  (%s)\n", step, cfg_after, io_after,
-	    (io_after & GPIO_IO_OUT) ? "DRIVES HIGH – WCN3990 power-on asserted" : "OUTPUT LOW – CHECK");
-
-	return (io_after & GPIO_IO_OUT) != 0;
+	printf("wifi: %u: Blair/WCN3990: bt-sw-ctrl gpio69 cfg %#x io %#x (leaving gpio84/touch untouched)\n",
+	    step, rd(cfg_reg), rd(io_reg));
+	return true;
 }
 
 static bool
@@ -3415,10 +3375,35 @@ step_driver(uint32_t how)
 	return error == 0;
 }
 
+extern const struct hakios_qrtr_ops *hakios_mpss_qrtr(void);
+
 static bool
 step_exchange(void)
 {
 	uint32_t driver = 0;
+
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		const struct hakios_qrtr_ops *mpss_qrtr = NULL;
+
+		announce("Blair/WCN3990: wait for modem QRTR link (hakios_mpss_qrtr) and run WLFW QMI exchange");
+		for (unsigned ms = 0; ms < 30000; ms += 100) {
+			mpss_qrtr = hakios_mpss_qrtr();
+			if (mpss_qrtr != NULL) {
+				break;
+			}
+			sleep_ms(100);
+		}
+		if (mpss_qrtr == NULL) {
+			printf("wifi: %u: Blair/WCN3990: modem QRTR link not up after 30 s (is modem=1 enabled?)\n", step);
+			return false;
+		}
+		hakios_qmi_set_transport(mpss_qrtr);
+		printf("wifi: %u: Blair/WCN3990: using modem QRTR transport for WLFW (0x45)\n", step);
+		if ((driver = hakios_wifi_option("wifi_lx")) != 0) {
+			return step_driver(driver);
+		}
+		return hakios_wlfw_exchange(step);
+	}
 
 	if (!glink.open) {
 		return false;
@@ -4331,8 +4316,8 @@ join_given(uint64_t began)
 static void
 whole_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	/* Blair/WCN3990: skip steps 9 (WPSS image write), 10 (SMP2P), 11 (TZ PAS_WPSS start) */
-	static const uint8_t needed_blair[]   = { 1, 2, 6, 7, 8, 12, 13, 14, 15 };
+	/* Blair/WCN3990: wlan_pd runs on MPSS, so skip WPSS firmware/GLINK/QRTR steps (2,6,7,9,10,11,12,13,14) */
+	static const uint8_t needed_blair[]   = { 1, 5, 8, 15 };
 	/* Redwood/WCN6750: original full sequence */
 	static const uint8_t needed_redwood[] = { 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
 	const uint8_t *needed;
@@ -4340,7 +4325,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
 		needed       = needed_blair;
 		needed_count = sizeof(needed_blair);
-		tell("wifi: Blair/WCN3990 path: steps 1,2,6,7,8,12,13,14,15 (WPSS/TZ steps skipped)\n");
+		tell("wifi: Blair/WCN3990 path: steps 1,5,8,15 (via modem QRTR + WLFW)\n");
 	} else {
 		needed       = needed_redwood;
 		needed_count = sizeof(needed_redwood);
