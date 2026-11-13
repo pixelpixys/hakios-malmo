@@ -3399,9 +3399,6 @@ step_exchange(void)
 		}
 		hakios_qmi_set_transport(mpss_qrtr);
 		printf("wifi: %u: Blair/WCN3990: using modem QRTR transport for WLFW (0x45)\n", step);
-		if ((driver = hakios_wifi_option("wifi_lx")) != 0) {
-			return step_driver(driver);
-		}
 		return hakios_wlfw_exchange(step);
 	}
 

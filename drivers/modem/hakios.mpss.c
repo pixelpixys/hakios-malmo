@@ -2558,7 +2558,7 @@ step_start(void)
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	{
-		uint32_t ipa_fw = 1;
+		uint32_t ipa_fw = pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR ? 0 : 1;
 
 		PE_parse_boot_argn("modem_ipa_fw", &ipa_fw, sizeof(ipa_fw));
 		ipa_loaded = ipa_fw != 0 && ipa_firmware_load();
