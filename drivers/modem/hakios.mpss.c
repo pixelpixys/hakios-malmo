@@ -1862,7 +1862,7 @@ static struct block gsi_ee0 = { "gsi-ee0", 0x05816000, 0x1000 };
 static void
 ipa_regs_find(void)
 {
-	static const uint32_t tries[] = { 0x05840000u, 0x05800000u };
+	static const uint32_t tries[] = { 0x05840000u };
 	uint32_t forced = 0;
 
 	PE_parse_boot_argn("soc_ipa_regs", &forced, sizeof(forced));
@@ -1875,14 +1875,16 @@ ipa_regs_find(void)
 	}
 	for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
 		struct block b = { "ipa probe", tries[i], 0x1000, 0 };
-		uint32_t version;
+		uint32_t version, shared;
 
 		printf("mpss: ipa: reading %#x\n", tries[i]);
 		need(&b);
 		version = rd(b.base + 0x0);
+		shared = rd(b.base + 0x54);
 		tell("mpss: ipa: %#x: version %#x, hardware version %#x, shared memory %#x\n",
-		    tries[i], version, rd(b.base + 0x8), rd(b.base + 0x54));
-		if (version != 0 && version != 0xffffffffu) {
+		    tries[i], version, rd(b.base + 0x8), shared);
+		if ((version != 0 && version != 0xffffffffu) ||
+		    (shared != 0 && shared != 0xffffffffu)) {
 			ipa_regs.phys = tries[i];
 			ipa_regs.base = b.base;
 			ipa_sram.phys = tries[i] + 0x10000;   /* the local memory follows the registers */
@@ -2017,7 +2019,7 @@ ipa_hardware_init(void)
 	 * first one, the QSB register, while reads of the same register answer) means the block has no clock: its own
 	 * version registers then read 0 (this phone's Android reads 0x32 and 0x400b0000). Skip all of it rather than
 	 * hang, and say why: what is left is the firmware already started by TrustZone. */
-	if (rd(ipa_regs.base + 0x0) == 0) {
+	if (rd(ipa_regs.base + 0x0) == 0 && rd(ipa_regs.base + 0x54) == 0) {
 		printf("mpss: ipa: THE BLOCK DOES NOT ANSWER (version 0): it has no clock, so its hardware is left alone\n");
 		return;
 	}
@@ -2168,10 +2170,29 @@ ipa_space_on(void)
 	contexts = idr1 & 0xff;
 	ipa_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
 	ipa_space.pages = 2u << (idr1 >> 28 & 7);
-	if ((scr0 & 1u << 3) || 2 * ipa_space.pages * ipa_space.page != 0x100000) {
+	if ((scr0 & 1u << 3) || (2 * ipa_space.pages * ipa_space.page != 0x100000 &&
+	    2 * ipa_space.pages * ipa_space.page != 0x80000)) {
 		lck_mtx_unlock(&hakios_smmu_lock);
 		printf("mpss: ipa: the SMMU is not of the shape this knows (scr0 %#x, idr1 %#x)\n", scr0, idr1);
 		return false;
+	}
+	if (option("modem_ipa_smmu_bypass")) {
+		uint32_t streams[4] = { ipa_stream, ipa_stream + 1, ipa_stream_uc, ipa_stream_uc + 1 };
+		unsigned done = 0;
+
+		for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00 && done < 4; n++) {
+			uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n));
+
+			if (!(smr >> 31)) {
+				wr(apps_smmu.base + SMMU_S2CR(n), 0x10000u);
+				wr(apps_smmu.base + SMMU_SMR(n), (1u << 31) | streams[done]);
+				printf("mpss: ipa: smmu bypass reg %u stream %#x -> smr %#x s2cr %#x (scr0 %#x)\n",
+				    n, streams[done], rd(apps_smmu.base + SMMU_SMR(n)), rd(apps_smmu.base + SMMU_S2CR(n)), scr0);
+				done++;
+			}
+		}
+		lck_mtx_unlock(&hakios_smmu_lock);
+		return done == 4;
 	}
 	ipa_space.match = ipa_space.match_uc = ~0u;
 	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
@@ -2262,6 +2283,19 @@ ipa_space_on(void)
 	wr(apps_smmu.base + SMMU_SMR(ipa_space.match), sees);
 	wr(apps_smmu.base + SMMU_S2CR(ipa_space.match_uc), ipa_space.context);
 	wr(apps_smmu.base + SMMU_SMR(ipa_space.match_uc), sees_uc);
+	if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+		uint32_t extra[2] = { ipa_stream + 1, ipa_stream_uc + 1 };
+		unsigned e = 0;
+
+		for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00 && e < 2; n++) {
+			if (n != ipa_space.match && n != ipa_space.match_uc && !(rd(apps_smmu.base + SMMU_SMR(n)) >> 31)) {
+				wr(apps_smmu.base + SMMU_S2CR(n), ipa_space.context);
+				wr(apps_smmu.base + SMMU_SMR(n), (1u << 31) | extra[e]);
+				e++;
+			}
+		}
+		printf("mpss: ipa: blair extra SMMU streams mapped=%u (scr0=%#x)\n", e, scr0);
+	}
 	if (rd(apps_smmu.base + SMMU_SMR(ipa_space.match)) != sees ||
 	    (rd(apps_smmu.base + SMMU_S2CR(ipa_space.match)) & 0x300ff) != ipa_space.context ||
 	    rd(apps_smmu.base + SMMU_SMR(ipa_space.match_uc)) != sees_uc ||
@@ -2398,6 +2432,7 @@ blair_rpm_enable_ipa_clk(void)
 	uint32_t tx_intent_id = 0, peer_rcid = 0;
 
 	need(&rpm_ram);
+	need(&ipcc);
 	toc_at = rpm_ram.base + RPM_MSG_RAM_SIZE - RPM_TOC_SIZE;
 	magic = rd(toc_at);
 	count = rd(toc_at + 4);
@@ -2432,9 +2467,13 @@ blair_rpm_enable_ipa_clk(void)
 	}
 	printf("mpss: rpm: TOC ok (%u entries): tx %u B (h=%u t=%u), rx %u B (h=%u t=%u)\n",
 	    count, tx.size, rd(tx.head), rd(tx.tail), rx.size, rd(rx.head), rd(rx.tail));
-
-	{
-		uint16_t ver[4] = { 0, 1, 0, 0 }; /* GLINK_VERSION = 0, version 1, features = 2 */
+	if (rd(tx.head) >= 56 && rd(rx.head) >= 72) {
+		/* UEFI already opened lcid=1 ("rpm_requests", intentless mode). */
+		ver_ack = peer_ver = open_ack = peer_open = true;
+		features = 0;
+		tx_intent_id = 0;
+	} else {
+		uint16_t ver[4] = { 0, 1, 0, 0 }; /* GLINK_VERSION = 0, version 1 */
 		uint32_t feat = features;
 
 		memcpy(&ver[2], &feat, 4);
@@ -2466,6 +2505,7 @@ blair_rpm_enable_ipa_clk(void)
 			if (rpm_pipe_avail(&rx) < ((skip + 7) & ~7u)) {
 				break;
 			}
+			printf("mpss: rpm: reply rx cmd=%u p1=%u p2=%#x skip=%u\n", hdr[0], hdr[1], p2, skip);
 			if (cmd == 0) { /* VERSION */
 				uint16_t ack[4] = { 1, 1, 0, 0 };
 				uint32_t f = p2 & features;
@@ -2538,6 +2578,29 @@ blair_rpm_enable_ipa_clk(void)
 			printf("mpss: rpm: failed to write IPA_CLK request\n");
 			return false;
 		}
+		/* Also vote in SLEEP_SET (set=1) just like Linux RPM_SMD_IPA_CLK does. */
+		req.msg_id = 2;
+		req.set = 1;
+		(void)rpm_pipe_write(&tx, &req, sizeof(req), NULL, 0);
+		{
+			static const struct {
+				uint32_t rtype, khz;
+			} buses[] = {
+				{ 0x636f6e73u, 200000 }, /* "snoc" */
+				{ 0x636d6962u, 400000 }, /* "bimc" */
+				{ 0x636f6e63u, 100000 }, /* "cnoc" */
+			};
+			for (unsigned b = 0; b < sizeof(buses) / sizeof(buses[0]); b++) {
+				req.msg_id = 3 + b * 2;
+				req.set = 0;
+				req.resource_type = buses[b].rtype;
+				req.val = buses[b].khz;
+				(void)rpm_pipe_write(&tx, &req, sizeof(req), NULL, 0);
+				req.msg_id = 4 + b * 2;
+				req.set = 1;
+				(void)rpm_pipe_write(&tx, &req, sizeof(req), NULL, 0);
+			}
+		}
 	}
 	for (unsigned ms = 0; ms < 500 && !got_reply; ms++) {
 		while (rpm_pipe_avail(&rx) >= 8) {
@@ -2558,11 +2621,12 @@ blair_rpm_enable_ipa_clk(void)
 					break;
 				}
 				{
-					uint8_t msg[96];
+					uint32_t msg[24] = { 0 };
 
 					rpm_pipe_read(&rx, msg, skip < sizeof(msg) ? skip : sizeof(msg), true);
 					got_reply = true;
-					printf("mpss: rpm: IPA_CLK (100 MHz) reply: %u bytes\n", dhdr[2]);
+					printf("mpss: rpm: IPA_CLK (100 MHz) reply: %u bytes [%08x %08x %08x %08x %08x %08x %08x]\n",
+					    dhdr[2], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8]);
 					break;
 				}
 			} else if (hdr[0] == 5) {
@@ -2571,6 +2635,7 @@ blair_rpm_enable_ipa_clk(void)
 			if (rpm_pipe_avail(&rx) < ((skip + 7) & ~7u)) {
 				break;
 			}
+			printf("mpss: rpm: reply rx cmd=%u p1=%u p2=%#x skip=%u\n", hdr[0], hdr[1], p2, skip);
 			{
 				uint8_t trash[64];
 				rpm_pipe_read(&rx, trash, skip < sizeof(trash) ? skip : sizeof(trash), true);
@@ -2764,20 +2829,22 @@ ipa_firmware_load(void)
 		}
 	}
 	sleep_ms(50);
-	ipa_regs_find();
-	if (!option("modem_ipa_quiet")) {
-		ipa_status("after its firmware's start");
-	}
-	if (!option("modem_ipa_raw")) {
-		if (!option("modem_ipa_nomem")) {
-			ipa_memory_init();
+	if (!option("modem_ipa_noregs")) {
+		ipa_regs_find();
+		if (!option("modem_ipa_quiet")) {
+			ipa_status("after its firmware's start");
 		}
-		if (!option("modem_ipa_nohw")) {
-			ipa_hardware_init();
-		}
-		/* this processor's own channels and endpoints, and the IPA's tables, before the modem (hakios.ipa.c); then en1 on them */
-		if (!option("modem_ipa_tables") && hakios_ipa_data_setup()) {
-			hakios_cell_attach();
+		if (!option("modem_ipa_raw")) {
+			if (!option("modem_ipa_nomem")) {
+				ipa_memory_init();
+			}
+			if (!option("modem_ipa_nohw")) {
+				ipa_hardware_init();
+			}
+			/* this processor's own channels and endpoints, and the IPA's tables, before the modem (hakios.ipa.c); then en1 on them */
+			if (!option("modem_ipa_tables") && hakios_ipa_data_setup()) {
+				hakios_cell_attach();
+			}
 		}
 	}
 	ok = true;
@@ -2847,9 +2914,11 @@ step_start(void)
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	{
-		uint32_t ipa_fw = pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR ?
-		    (blair_rpm_enable_ipa_clk() ? 1 : 0) : 1;
+		uint32_t ipa_fw = 1;
 
+		if (pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR) {
+			ipa_fw = blair_rpm_enable_ipa_clk() ? 1 : 0;
+		}
 		PE_parse_boot_argn("modem_ipa_fw", &ipa_fw, sizeof(ipa_fw));
 		ipa_loaded = ipa_fw != 0 && ipa_firmware_load();
 	}
@@ -2870,6 +2939,12 @@ step_start(void)
 			lck_mtx_unlock(&dsp_lock);
 			return false;
 		}
+	}
+	if (option("modem_no_start")) {
+		printf("mpss: %u: modem_no_start=1: sleeping 3s without starting modem (ipa_loaded=%d)\n", step, ipa_loaded);
+		sleep_ms(3000);
+		lck_mtx_unlock(&dsp_lock);
+		return false;
 	}
 	result = scm("to authenticate the modem's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_mpss, 0, 0, 0,
 	    &answer);
@@ -6968,7 +7043,7 @@ step_nas(void)
 	if (!keep) {
 		wds_close();
 	}
-	if (ipa_loaded && !option("modem_ipa_quiet")) {
+	if (ipa_loaded && !option("modem_ipa_quiet") && !option("modem_ipa_noregs")) {
 		ipa_status("at the end of step 11");
 		ipa_space_faults("at the end of step 11");
 	}
