@@ -5,7 +5,7 @@
 
 ---
 
-## 📊 Overall Porting Progress: **~88% Complete**
+## 📊 Overall Porting Progress: **~90% Complete**
 
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
@@ -21,11 +21,12 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 | **GPU (Adreno 619)** | ✅ Working | 90% | Hardware-accelerated UI via `hakios-gl` / Mesa Freedreno, Metal translation |
 | **Touchscreen (Touch)** | ✅ Working | 95% | FocalTech FT3683G (I2C SE1), multi-touch & gesture navigation |
 | **Physical Buttons** | ✅ Working | 100% | Power and Volume (+/-) via PMIC PON driver |
-| **Haptics / Vibration** | ✅ Working | 93% | Awinic AW86927 (I2C SE8), AW86927 hw_reset sequence (LOW 5ms→HIGH), PMIC LDO 3.0V, RAM waveforms |
-| **Audio / Speakers** | 🟡 In Progress | 82% | FourSemi FS1815: GPIO4/5 forced to function=0 for bit-bang I2C, ADSP TZ auth, AFE TDM 0x9000 |
-| **Wi-Fi** | 🟡 In Progress | 80% | WCN3990 (SNOC) / MPSS `wlan_pd`: ICNSS + MSA + QRTR/QMI, blocked on MPSS + `ipa_fw=1` hang |
+| **Haptics / Vibration** | ✅ Working | 95% | Awinic AW86927: EGPIO reset bit logic, boost 0xd0 (vmax 8500 mV), max gain 0xff, RAM waveforms + CONT buzz |
+| **Audio / Speakers** | 🟡 In Progress | 82% | FourSemi FS1815: GPIO4/5 bit-bang I2C, ADSP TZ auth, Blair stream `0xa1`, fastrpc SMMU early page |
+| **Wi-Fi** | 🟡 In Progress | 82% | WCN3990 (SNOC) + ath10k shim: WLFW QMI exchange, MSA info/ready, CAL report, BDF bin loading |
 | **Bluetooth** | 🟡 In Progress | 45% | WCN3990 UART / QCA coex (GPIO 69), driver under active development |
 | **Cellular Modem (LTE/5G) / MPSS** | 🟡 In Progress | 45% | MPSS boots (`smem_lock=0x343000`), RPM GLINK `IPA_CLK` (100 MHz) + `snoc/bimc/cnoc` votes, IPA v4.5 (`0x05840000`) & 512KB SMMU (`0x4a0..0x4a3`); debugging hang when `ipa_fw=1` + MPSS run together |
+| **PosterBoard / Wallpapers** | 🟡 Partial | 70% | Lock screen wallpaper renders; poster switcher hook returns `NO` (avoids black screen compositing bug); ExtensionKit posters load in background (~400s); home screen freeze via `wallpaper_freeze=1` |
 | **Cameras** | 🔴 Planned | 10% | Requires porting Qualcomm Spectra ISP & Sony LYT-600 sensors |
 
 ---
@@ -57,14 +58,21 @@ XL_SECS=36000 XL_FOLLOW=10 XL_CMDLINE="touchscreen=1 buttons=1 bootcpu=7 cpus=7 
 2. **FourSemi FS1815 Smart Audio Amplifiers:**
    - Dedicated driver in `drivers/audio/hakios.speaker.c` with register sequences from `drivers/audio/hakios.fs1815.h` (extracted from `/vendor/firmware/fs1815.fsm`).
    - Dual-channel I2C addressing (`0x34` right / `0x35` left) with hardware shutdown pins on GPIO 48 and GPIO 59.
-3. **WCN3990 Connectivity Radio:**
+3. **WCN3990 Connectivity Radio & ath10k Shim:**
    - Hardware power-on via `cnss_wlan_en` (GPIO 84) output drive, and MSA memory window preparation for firmware load (`wlanmdsp.mbn`).
    - **Blair-specific boot path**: `whole_thread()` now selects step sequence `{1,2,6,7,8,12,13,14,15}` for Blair/WCN3990, skipping WPSS image write (step 9), SMP2P (step 10), and TrustZone `SCM_PAS_AUTH_AND_RESET` with `PAS_WPSS` (step 11) — the DSP is started directly via ICNSS registers in step 8.
-4. **AW86927 Haptics:**
+   - **ath10k integration**: Added `wifi/lx/src/lx_bus_ath10k.c` and `tools/mk-ath10k.sh` for linking ath10k directly into the kernel image via `xnu-build.sh`.
+   - **WLFW exchange updates**: Handles QMI MSA info (`0x2d`), MSA ready (`0x2e`), calibration reports (`0x26`), and automatic fallback to board ID 0 for raw BDF bin (`bdwlan_malmo_ipa.bin`).
+4. **AW86927 Haptics Tuning:**
    - Full Android `haptic_hv_hw_reset()` sequence: GPIO 89 LOW 5 ms → HIGH → 15 ms settle, then I2C on SE8 (GPIO 19/20).
+   - Dynamic `reset_egpio_bit()` logic to preserve `EGPIO_ENABLE` (bit 12) whenever `EGPIO_PRESENT` (bit 11) is active on the TLMM GPIO line.
    - PMIC PM7250B vibrator LDO (channel 390 / 0x5300) enabled at 3.0V before reset release.
-   - RAM waveforms loaded from `fw-haptic/haptic_ram.bin` with checksum verification.
-5. **MPSS & IPA v4.5 (`drivers/modem/hakios.mpss.c`):**
+   - Configured boost on `PLAYCFG1` (`0xd0`), max output gain (`0xff`), and verified both RAM waveforms and continuous 250 ms vibration bursts.
+5. **SpringBoard & PosterBoard Wallpaper Compositing:**
+   - On iOS 16, PosterBoard runs in an independent userland process hosted inside SpringBoard. Due to OpenGL ES / freedreno offscreen compositing constraints with `CALayerHost`, long-press poster switching is intercepted (`_allowsCapabilityPosterSwitcherWithExplanation:` returns `NO`) to prevent black screen lockups.
+   - Poster collections and templates via ExtensionKit start in background speculative QoS (~400s after initial boot settling).
+   - Use `wallpaper_freeze=1` in boot-args to snapshot the active framebuffer as a static cached wallpaper for the home screen.
+6. **MPSS & IPA v4.5 (`drivers/modem/hakios.mpss.c`):**
    - **RPM-SMD GLINK (`rpm_requests`)**: `blair_rpm_enable_ipa_clk()` reuses UEFI's open `rpm_requests` GLINK channel over IPCC, requests `IPA_CLK` (`100 MHz`) and votes for `snoc` (`200 MHz`), `bimc` (`400 MHz`), and `cnoc` (`100 MHz`) across `set=0` (active) and `set=1` (sleep).
    - **IPA v4.5 hardware & memory**: Probes `0x05840000` (`ipa_regs_find()`) and initializes 12,288 bytes (`0x600`) of IPA shared memory (`0x54`).
    - **SMMU Context 4**: `ipa_space_on()` supports Blair's 512 KB SMMU (`idr1 = 0x50000030`) and maps streams `0x4a0..0x4a3`.
