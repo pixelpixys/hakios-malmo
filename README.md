@@ -5,7 +5,7 @@
 
 ---
 
-## 📊 Overall Porting Progress: **~90% Complete**
+## 📊 Overall Porting Progress: **~93% Complete**
 
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
@@ -23,7 +23,7 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 | **Physical Buttons** | ✅ Working | 100% | Power and Volume (+/-) via PMIC PON driver |
 | **Haptics / Vibration** | ✅ Working | 95% | Awinic AW86927: EGPIO reset bit logic, boost 0xd0 (vmax 8500 mV), max gain 0xff, RAM waveforms + CONT buzz |
 | **Audio / Speakers** | 🟡 In Progress | 82% | FourSemi FS1815: GPIO4/5 bit-bang I2C, ADSP TZ auth, Blair stream `0xa1`, fastrpc SMMU early page |
-| **Wi-Fi** | 🟡 In Progress | 82% | WCN3990 (SNOC) + ath10k shim: WLFW QMI exchange, MSA info/ready, CAL report, BDF bin loading |
+| **Wi-Fi** | ✅ Working | 100% | WCN3990 (SNOC) + ath10k shim: full stack operational, WLFW handshake, scanning, association & network working |
 | **Bluetooth** | 🟡 In Progress | 45% | WCN3990 UART / QCA coex (GPIO 69), driver under active development |
 | **Cellular Modem (LTE/5G) / MPSS** | 🟡 In Progress | 45% | MPSS boots (`smem_lock=0x343000`), RPM GLINK `IPA_CLK` (100 MHz) + `snoc/bimc/cnoc` votes, IPA v4.5 (`0x05840000`) & 512KB SMMU (`0x4a0..0x4a3`); debugging hang when `ipa_fw=1` + MPSS run together |
 | **PosterBoard / Wallpapers** | 🟡 Partial | 70% | Lock screen wallpaper renders; poster switcher hook returns `NO` (avoids black screen compositing bug); ExtensionKit posters load in background (~400s); home screen freeze via `wallpaper_freeze=1` |
