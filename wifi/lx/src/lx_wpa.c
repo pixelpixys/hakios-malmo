@@ -424,12 +424,12 @@ group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_
 			break;				/* (padding from here on) */
 		}
 		/*
-		 * Only a CCMP group key is joined (protection() in lx_80211.c), so the key is 16 bytes -- the length key_set() copies --
-		 * and its number is 1 to 3 (IEEE 802.11-2020, 12.7.2: number 0 is the pairwise key's): a KDE of another length or number
-		 * is not installed with stale bytes of `group` filling it out.
+		 * CCMP (16 bytes) or TKIP (32 bytes) group key (protection() in lx_80211.c), and its number is 1 to 3
+		 * (IEEE 802.11-2020, 12.7.2: number 0 is the pairwise key's): a KDE of another length or number is not
+		 * installed with stale bytes of `group` filling it out.
 		 */
 		if (e[0] == 0xdd && e[1] >= 6 + 5 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
-		    e[1] - 6u == 16 && (e[6] & 3) != 0) {
+		    (e[1] - 6u == 16 || e[1] - 6u == 32) && (e[6] & 3) != 0) {
 			wpa->group_index = e[6] & 3;
 			wpa->group_length = e[1] - 6u;
 			memcpy(wpa->group, e + 8, wpa->group_length);

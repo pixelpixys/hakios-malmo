@@ -59,6 +59,20 @@ hakios_wlfw_stop(__unused uint32_t step)
 {
 }
 
+static bool mission(void);
+
+int
+lx_os_wlfw_wlan_enable(void)
+{
+	return -ENODEV;
+}
+
+int
+lx_os_wlfw_wlan_disable(void)
+{
+	return -ENODEV;
+}
+
 bool
 hakios_wlfw_exchange(uint32_t step)
 {
@@ -74,15 +88,21 @@ hakios_wlfw_exchange(uint32_t step)
 
 #define MODE_COLD_BOOT          7               /* core.h: ATH11K_FIRMWARE_MODE_COLD_BOOT */
 #define ATH11K_FIRMWARE_MODE_NORMAL 0           /* core.h: the mode "mission" */
+#define QMI_WLANFW_MSA_INFO_REQ_V01  0x0026
+#define QMI_WLANFW_CAL_REPORT_REQ_V01 0x0026
+#define QMI_WLANFW_MSA_READY_REQ_V01 0x002E
+#define QMI_WLANFW_MSA_READY_IND_V01 0x0028
 
 static struct qmi_handle handle;
 static bool handle_open, in_mission;
 static uint64_t registers_at;           /* where the firmware said the radio's registers are, and ... */
 static uint32_t registers_size;         /* ... how many bytes of them; 0: it has not said */
 static struct {
-	volatile bool server, gone, init_done, ready, cal_done;
-	uint64_t began, init_done_at, ready_at, cal_done_at;
+	volatile bool server, gone, init_done, ready, cal_done, req_mem, mem_ready, msa_ready;
+	bool is_blair;
+	uint64_t began, init_done_at, ready_at, cal_done_at, req_mem_at, mem_ready_at, msa_ready_at;
 	uint32_t step;
+	struct qmi_wlanfw_request_mem_ind_msg_v01 req_mem_msg;
 } wlfw;
 
 static uint64_t
@@ -98,7 +118,9 @@ now_ms(void)
 static int
 wlfw_new_server(struct qmi_handle *qmi, struct qmi_service *service)
 {
-	int error = hakios_qmi_connect(qmi->sock, service->node, service->port);
+	int error;
+
+	error = hakios_qmi_connect(qmi->sock, service->node, service->port);
 
 	say("wifi: %u: the service is at node %u port %u (service %#x, version %u, instance %u)%s\n", wlfw.step, service->node,
 	    service->port, service->service, service->version, service->instance, error ? ": CANNOT BE CONNECTED TO" : "");
@@ -142,8 +164,37 @@ wlfw_cal_done(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq
 	wlfw_indication(&wlfw.cal_done, &wlfw.cal_done_at, "cold boot calibration done", QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01);
 }
 
+static void
+wlfw_request_mem(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
+    const void *decoded)
+{
+	if (decoded != NULL) {
+		wlfw.req_mem_msg = *(const struct qmi_wlanfw_request_mem_ind_msg_v01 *)decoded;
+	}
+	wlfw_indication(&wlfw.req_mem, &wlfw.req_mem_at, "request mem", QMI_WLFW_REQUEST_MEM_IND_V01);
+	if (decoded != NULL) {
+		for (uint32_t i = 0; i < wlfw.req_mem_msg.mem_seg_len && i < ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01; i++) {
+			say("wifi: %u:   mem_seg[%u]: size %#x, type %u\n", wlfw.step, i,
+			    wlfw.req_mem_msg.mem_seg[i].size, wlfw.req_mem_msg.mem_seg[i].type);
+		}
+	}
+}
+
+static void
+wlfw_mem_ready(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
+    __unused const void *decoded)
+{
+	wlfw_indication(&wlfw.mem_ready, &wlfw.mem_ready_at, "fw mem ready", QMI_WLFW_FW_MEM_READY_IND_V01);
+}
+
+static void
+wlfw_msa_ready(__unused struct qmi_handle *qmi, __unused struct sockaddr_qrtr *sq, __unused struct qmi_txn *txn,
+    __unused const void *decoded)
+{
+	wlfw_indication(&wlfw.msa_ready, &wlfw.msa_ready_at, "msa ready", QMI_WLANFW_MSA_READY_IND_V01);
+}
+
 static const struct qmi_ops wlfw_ops = { .new_server = wlfw_new_server, .del_server = wlfw_del_server };
-/* (qmi.c's own table has two more, for memory the firmware asks for: this chip's does not) */
 static const struct qmi_msg_handler wlfw_handlers[] = {
 	{ QMI_INDICATION, QMI_WLFW_FW_READY_IND_V01, qmi_wlanfw_fw_ready_ind_msg_v01_ei,
 	  sizeof(struct qmi_wlanfw_fw_ready_ind_msg_v01), wlfw_ready },
@@ -151,6 +202,12 @@ static const struct qmi_msg_handler wlfw_handlers[] = {
 	  sizeof(struct qmi_wlanfw_fw_cold_cal_done_ind_msg_v01), wlfw_cal_done },
 	{ QMI_INDICATION, QMI_WLFW_FW_INIT_DONE_IND_V01, qmi_wlfw_fw_init_done_ind_msg_v01_ei,
 	  sizeof(struct qmi_wlfw_fw_init_done_ind_msg_v01), wlfw_init_done },
+	{ QMI_INDICATION, QMI_WLFW_REQUEST_MEM_IND_V01, qmi_wlanfw_request_mem_ind_msg_v01_ei,
+	  sizeof(struct qmi_wlanfw_request_mem_ind_msg_v01), wlfw_request_mem },
+	{ QMI_INDICATION, QMI_WLFW_FW_MEM_READY_IND_V01, qmi_wlanfw_mem_ready_ind_msg_v01_ei,
+	  sizeof(struct qmi_wlanfw_fw_mem_ready_ind_msg_v01), wlfw_mem_ready },
+	{ QMI_INDICATION, QMI_WLANFW_MSA_READY_IND_V01, qmi_wlanfw_fw_ready_ind_msg_v01_ei,
+	  sizeof(struct qmi_wlanfw_fw_ready_ind_msg_v01), wlfw_msa_ready },
 	{ 0 },
 };
 
@@ -229,14 +286,17 @@ send_file(const char *what, const char *name, uint8_t type, uint32_t board_id)
 		request.file_id_valid = 1;
 		request.file_id = board_id;
 		request.total_size_valid = 1;
-		request.total_size = left;
+		request.total_size = (board_id == 0) ? (uint32_t)size : left;
 		request.seg_id_valid = 1;
 		request.data_valid = 1;
 		request.bdf_type = type;
 		request.bdf_type_valid = 1;
 		request.end_valid = 1;
-		request.end = left <= QMI_WLANFW_MAX_DATA_SIZE_V01;
-		request.data_len = request.end ? left : QMI_WLANFW_MAX_DATA_SIZE_V01;
+		{
+			uint32_t max_chunk = (board_id == 0) ? 2048u : QMI_WLANFW_MAX_DATA_SIZE_V01;
+			request.end = left <= max_chunk;
+			request.data_len = request.end ? left : max_chunk;
+		}
 		memcpy(request.data, data, request.data_len);
 		bzero(&reply, sizeof(reply));
 		if (!ask(what, QMI_WLANFW_BDF_DOWNLOAD_REQ_V01, QMI_WLANFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_LEN,
@@ -274,17 +334,15 @@ hakios_wlfw_registers(uint64_t *address, uint32_t *size, bool *mission)
 static bool ask(const char *what, int message, size_t largest, const struct qmi_elem_info *request_ei, const void *request,
     const struct qmi_elem_info *reply_ei, void *reply, bool quiet);
 
-/* ath11k_qmi_firmware_stop(): the mode "off"; and our handle given up. Before the DSP is stopped, while the link is up. */
-void
-hakios_wlfw_stop(uint32_t step)
+int
+lx_os_wlfw_wlan_disable(void)
 {
 	struct qmi_wlanfw_wlan_mode_req_msg_v01 mode;
 	struct qmi_wlanfw_wlan_mode_resp_msg_v01 mode_reply;
 
 	if (!handle_open) {
-		return;
+		return -ENODEV;
 	}
-	wlfw.step = step;
 	if (in_mission) {
 		bzero(&mode, sizeof(mode));
 		bzero(&mode_reply, sizeof(mode_reply));
@@ -294,6 +352,33 @@ hakios_wlfw_stop(uint32_t step)
 		    qmi_wlanfw_wlan_mode_req_msg_v01_ei, &mode, qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &mode_reply, false);
 		in_mission = false;
 	}
+	return 0;
+}
+
+static bool mission(void);
+
+int
+lx_os_wlfw_wlan_enable(void)
+{
+	if (!handle_open) {
+		return -ENODEV;
+	}
+	if (in_mission) {
+		return 0;
+	}
+	in_mission = mission();
+	return in_mission ? 0 : -EIO;
+}
+
+/* ath11k_qmi_firmware_stop(): the mode "off"; and our handle given up. Before the DSP is stopped, while the link is up. */
+void
+hakios_wlfw_stop(uint32_t step)
+{
+	if (!handle_open) {
+		return;
+	}
+	wlfw.step = step;
+	(void)lx_os_wlfw_wlan_disable();
 	qmi_handle_release(&handle);
 	handle_open = false;
 }
@@ -327,28 +412,85 @@ mission(void)
 	bzero(&cfg_reply, sizeof(cfg_reply));
 	cfg.host_version_valid = 1;
 	strlcpy(cfg.host_version, ATH11K_HOST_VERSION_STRING, sizeof(cfg.host_version));
-	cfg.tgt_cfg_valid = 1;
-	cfg.tgt_cfg_len = WLFW_PIPE_COUNT;
-	for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
-		cfg.tgt_cfg[i].pipe_num = WLFW_PIPES[i].pipenum;
-		cfg.tgt_cfg[i].pipe_dir = WLFW_PIPES[i].pipedir;
-		cfg.tgt_cfg[i].nentries = WLFW_PIPES[i].nentries;
-		cfg.tgt_cfg[i].nbytes_max = WLFW_PIPES[i].nbytes_max;
-		cfg.tgt_cfg[i].flags = WLFW_PIPES[i].flags;
+	if (wlfw.is_blair) {
+		static const struct ce_pipe_config blair_pipes[] = {
+			{ 0, PIPEDIR_OUT, 32, 2048, CE_ATTR_FLAGS, 0 },
+			{ 1, PIPEDIR_IN, 32, 2048, CE_ATTR_FLAGS, 0 },
+			{ 2, PIPEDIR_IN, 64, 2048, CE_ATTR_FLAGS, 0 },
+			{ 3, PIPEDIR_OUT, 32, 2048, CE_ATTR_FLAGS, 0 },
+			{ 4, PIPEDIR_OUT, 512, 256, CE_ATTR_FLAGS, 0 },
+			{ 5, PIPEDIR_OUT, 1024, 64, CE_ATTR_FLAGS | CE_ATTR_DIS_INTR, 0 },
+			{ 6, PIPEDIR_INOUT, 32, 16384, CE_ATTR_FLAGS, 0 },
+			{ 7, 4, 0, 0, CE_ATTR_FLAGS | CE_ATTR_DIS_INTR, 0 },
+			{ 8, PIPEDIR_IN, 32, 2048, 0, 0 },
+			{ 9, PIPEDIR_IN, 32, 2048, CE_ATTR_FLAGS, 0 },
+			{ 10, PIPEDIR_IN, 32, 2048, CE_ATTR_FLAGS, 0 },
+			{ 11, PIPEDIR_IN, 32, 2048, CE_ATTR_FLAGS, 0 },
+		};
+		static const struct service_to_pipe blair_services[] = {
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_VO, PIPEDIR_OUT, 3 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_VO, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_BK, PIPEDIR_OUT, 3 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_BK, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_BE, PIPEDIR_OUT, 3 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_BE, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_VI, PIPEDIR_OUT, 3 },
+			{ ATH11K_HTC_SVC_ID_WMI_DATA_VI, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_WMI_CONTROL, PIPEDIR_OUT, 3 },
+			{ ATH11K_HTC_SVC_ID_WMI_CONTROL, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_RSVD_CTRL, PIPEDIR_OUT, 0 },
+			{ ATH11K_HTC_SVC_ID_RSVD_CTRL, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_TEST_RAW_STREAMS, PIPEDIR_OUT, 0 },
+			{ ATH11K_HTC_SVC_ID_TEST_RAW_STREAMS, PIPEDIR_IN, 2 },
+			{ ATH11K_HTC_SVC_ID_HTT_DATA_MSG, PIPEDIR_OUT, 4 },
+			{ ATH11K_HTC_SVC_ID_HTT_DATA_MSG, PIPEDIR_IN, 1 },
+		};
+
+		cfg.tgt_cfg_valid = 1;
+		cfg.tgt_cfg_len = sizeof(blair_pipes) / sizeof(blair_pipes[0]);
+		for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
+			cfg.tgt_cfg[i].pipe_num = blair_pipes[i].pipenum;
+			cfg.tgt_cfg[i].pipe_dir = blair_pipes[i].pipedir;
+			cfg.tgt_cfg[i].nentries = blair_pipes[i].nentries;
+			cfg.tgt_cfg[i].nbytes_max = blair_pipes[i].nbytes_max;
+			cfg.tgt_cfg[i].flags = blair_pipes[i].flags;
+		}
+		cfg.svc_cfg_valid = 1;
+		cfg.svc_cfg_len = sizeof(blair_services) / sizeof(blair_services[0]);
+		for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
+			cfg.svc_cfg[i].service_id = blair_services[i].service_id;
+			cfg.svc_cfg[i].pipe_dir = blair_services[i].pipedir;
+			cfg.svc_cfg[i].pipe_num = blair_services[i].pipenum;
+		}
+		say("wifi: %u: the configuration: host version \"%s\", %u pipes and %u services from ath10k's WCN3990 tables; "
+		    "shadow registers: none\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len);
+	} else {
+		cfg.tgt_cfg_valid = 1;
+		cfg.tgt_cfg_len = WLFW_PIPE_COUNT;
+		for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
+			cfg.tgt_cfg[i].pipe_num = WLFW_PIPES[i].pipenum;
+			cfg.tgt_cfg[i].pipe_dir = WLFW_PIPES[i].pipedir;
+			cfg.tgt_cfg[i].nentries = WLFW_PIPES[i].nentries;
+			cfg.tgt_cfg[i].nbytes_max = WLFW_PIPES[i].nbytes_max;
+			cfg.tgt_cfg[i].flags = WLFW_PIPES[i].flags;
+		}
+		cfg.svc_cfg_valid = 1;
+		cfg.svc_cfg_len = WLFW_SERVICE_COUNT;
+		for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
+			cfg.svc_cfg[i].service_id = WLFW_SERVICES[i].service_id;
+			cfg.svc_cfg[i].pipe_dir = WLFW_SERVICES[i].pipedir;
+			cfg.svc_cfg[i].pipe_num = WLFW_SERVICES[i].pipenum;
+		}
+		say("wifi: %u: the configuration: host version \"%s\", %u pipes and %u services from ath11k's tables for this chip; "
+		    "shadow registers: none%s\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len, WLFW_SHADOW_REGISTERS ?
+		    " (ath11k SENDS A LIST of up to 36 here)" : "");
 	}
-	cfg.svc_cfg_valid = 1;
-	cfg.svc_cfg_len = WLFW_SERVICE_COUNT;
-	for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
-		cfg.svc_cfg[i].service_id = WLFW_SERVICES[i].service_id;
-		cfg.svc_cfg[i].pipe_dir = WLFW_SERVICES[i].pipedir;
-		cfg.svc_cfg[i].pipe_num = WLFW_SERVICES[i].pipenum;
-	}
-	say("wifi: %u: the configuration: host version \"%s\", %u pipes and %u services from ath11k's tables for this chip; "
-	    "shadow registers: none%s\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len, WLFW_SHADOW_REGISTERS ?
-	    " (ath11k SENDS A LIST of up to 36 here)" : "");
 	if (!ask("the configuration", QMI_WLANFW_WLAN_CFG_REQ_V01, QMI_WLANFW_WLAN_CFG_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_wlan_cfg_req_msg_v01_ei, &cfg, qmi_wlanfw_wlan_cfg_resp_msg_v01_ei, &cfg_reply, false)) {
-		return false;
+		if (!wlfw.is_blair) {
+			return false;
+		}
+		say("wifi: %u: Blair/WCN3990: WLAN_CFG skipped, trying WLAN_MODE_NORMAL directly\n", wlfw.step);
 	}
 	bzero(&mode, sizeof(mode));
 	bzero(&mode_reply, sizeof(mode_reply));
@@ -391,6 +533,7 @@ hakios_wlfw_exchange(uint32_t step)
 	bzero(&wlfw, sizeof(wlfw));
 	wlfw.step = step;
 	wlfw.began = now_ms();
+	wlfw.is_blair = is_blair;
 	PE_parse_boot_argn("wifi_cal", &calibrate, sizeof(calibrate));
 	PE_parse_boot_argn("wifi_ready", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("wifi_mission", &to_mission, sizeof(to_mission));
@@ -418,6 +561,16 @@ hakios_wlfw_exchange(uint32_t step)
 	indications.cal_done_enable = 1;
 	indications.fw_init_done_enable_valid = 1;
 	indications.fw_init_done_enable = 1;
+	if (is_blair) {
+		indications.msa_ready_enable_valid = 1;
+		indications.msa_ready_enable = 1;
+		indications.pin_connect_result_enable_valid = 1;
+		indications.pin_connect_result_enable = 1;
+		indications.request_mem_enable_valid = 1;
+		indications.request_mem_enable = 1;
+		indications.fw_mem_ready_enable_valid = 1;
+		indications.fw_mem_ready_enable = 1;
+	}
 	if (!ask("which indications we want", QMI_WLANFW_IND_REGISTER_REQ_V01, QMI_WLANFW_IND_REGISTER_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_ind_register_req_msg_v01_ei, &indications, qmi_wlanfw_ind_register_resp_msg_v01_ei, &indications_reply,
 	    false)) {
@@ -437,10 +590,52 @@ hakios_wlfw_exchange(uint32_t step)
 	host.bdf_support_valid = 1;
 	host.bdf_support = 1;
 	host.cal_done_valid = 1;
-	host.cal_done = 0;
+	host.cal_done = 1;
 	if (!ask("what the host can do", QMI_WLANFW_HOST_CAP_REQ_V01, QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_host_cap_req_msg_v01_ei, &host, qmi_wlanfw_host_cap_resp_msg_v01_ei, &host_reply, false)) {
 		goto out;
+	}
+
+	if (is_blair) {
+		struct {
+			uint64_t msa_addr;
+			uint32_t msa_size;
+		} msa_info;
+		struct qmi_wlanfw_wlan_mode_resp_msg_v01 msa_info_reply;
+		struct qmi_wlanfw_cap_req_msg_v01 msa_ready_req;
+		struct qmi_wlanfw_wlan_mode_resp_msg_v01 msa_ready_reply;
+		static const struct qmi_elem_info msa_info_ei[] = {
+			{
+				.data_type = QMI_UNSIGNED_8_BYTE,
+				.elem_len = 1,
+				.elem_size = sizeof(uint64_t),
+				.array_type = NO_ARRAY,
+				.tlv_type = 0x01,
+				.offset = offsetof(typeof(msa_info), msa_addr),
+			},
+			{
+				.data_type = QMI_UNSIGNED_4_BYTE,
+				.elem_len = 1,
+				.elem_size = sizeof(uint32_t),
+				.array_type = NO_ARRAY,
+				.tlv_type = 0x02,
+				.offset = offsetof(typeof(msa_info), msa_size),
+			},
+			{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+		};
+
+		wait_for(&wlfw.req_mem, 1000);
+		bzero(&msa_info, sizeof(msa_info));
+		bzero(&msa_info_reply, sizeof(msa_info_reply));
+		msa_info.msa_addr = 0x86500000ull;
+		msa_info.msa_size = 0x100000u;
+		if (ask("MSA info (0x2d)", 0x002du, 32, msa_info_ei, &msa_info,
+		    qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &msa_info_reply, false)) {
+			bzero(&msa_ready_req, sizeof(msa_ready_req));
+			bzero(&msa_ready_reply, sizeof(msa_ready_reply));
+			ask("MSA ready (0x2e)", QMI_WLANFW_MSA_READY_REQ_V01, 32, qmi_wlanfw_cap_req_msg_v01_ei,
+			    &msa_ready_req, qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &msa_ready_reply, false);
+		}
 	}
 
 	/* ath11k_qmi_request_target_cap() */
@@ -494,9 +689,10 @@ hakios_wlfw_exchange(uint32_t step)
 	 * Redwood / Poco X5 Pro: regdb_xiaomi.bin and bd_m20gl.elf (WCN6750 BDF).
 	 */
 	if (is_blair) {
-		send_file("the regulatory database", "regdb.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
-		/* malmo's BDF is a raw bdwlan image, not an ELF blob (ath11k's qmi.h: BIN is 0, ELF is 1) */
-		board = send_file("the board's data", "bdwlan_malmo_ipa.bin", ATH11K_QMI_BDF_TYPE_BIN, board_id);
+		uint32_t blair_bid = target.board_info_valid ? board_id : 0;
+		/* On WCN3990 / ICNSS, board_id is not reported in CAP_RESP; try file_id=0 */
+		send_file("the regulatory database", "regdb.bin", ATH11K_QMI_BDF_TYPE_REGDB, blair_bid);
+		board = send_file("the board's data", "bdwlan_malmo_ipa.bin", ATH11K_QMI_BDF_TYPE_BIN, blair_bid);
 	} else {
 		send_file("the regulatory database", "regdb_xiaomi.bin", ATH11K_QMI_BDF_TYPE_REGDB, board_id);
 		board = send_file("the board's data", "bd_m20gl.elf", ATH11K_QMI_BDF_TYPE_ELF, board_id);
@@ -505,6 +701,60 @@ hakios_wlfw_exchange(uint32_t step)
 		goto out;
 	}
 	far = true;
+
+	if (is_blair) {
+		struct {
+			uint8_t meta_data_valid;
+			uint32_t meta_data_len;
+			uint32_t meta_data[1];
+		} cal_report;
+		struct qmi_wlanfw_m3_info_resp_msg_v01 cal_reply;
+		static const struct qmi_elem_info cal_report_ei[] = {
+			{
+				.data_type = QMI_DATA_LEN,
+				.elem_len = 1,
+				.elem_size = sizeof(uint8_t),
+				.array_type = NO_ARRAY,
+				.tlv_type = 0x01,
+				.offset = offsetof(typeof(cal_report), meta_data_len),
+			},
+			{
+				.data_type = QMI_UNSIGNED_4_BYTE,
+				.elem_len = 1,
+				.elem_size = sizeof(uint32_t),
+				.array_type = VAR_LEN_ARRAY,
+				.tlv_type = 0x01,
+				.offset = offsetof(typeof(cal_report), meta_data),
+			},
+			{ .data_type = QMI_EOTI, .array_type = NO_ARRAY, .tlv_type = QMI_COMMON_TLV_TYPE },
+		};
+
+		memset(&cal_report, 0, sizeof(cal_report));
+		ask("calibration report (0x26)", 0x0026u, sizeof(cal_report), cal_report_ei, &cal_report,
+		    qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &cal_reply, false);
+		if (!wlfw.ready && !wlfw.init_done) {
+			say("wifi: %u: Blair/WCN3990: waiting up to 3s for FW_READY_IND / FW_INIT_DONE_IND after CAL_REPORT...\n", step);
+			wait_for(&wlfw.ready, 3000);
+		}
+		in_mission = mission();
+		if (in_mission && !wlfw.ready) {
+			wait_for(&wlfw.ready, 2000);
+		}
+		if (!in_mission) {
+			bzero(&mode, sizeof(mode));
+			bzero(&mode_reply, sizeof(mode_reply));
+			mode.mode = MODE_COLD_BOOT;
+			mode.hw_debug_valid = 1;
+			mode.hw_debug = 0;
+			if (ask("the mode: cold-boot calibration (Blair)", QMI_WLANFW_WLAN_MODE_REQ_V01,
+			    QMI_WLANFW_WLAN_MODE_REQ_MSG_V01_MAX_LEN, qmi_wlanfw_wlan_mode_req_msg_v01_ei,
+			    &mode, qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &mode_reply, false)) {
+				wait_for(&wlfw.cal_done, 5000);
+				wait_for(&wlfw.ready, 1000);
+			}
+		}
+		goto out;
+	}
 
 	if (!wait_for(&wlfw.init_done, 10000)) {
 		say("wifi: %u: NO \"FIRMWARE INIT DONE\" within 10 s of the board's data\n", step);
@@ -562,7 +812,7 @@ out:
 		qmi_handle_release(&handle);
 		handle_open = false;
 	}
-	return far && wlfw.init_done;
+	return far && (wlfw.init_done || in_mission);
 }
 
 #endif

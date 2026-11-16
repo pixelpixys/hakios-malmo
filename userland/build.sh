@@ -495,6 +495,8 @@ for fw_dir in ../fw-wifi fw-wifi; do
 		install -m 0644 "$fw_dir/wlanmdsp.mbn" root/fw/
 		[ -f "$fw_dir/bdwlan_malmo_ipa.bin" ] && install -m 0644 "$fw_dir/bdwlan_malmo_ipa.bin" root/fw/
 		[ -f "$fw_dir/regdb.bin" ] && install -m 0644 "$fw_dir/regdb.bin" root/fw/
+		rm -f root/fw/network
+		if [ -z "$SHARE" ] && [ -f "$fw_dir/network" ]; then install -m 0600 "$fw_dir/network" root/fw/; fi
 		break
 	fi
 done

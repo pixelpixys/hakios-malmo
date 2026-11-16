@@ -70,6 +70,24 @@ of_property_read_bool(const struct device_node *np, const char *name)
 	return (of_find_property(np, name, NULL) != NULL);
 }
 
+static inline int
+of_property_read_u8(const struct device_node *np, const char *name, u8 *out)
+{
+	return (-EINVAL);
+}
+
+static inline int
+of_property_read_u8_array(const struct device_node *np, const char *name, u8 *out, size_t sz)
+{
+	return (-EINVAL);
+}
+
+static inline int
+of_property_read_string_index(const struct device_node *np, const char *name, int index, const char **out)
+{
+	return (-EINVAL);
+}
+
 /* the nodes live as long as the layer does */
 static inline struct device_node *of_node_get(struct device_node *np) { return (np); }
 static inline void of_node_put(struct device_node *np) { }

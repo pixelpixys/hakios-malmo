@@ -302,12 +302,12 @@ get(struct apple80211req *request)
 		/*
 		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
 		 * bits alone, from the first (the framework hands in a buffer that begins after the old
-		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
-		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
-		 * for a WPA2 network ("Unable to join").
+		 * header's version word). TKIP, AES, AES-CCM, power management, short slot and preamble,
+		 * TKIP-MIC, WPA2, WME, short guard interval at 20 MHz. Read wrong, the framework sees no
+		 * TKIP/WPA2 and builds no join ("Unable to join").
 		 */
 		uint8_t bits[13] = { 0 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 14, 17, 19 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
@@ -518,8 +518,10 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	struct hakios_sta_join *what;
 	int error;
 
+	said[0] = '\0';
 	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
-		return EINVAL;
+		error = EINVAL;
+		goto out_log;
 	}
 	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
@@ -564,6 +566,8 @@ out:
 		memset_s(what, sizeof(*what), 0, sizeof(*what));
 		kfree_data(what, sizeof(*what));
 	}
+out_log:
+	printf("apple80211: set_join%s (len %u) -> %d\n", said, request->req_len, error);
 	return error;
 }
 

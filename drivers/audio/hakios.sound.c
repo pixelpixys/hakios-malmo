@@ -79,6 +79,15 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/hakios.audio.h>
+
+extern vm_offset_t pe_arm_get_soc_base_phys(void);
+#define HAKIOS_SOC_BASE_BLAIR   0x00200000ul
+
+static inline bool
+is_blair(void)
+{
+	return pe_arm_get_soc_base_phys() == HAKIOS_SOC_BASE_BLAIR;
+}
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -226,6 +235,9 @@ static bool pins_taken;
 static void
 pins_on(void)
 {
+	if (is_blair()) {
+		return;
+	}
 	for (unsigned i = 0; i < TDM_PINS; i++) {
 		found_cfg[i] = get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
 		found_io[i] = get(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin));
@@ -525,7 +537,7 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PTE_ADDRESS             0x0000fffffffff000ull
 #define AUDIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* as hakios.wifi.c's */
 
-#define AUDIO_STREAM            0x1801
+#define AUDIO_STREAM            (is_blair() ? 0xa1u : 0x1801u)
 #define AUDIO_ADDRESSES         0x10000000ull   /* dt: qcom,iommu-dma-addr-pool of qcom,msm-audio-ion */
 #define AUDIO_STREAM_BITS       (1ull << 32)    /* the stream's low bits (0x1801 & 0xf), where the DSP takes them from */
 
@@ -1399,7 +1411,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
-	if (level >= 3) {
+	if (level >= 3 && !is_blair()) {
 		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
 		if (acf == NULL) {
 			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
@@ -1417,16 +1429,20 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		hakios_adsp_apr_events(events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
-	pins_on();
+	if (!is_blair()) {
+		announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+		pins_on();
+	}
 	if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	if (!is_blair()) {
+		pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
+		pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
+		say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
+		    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	}
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
@@ -1501,6 +1517,9 @@ hakios_sound_dsp_up(void)
 
 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
 		return;
+	}
+	if (is_blair()) {
+		apps_smmu.phys = 0x0c600000;
 	}
 	if (level > 4) {
 		level = 4;

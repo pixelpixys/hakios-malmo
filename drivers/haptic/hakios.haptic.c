@@ -242,12 +242,18 @@ show_pins(void)
 
 static bool level_of(unsigned pin);
 
+static uint32_t
+reset_egpio_bit(void)
+{
+	return (rd(GPIO_CFG(PIN_RESET)) & 0x800u) ? 0x1000u : 0u;
+}
+
 static void
 reset_pin(bool high)
 {
 	wr(GPIO_IO(PIN_RESET), high ? 2 : 0);
-	/* Explicitly clear func bits [5:2] = 0, set drive 16mA (7<<6) and pull-up (3) */
-	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_PULL_UP | (7u << 6));
+	/* Explicitly clear func bits [5:2] = 0, set drive 16mA (7<<6) and pull-up (3); set EGPIO_ENABLE (0x1000) if EGPIO_PRESENT (0x800) */
+	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_PULL_UP | (7u << 6) | reset_egpio_bit());
 	released = high;
 }
 
@@ -264,13 +270,15 @@ release_and_look(unsigned attempt)
 	unsigned pull_up, driven;
 	uint32_t pull_up_cfg, driven_cfg, driven_io;
 
+	uint32_t egpio = reset_egpio_bit();
+
 	wr(GPIO_IO(PIN_RESET), 0);
-	wr(GPIO_CFG(PIN_RESET), CFG_PULL_UP);
+	wr(GPIO_CFG(PIN_RESET), CFG_PULL_UP | egpio);
 	spin_us(200);
 	pull_up_cfg = rd(GPIO_CFG(PIN_RESET));
 	pull_up = level_of(PIN_RESET);
 	wr(GPIO_IO(PIN_RESET), 2);
-	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_PULL_UP | (7u << 6));
+	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT | CFG_PULL_UP | (7u << 6) | egpio);
 	spin_us(200);
 	driven_cfg = rd(GPIO_CFG(PIN_RESET));
 	driven_io = rd(GPIO_IO(PIN_RESET));
@@ -639,10 +647,12 @@ chip_answers(void)
  */
 static const uint8_t android_config[][2] = {
 	{ 0x03, 0x59 },         /* the interrupt mask */
-	{ 0x06, 0x50 },         /* PLAYCFG1: the boost in bypass, its voltage setting 0x50 (Android's vmax 8500 mV) */
+	{ 0x06, 0xd0 },         /* PLAYCFG1: boost on (0x80), voltage setting 0x50 (Android's vmax 8500 mV) */
 	{ 0x1a, 0x56 },         /* CONTCFG3 */
 	{ 0x1d, 0xff },         /* CONTCFG6: f0 tracking on, the first drive level 0x7f */
 	{ 0x1e, 0x59 },         /* CONTCFG7: the second drive level */
+	{ 0x20, 0x14 },
+	{ 0x22, 0x0f },
 	{ 0x2f, 0x46 },         /* the FIFO's thresholds */
 	{ 0x36, 0x02 }, { 0x37, 0x02 }, { 0x38, 0x02 },  /* the trigger pins' waveforms (the triggers stay off) */
 	{ 0x39, 0x00 }, { 0x3a, 0x00 },  /* ... and off */
@@ -790,9 +800,9 @@ play_effect(unsigned effect)
 	uint64_t began = mach_absolute_time(), ended;
 	bool done;
 
-	say("haptic: waveform %u is played once, at Android's gain %#x\n", effect, android_regs[AW_PLAYCFG2]);
+	say("haptic: waveform %u is played once, at max gain 0xff\n", effect);
 	if (!wait_standby(250) || !put(AW_PLAYCFG3, 0x04) || !put(AW_WAVCFG1, (uint8_t)effect) || !put(AW_WAVCFG2, 0x00) ||
-	    !put(AW_WAVCFG9, 0x00) || !put(AW_PLAYCFG2, android_regs[AW_PLAYCFG2]) || !healthy("before playing")) {
+	    !put(AW_WAVCFG9, 0x00) || !put(AW_PLAYCFG2, 0xff) || !healthy("before playing")) {
 		return false;
 	}
 	{
@@ -818,6 +828,17 @@ play_effect(unsigned effect)
 	}
 	say("haptic: the waveform has played: back in standby after %llu ms (states seen meanwhile: %#x, a bit each; 0 is "
 	    "standby)\n", ended / NSEC_PER_MSEC, states_seen);
+	/* Also test CONT mode buzz for 250 ms at max gain 0xff so the motor is unmistakably felt */
+	if (wait_standby(100) && put(AW_PLAYCFG3, 0x06) && put(AW_PLAYCFG2, 0xff)) {
+		uint8_t go = 0x01, stop = 0x02;
+
+		if (regs_write(AW_PLAYCFG4, &go, 1)) {
+			wait_ms(250);
+			(void)regs_write(AW_PLAYCFG4, &stop, 1);
+			(void)wait_standby(100);
+			say("haptic: CONT 250ms buzz done (states=%#x)\n", states_seen);
+		}
+	}
 	return healthy("after playing");
 }
 

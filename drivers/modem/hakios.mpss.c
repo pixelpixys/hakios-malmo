@@ -2601,8 +2601,48 @@ blair_rpm_enable_ipa_clk(void)
 				(void)rpm_pipe_write(&tx, &req, sizeof(req), NULL, 0);
 			}
 		}
+		{
+			/* Enable WCN3990 regulators via RPM-SMD (active set) */
+			struct {
+				uint16_t cmd, param1;
+				uint32_t param2;
+				uint32_t chunk, left;
+				uint32_t service_type, request_len;
+				uint32_t msg_id, set, resource_type, resource_id, data_len;
+				uint32_t k_en, l_en, v_en;
+				uint32_t k_uv, l_uv, v_uv;
+			} vreq = {
+				.cmd = 9, .param1 = 1, .param2 = tx_intent_id,
+				.chunk = 52, .left = 0,
+				.service_type = 0x00716572u, /* "req\0" */
+				.request_len = 44,
+				.set = 0, .data_len = 24,
+				.k_en = 0x6e657773u, .l_en = 4, .v_en = 1,   /* "swen" = 1 */
+				.k_uv = 0x00005675u, .l_uv = 4, .v_uv = 0,   /* "uV\0\0" */
+			};
+			static const struct {
+				uint32_t rtype, rid, uv;
+			} wlan_vregs[] = {
+				{ 0x61706d73u, 5,   952000 }, /* "smpa" 5: pm6125_s5 */
+				{ 0x616f646cu, 2,  1304000 }, /* "ldoa" 2: pm6125_l2 (vdd-1.3-rfa) */
+				{ 0x616f646cu, 16, 1800000 }, /* "ldoa" 16: pm6125_l16 (vdd-1.8-xo) */
+				{ 0x616f646cu, 21, 3000000 }, /* "ldoa" 21: pm6125_l21 (vdd-3.3-ch1) */
+				{ 0x616f646cu, 23, 3304000 }, /* "ldoa" 23: pm6125_l23 (vdd-3.3-ch0) */
+				{ 0x656f646cu, 2,   704000 }, /* "ldoe" 2: pmr735a_l2 (vdd-cx-mx) */
+			};
+			for (unsigned r = 0; r < sizeof(wlan_vregs) / sizeof(wlan_vregs[0]); r++) {
+				vreq.msg_id = 20 + r;
+				vreq.resource_type = wlan_vregs[r].rtype;
+				vreq.resource_id = wlan_vregs[r].rid;
+				vreq.v_uv = wlan_vregs[r].uv;
+				(void)rpm_pipe_write(&tx, &vreq, sizeof(vreq), NULL, 0);
+			}
+			printf("mpss: rpm: voted %u WCN3990 regulators on\n",
+			    (unsigned)(sizeof(wlan_vregs) / sizeof(wlan_vregs[0])));
+		}
 	}
-	for (unsigned ms = 0; ms < 500 && !got_reply; ms++) {
+	unsigned replies = 0;
+	for (unsigned ms = 0; ms < 500 && replies < 14; ms++) {
 		while (rpm_pipe_avail(&rx) >= 8) {
 			uint16_t hdr[4];
 			uint32_t p2, skip = 8;
@@ -2625,9 +2665,10 @@ blair_rpm_enable_ipa_clk(void)
 
 					rpm_pipe_read(&rx, msg, skip < sizeof(msg) ? skip : sizeof(msg), true);
 					got_reply = true;
-					printf("mpss: rpm: IPA_CLK (100 MHz) reply: %u bytes [%08x %08x %08x %08x %08x %08x %08x]\n",
-					    dhdr[2], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8]);
-					break;
+					replies++;
+					printf("mpss: rpm: reply #%u: %u bytes [%08x %08x %08x %08x %08x %08x %08x]\n",
+					    replies, dhdr[2], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7], msg[8]);
+					continue;
 				}
 			} else if (hdr[0] == 5) {
 				skip = 16;
@@ -2977,7 +3018,7 @@ step_start(void)
 		 * so the link -- and with it RMTFS/TFTP -- is taken up here rather than in step 9. Once the link
 		 * thread runs, it owns the doorbells and the DSP's words; this loop only watches their state.
 		 */
-		if (!glink_is_up() && glink_find()) {
+		if (!option("modem_no_link") && !glink_is_up() && glink_find()) {
 			if (!step_link()) {
 				printf("mpss: %u: the link is not up yet; the watch goes on\n", step);
 			}
@@ -5061,6 +5102,18 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 		tftp_refused++;
 		return;
 	}
+	if (file == NULL && option("modem_no_wlan_pd") && strnstr(name, "wlanmdsp.mbn", strlen(name)) != NULL) {
+		printf("mpss: tftp: the modem reads \"%s\": REFUSED (modem_no_wlan_pd=1)\n", name);
+		tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
+		tftp_refused++;
+		return;
+	}
+	if (file == NULL && option("modem_no_mcfg") && strnstr(name, "modem_pr/", strlen(name)) != NULL) {
+		printf("mpss: tftp: the modem reads \"%s\": REFUSED (modem_no_mcfg=1)\n", name);
+		tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
+		tftp_refused++;
+		return;
+	}
 	if (file == NULL) {
 		snprintf(fwname, sizeof(fwname), "image/%s", tftp_file_of(name));
 		file = root_file(fwname, &size);
@@ -5338,9 +5391,14 @@ servreg_receive(__unused void *context, uint32_t node, uint32_t port, const void
 		}
 		printf("mpss: servreg: the modem asks where \"%s\" is: %u domain%s\n", wanted, found, found == 1 ? "" : "s");
 	} else if (message == SERVREG_PFR) {
+		const uint8_t *reason;
+		uint16_t rlen = 0;
+
 		value = qmi_tlv(m, length, 1, &size);
-		printf("mpss: servreg: the modem reports a failure of \"%.*s\"\n", value ? (int)(size < 63 ? size : 63) : 0,
-		    value ? (const char *)value : "");
+		reason = qmi_tlv(m, length, 2, &rlen);
+		printf("mpss: servreg: the modem reports a failure of \"%.*s\" reason=\"%.*s\" (len %zu)\n",
+		    value ? (int)(size < 63 ? size : 63) : 0, value ? (const char *)value : "",
+		    reason ? (int)(rlen < 255 ? rlen : 255) : 0, reason ? (const char *)reason : "", length);
 	} else {
 		printf("mpss: servreg: a request this does not know (%#x)\n", message);
 		answer[10] = QMI_RESULT_FAILURE;
@@ -5895,8 +5953,7 @@ dms_server(__unused void *context, bool arrived, uint32_t service, __unused uint
 	if (arrived) {
 		dms_node = node;
 		dms_port_number = port;
-		printf("mpss: dms: service 2 arrived at node %u port %u, putting modem online immediately...\n", node, port);
-		dms_online();
+		printf("mpss: dms: service 2 arrived at node %u port %u (step 11 will put modem online)\n", node, port);
 	} else if (node == dms_node && port == dms_port_number) {
 		dms_node = dms_port_number = 0;
 	}
@@ -5952,15 +6009,20 @@ pdr_client_receive(__unused void *context, uint32_t node, uint32_t port, const v
 
 	if (type == 4 && msg_id == 0x0022 && length >= 7) {
 		uint16_t t_id = 0;
+		uint32_t new_state = 0;
+		bool has_state = false;
 		char path_buf[64] = "";
-		/* Find TLV 0x02 (service_path) and TLV 0x03 (transaction_id) */
+		/* Find TLV 0x01 (curr_state), TLV 0x02 (service_path) and TLV 0x03 (transaction_id) */
 		size_t off = 7;
 		while (off + 3 <= length) {
 			uint8_t t_type = m[off];
 			uint16_t t_len = (uint16_t)(m[off + 1] | m[off + 2] << 8);
 			off += 3;
 			if (off + t_len > length) break;
-			if (t_type == 0x02 && t_len > 0) {
+			if (t_type == 0x01 && t_len >= 4) {
+				new_state = le32(&m[off]);
+				has_state = true;
+			} else if (t_type == 0x02 && t_len > 0) {
 				unsigned n = t_len < sizeof(path_buf) ? t_len : sizeof(path_buf) - 1;
 
 				/* a top-level QMI string: raw bytes, no length prefix */
@@ -5971,7 +6033,12 @@ pdr_client_receive(__unused void *context, uint32_t node, uint32_t port, const v
 			}
 			off += t_len;
 		}
-		tell("mpss: pdr: STATE_UPDATED_IND for \"%s\" (txn_id %u)! Replying with SET_ACK_REQ (0x23)...\n", path_buf, t_id);
+		if (has_state && (path_buf[0] == 0 || strcmp(path_buf, "msm/modem/wlan_pd") == 0)) {
+			wlan_pd_state = new_state;
+			wlan_pd_known = true;
+		}
+		tell("mpss: pdr: STATE_UPDATED_IND for \"%s\" (state %#x, txn_id %u)! Replying with SET_ACK_REQ (0x23)...\n",
+		    path_buf, new_state, t_id);
 
 		/* Send SERVREG_SET_ACK_REQ (0x0023) */
 		uint8_t ack_pkt[64];

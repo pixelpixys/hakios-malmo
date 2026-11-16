@@ -1224,9 +1224,44 @@ wcn3990_power_on(void)
 {
 	vm_offset_t cfg_reg = tlmm_blair.base + 0x1000UL * 69 + GPIO_CFG_REG;
 	vm_offset_t io_reg  = tlmm_blair.base + 0x1000UL * 69 + GPIO_IO_REG;
+	uint32_t found = 0;
 
 	printf("wifi: %u: Blair/WCN3990: bt-sw-ctrl gpio69 cfg %#x io %#x (leaving gpio84/touch untouched)\n",
 	    step, rd(cfg_reg), rd(io_reg));
+
+	need(&arb_core);
+	need(&arb_cnfg);
+	need(&arb_observer);
+	if (arb_channels == 0) {
+		arb_channels = rd(arb_core.base + ARB_FEATURES) & 0x7ff;
+		if (arb_channels == 0 || arb_channels > 512) {
+			arb_channels = 512;
+		}
+	}
+	for (uint32_t n = 0; n < arb_channels; n++) {
+		uint32_t map = rd(arb_core.base + ARB_CHANNEL(n));
+		uint16_t id = (uint16_t)((map >> 8) & 0xfff);
+		uint8_t slave = (uint8_t)(id >> 8), periph = (uint8_t)(id & 0xff);
+		uint8_t info[4], ctrl[7];
+
+		if (map == 0 || (slave != 1 && slave != 5)) {
+			continue;
+		}
+		if (spmi_read((int)n, 0x04, info, 2) != NULL) {
+			continue;
+		}
+		if (info[0] != 0x03 && info[0] != 0x04 && info[0] != 0x1c && info[0] != 0x22) {
+			continue;
+		}
+		if (spmi_read((int)n, 0x40, ctrl, 7) != NULL) {
+			continue;
+		}
+		uint16_t mv = (uint16_t)ctrl[0] | ((uint16_t)ctrl[1] << 8);
+		printf("wifi: %u:   spmi %u:%#02x (type %#x/%#x): en=%u %u mV\n",
+		    step, slave, periph, info[0], info[1], (ctrl[6] >> 7) & 1, mv);
+		found++;
+	}
+	printf("wifi: %u: Blair/WCN3990: SPMI survey found %u regulators on slaves 1,5\n", step, found);
 	return true;
 }
 
@@ -3398,8 +3433,23 @@ step_exchange(void)
 			return false;
 		}
 		hakios_qmi_set_transport(mpss_qrtr);
+		{
+			static const uint16_t check_ids[] = { 0x141, 0x14f, 0x156, 0x440, 0x441, 0x442 };
+			for (unsigned k = 0; k < 6; k++) {
+				int ch = spmi_channel(check_ids[k]);
+				uint8_t ctrl[7];
+				if (ch >= 0 && spmi_read(ch, 0x40, ctrl, 7) == NULL) {
+					printf("wifi: %u: Blair/WCN3990: pre-WLFW spmi %u:%#02x: en=%u %u mV\n",
+					    step, check_ids[k] >> 8, check_ids[k] & 0xff, (ctrl[6] >> 7) & 1,
+					    (uint16_t)ctrl[0] | ((uint16_t)ctrl[1] << 8));
+				}
+			}
+		}
 		printf("wifi: %u: Blair/WCN3990: using modem QRTR transport for WLFW (0x45)\n", step);
-		return hakios_wlfw_exchange(step);
+		if (!hakios_wlfw_exchange(step)) {
+			return false;
+		}
+		return step_driver(2);
 	}
 
 	if (!glink.open) {
@@ -3952,7 +4002,14 @@ radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long l
 		return true;
 	}
 	lck_mtx_lock(&hakios_smmu_lock);       /* (the sound may be looking for a free context at the same time) */
-	if ((!radio_space.found && !radio_space_find()) || !radio_enter(*address, physical, size, attributes)) {
+	if (!radio_space.found) {
+		smmu_look();
+		if (!radio_space_find()) {
+			lck_mtx_unlock(&hakios_smmu_lock);
+			return false;
+		}
+	}
+	if (!radio_enter(*address, physical, size, attributes)) {
 		lck_mtx_unlock(&hakios_smmu_lock);
 		return false;
 	}

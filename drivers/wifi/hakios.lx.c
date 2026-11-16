@@ -214,6 +214,18 @@ lx_os_option(const char *name)
 int
 lx_os_firmware(const char *name, const void **data, unsigned long *size)
 {
+	/* Synthetic IE header for WCN3990 SNOC (NON_BMI + WMI_TLV + HTT_TLV): firmware runs on MPSS */
+	static const uint8_t wcn3990_fw5[] = {
+		'Q', 'C', 'A', '-', 'A', 'T', 'H', '1', '0', 'K', 0, 0,
+		2, 0, 0, 0,  8, 0, 0, 0,  0, 0, 0x08, 0,  0, 0, 0, 0, /* ATH10K_FW_IE_FEATURES: bit 19 (NON_BMI) */
+		5, 0, 0, 0,  4, 0, 0, 0,  4, 0, 0, 0,                 /* ATH10K_FW_IE_WMI_OP_VERSION: TLV (4) */
+		6, 0, 0, 0,  4, 0, 0, 0,  3, 0, 0, 0,                 /* ATH10K_FW_IE_HTT_OP_VERSION: TLV (3) */
+	};
+	if (name != NULL && strcmp(name, "ath10k/WCN3990/hw1.0/firmware-5.bin") == 0) {
+		*data = wcn3990_fw5;
+		*size = sizeof(wcn3990_fw5);
+		return 0;
+	}
 	uint64_t length = 0;
 	const uint8_t *file = hakios_wifi_driver_file(name, &length);
 
