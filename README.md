@@ -5,7 +5,7 @@
 
 ---
 
-## 📊 Overall Porting Progress: **~93% Complete**
+## 📊 Overall Porting Progress: **~94% Complete**
 
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
@@ -21,7 +21,7 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 | **GPU (Adreno 619)** | ✅ Working | 90% | Hardware-accelerated UI via `hakios-gl` / Mesa Freedreno, Metal translation |
 | **Touchscreen (Touch)** | ✅ Working | 95% | FocalTech FT3683G (I2C SE1), multi-touch & gesture navigation |
 | **Physical Buttons** | ✅ Working | 100% | Power and Volume (+/-) via PMIC PON driver |
-| **Haptics / Vibration** | ✅ Working | 95% | Awinic AW86927: EGPIO reset bit logic, boost 0xd0 (vmax 8500 mV), max gain 0xff, RAM waveforms + CONT buzz |
+| **Haptics / Vibration** | ✅ Working | 100% | Awinic AW86927: EGPIO reset bit logic, boost 0xd0 (vmax 8500 mV), max gain 0xff, RAM waveforms + CONT buzz fully working |
 | **Audio / Speakers** | 🟡 In Progress | 82% | FourSemi FS1815: GPIO4/5 bit-bang I2C, ADSP TZ auth, Blair stream `0xa1`, fastrpc SMMU early page |
 | **Wi-Fi** | ✅ Working | 100% | WCN3990 (SNOC) + ath10k shim: full stack operational, WLFW handshake, scanning, association & network working |
 | **Bluetooth** | 🟡 In Progress | 45% | WCN3990 UART / QCA coex (GPIO 69), driver under active development |
