@@ -538,10 +538,36 @@ watched_ordered_sections(id self, SEL cmd)
 	return res;
 }
 
+extern void NSSetUncaughtExceptionHandler(void (*)(id));
+extern void __assert_rtn(const char *, const char *, int, const char *) __attribute__((noreturn));
+
+static void
+watched_uncaught_exception(id exception)
+{
+	char line[512];
+	int n = snprintf(line, sizeof(line), "hakios: %s: UNCAUGHT EXCEPTION: %s\n", who, text_of(exception));
+	say(line, (size_t)(n > 0 ? n : 0));
+}
+
+static void
+watched_assert_rtn(const char *func, const char *file, int line, const char *failedexpr)
+{
+	char msg[512];
+	int n = snprintf(msg, sizeof(msg), "hakios: %s: ASSERTION FAILED: %s in %s (%s:%d)\n",
+	    who, failedexpr ? failedexpr : "", func ? func : "", file ? file : "", line);
+	say(msg, (size_t)(n > 0 ? n : 0));
+}
+
 __attribute__((used)) static struct {
 	const void *ours, *theirs;
 } spawn_interpose __attribute__((section("__DATA,__interpose"))) = {
 	(const void *)watched_spawn, (const void *)posix_spawn
+};
+
+__attribute__((used)) static struct {
+	const void *ours, *theirs;
+} assert_interpose __attribute__((section("__DATA,__interpose"))) = {
+	(const void *)watched_assert_rtn, (const void *)__assert_rtn
 };
 
 /* Put ours in the place of a method, keeping the one that was there. */
@@ -586,6 +612,7 @@ hakios_app_init(void)
 	for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
 		sigaction(signals[i], &action, NULL);
 	}
+	NSSetUncaughtExceptionHandler(watched_uncaught_exception);
 	if (strcmp(name, "Sileo") == 0) {
 		dispatch_async(dispatch_get_main_queue(), ^{ keep_to_the_repositories(); });
 	}
