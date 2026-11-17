@@ -568,19 +568,167 @@ wait_for_als_arrival(__unused id self, __unused SEL selector)
 	}
 }
 
-__attribute__((unused)) static void
+/* ---- backboardd: display brightness control --------------------------------------------------------- */
+
+
+
+static const char *
+utf8(id string)
+{
+	return string != NULL ? ((const char *(*)(id, SEL))objc_msgSend)(string, sel_registerName("UTF8String")) : "(nil)";
+}
+
+static void (*orig_setBrightnessLevel_reason_options)(id self, SEL _cmd, float level, id reason, unsigned long long options);
+static void (*orig_setBrightness)(id self, SEL _cmd, float level);
+static void (*orig_setDisplayBrightness_permanently)(id self, SEL _cmd, float level, BOOL permanently);
+static float (*orig_brightnessLevel)(id self, SEL _cmd);
+static BOOL (*orig_BrightnessSystem_setProperty_forKey)(id self, SEL _cmd, id value, id key);
+static id (*orig_BrightnessSystem_copyPropertyForKey)(id self, SEL _cmd, id key);
+
+static void
+apply_brightness_percent(float level)
+{
+	uint32_t percent = (uint32_t)(level * 100.0f + 0.5f);
+	if (percent > 100) percent = 100;
+	if (percent < 2) percent = 2; /* keep display visible */
+	sysctlbyname("kern.hakios.brightness", NULL, 0, &percent, sizeof(percent));
+}
+
+static void
+hook_setBrightnessLevel_reason_options(id self, SEL _cmd, float level, id reason, unsigned long long options)
+{
+	apply_brightness_percent(level);
+	say("hakios: brightness: setBrightnessLevel: %f (%u%%)\n", level, (unsigned)(level * 100.0f + 0.5f));
+	if (orig_setBrightnessLevel_reason_options) {
+		orig_setBrightnessLevel_reason_options(self, _cmd, level, reason, options);
+	}
+}
+
+static void
+hook_setBrightness(id self, SEL _cmd, float level)
+{
+	apply_brightness_percent(level);
+	say("hakios: brightness: setBrightness: %f (%u%%)\n", level, (unsigned)(level * 100.0f + 0.5f));
+	if (orig_setBrightness) {
+		orig_setBrightness(self, _cmd, level);
+	}
+}
+
+static void
+hook_setDisplayBrightness_permanently(id self, SEL _cmd, float level, BOOL permanently)
+{
+	apply_brightness_percent(level);
+	say("hakios: brightness: setDisplayBrightness: %f permanently: %d\n", level, permanently);
+	if (orig_setDisplayBrightness_permanently) {
+		orig_setDisplayBrightness_permanently(self, _cmd, level, permanently);
+	}
+}
+
+static float
+hook_brightnessLevel(id self, SEL _cmd)
+{
+	uint32_t val = 100;
+	size_t size = sizeof(val);
+	if (sysctlbyname("kern.hakios.brightness", &val, &size, NULL, 0) == 0) {
+		return (float)val / 100.0f;
+	}
+	if (orig_brightnessLevel) {
+		return orig_brightnessLevel(self, _cmd);
+	}
+	return 1.0f;
+}
+
+static BOOL
+hook_isBrightnessLevelControlAvailable(__unused id self, __unused SEL _cmd)
+{
+	return YES;
+}
+
+static BOOL
+hook_BrightnessSystem_setProperty_forKey(id self, SEL _cmd, id value, id key)
+{
+	if (key != NULL) {
+		const char *k = utf8(key);
+		if (strstr(k, "Brightness") != NULL || strstr(k, "brightness") != NULL) {
+			if (value != NULL && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(value, sel_registerName("respondsToSelector:"), sel_registerName("floatValue"))) {
+				float level = ((float (*)(id, SEL))objc_msgSend)(value, sel_registerName("floatValue"));
+				apply_brightness_percent(level);
+				say("hakios: brightness: BrightnessSystem setProperty:%s = %f\n", k, level);
+			}
+		}
+	}
+	if (orig_BrightnessSystem_setProperty_forKey) {
+		return orig_BrightnessSystem_setProperty_forKey(self, _cmd, value, key);
+	}
+	return YES;
+}
+
+static id
+hook_BrightnessSystem_copyPropertyForKey(id self, SEL _cmd, id key)
+{
+	if (key != NULL) {
+		const char *k = utf8(key);
+		if (strcmp(k, "DisplayBrightness") == 0 || strcmp(k, "Brightness") == 0) {
+			uint32_t val = 100;
+			size_t size = sizeof(val);
+			if (sysctlbyname("kern.hakios.brightness", &val, &size, NULL, 0) == 0) {
+				Class numCls = objc_getClass("NSNumber");
+				if (numCls) {
+					return ((id (*)(Class, SEL, float))objc_msgSend)(numCls, sel_registerName("numberWithFloat:"), (float)val / 100.0f);
+				}
+			}
+		}
+	}
+	if (orig_BrightnessSystem_copyPropertyForKey) {
+		return orig_BrightnessSystem_copyPropertyForKey(self, _cmd, key);
+	}
+	return NULL;
+}
+
+static void
 brightness_fixes(void)
 {
-	Class cls = objc_getClass("BLControl");
-	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("waitForALSArrival")) : NULL;
-	IMP original = method ? method_getImplementation(method) : NULL;
-
-	if (original == NULL || (uintptr_t)original != 0x1af043734UL + slide) {
-		say("hakios: -[BLControl waitForALSArrival]: found %#lx, not what was expected; left alone\n",
-		    original ? (uintptr_t)original - slide : 0);
-		return;
+	Class bkClass = objc_getClass("BKDisplayBrightnessController");
+	if (bkClass) {
+		Method m;
+		m = class_getInstanceMethod(bkClass, sel_registerName("setBrightnessLevel:reason:options:"));
+		if (m) {
+			orig_setBrightnessLevel_reason_options = (void (*)(id, SEL, float, id, unsigned long long))method_setImplementation(m, (IMP)hook_setBrightnessLevel_reason_options);
+		}
+		m = class_getInstanceMethod(bkClass, sel_registerName("setBrightness:"));
+		if (m) {
+			orig_setBrightness = (void (*)(id, SEL, float))method_setImplementation(m, (IMP)hook_setBrightness);
+		}
+		m = class_getInstanceMethod(bkClass, sel_registerName("setDisplayBrightness:permanently:"));
+		if (m) {
+			orig_setDisplayBrightness_permanently = (void (*)(id, SEL, float, BOOL))method_setImplementation(m, (IMP)hook_setDisplayBrightness_permanently);
+		}
+		m = class_getInstanceMethod(bkClass, sel_registerName("brightnessLevel"));
+		if (m) {
+			orig_brightnessLevel = (float (*)(id, SEL))method_setImplementation(m, (IMP)hook_brightnessLevel);
+		}
+		m = class_getInstanceMethod(bkClass, sel_registerName("isBrightnessLevelControlAvailable"));
+		if (m) {
+			method_setImplementation(m, (IMP)hook_isBrightnessLevelControlAvailable);
+		}
+		say("hakios: BKDisplayBrightnessController brightness hooks installed\n");
+	} else {
+		say("hakios: BKDisplayBrightnessController not found\n");
 	}
-	method_setImplementation(method, (IMP)wait_for_als_arrival);
+
+	Class bsClass = objc_getClass("BrightnessSystem");
+	if (bsClass) {
+		Method m;
+		m = class_getInstanceMethod(bsClass, sel_registerName("setProperty:forKey:"));
+		if (m) {
+			orig_BrightnessSystem_setProperty_forKey = (BOOL (*)(id, SEL, id, id))method_setImplementation(m, (IMP)hook_BrightnessSystem_setProperty_forKey);
+		}
+		m = class_getInstanceMethod(bsClass, sel_registerName("copyPropertyForKey:"));
+		if (m) {
+			orig_BrightnessSystem_copyPropertyForKey = (id (*)(id, SEL, id))method_setImplementation(m, (IMP)hook_BrightnessSystem_copyPropertyForKey);
+		}
+		say("hakios: BrightnessSystem hooks installed\n");
+	}
 }
 
 /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
@@ -1092,11 +1240,7 @@ static id (*orig_url_for_in)(id self, SEL selector, id name, id extension, id su
 static const char *ca_metallib;
 static unsigned lookups_said;
 
-static const char *
-utf8(id string)
-{
-	return string != NULL ? ((const char *(*)(id, SEL))objc_msgSend)(string, sel_registerName("UTF8String")) : "(nil)";
-}
+
 
 static id
 metallib_answer(id self, id name, id extension, id found)
@@ -1223,13 +1367,7 @@ hakios_init(void)
 		}
 		opengl_es();
 		window_server_fixes();
-		/*
-		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
-		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
-		 * service was made before or after the touch processing starts. (Most likely it only
-		 * moved the start of the event server onto the moment make_service() now knows how to
-		 * survive; not tried again since, and until it is, the five seconds stay.)
-		 */
+		brightness_fixes();
 		input_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();

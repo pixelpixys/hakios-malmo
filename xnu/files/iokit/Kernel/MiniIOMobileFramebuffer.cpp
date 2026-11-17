@@ -240,7 +240,7 @@ static TUNABLE(uint32_t, gFBSolid, "fbsolid", 0);
  * boot loader's level stands. This scales what is drawn, and 100 (the default) costs nothing.
  */
 static TUNABLE_WRITEABLE(uint32_t, gBrightness, "fb_brightness", 100);
-SYSCTL_UINT(_kern_hakios, OID_AUTO, brightness, CTLFLAG_RW | CTLFLAG_LOCKED, &gBrightness, 0,
+SYSCTL_UINT(_kern_hakios, OID_AUTO, brightness, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY, &gBrightness, 0,
     "how many per cent of its brightness the picture is drawn at (0 to 100)");
 
 static inline uint64_t
