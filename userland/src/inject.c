@@ -649,11 +649,22 @@ hook_BrightnessSystem_setProperty_forKey(id self, SEL _cmd, id value, id key)
 {
 	if (key != NULL) {
 		const char *k = utf8(key);
-		if (strstr(k, "Brightness") != NULL || strstr(k, "brightness") != NULL) {
-			if (value != NULL && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(value, sel_registerName("respondsToSelector:"), sel_registerName("floatValue"))) {
-				float level = ((float (*)(id, SEL))objc_msgSend)(value, sel_registerName("floatValue"));
+		if (strcmp(k, "DisplayBrightness") == 0) {
+			float level = -1.0f;
+			if (value != NULL) {
+				if (((BOOL (*)(id, SEL, Class))objc_msgSend)(value, sel_registerName("isKindOfClass:"), objc_getClass("NSDictionary"))) {
+					id bVal = ((id (*)(id, SEL, id))objc_msgSend)(value, sel_registerName("objectForKey:"),
+					    ((id (*)(Class, SEL, const char *))objc_msgSend)(objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "Brightness"));
+					if (bVal != NULL && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(bVal, sel_registerName("respondsToSelector:"), sel_registerName("floatValue"))) {
+						level = ((float (*)(id, SEL))objc_msgSend)(bVal, sel_registerName("floatValue"));
+					}
+				} else if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(value, sel_registerName("respondsToSelector:"), sel_registerName("floatValue"))) {
+					level = ((float (*)(id, SEL))objc_msgSend)(value, sel_registerName("floatValue"));
+				}
+			}
+			if (level >= 0.0f) {
 				apply_brightness_percent(level);
-				say("hakios: brightness: BrightnessSystem setProperty:%s = %f\n", k, level);
+				say("hakios: brightness: BrightnessSystem setProperty:DisplayBrightness = %f\n", level);
 			}
 		}
 	}

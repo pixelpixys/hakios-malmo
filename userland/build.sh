@@ -426,16 +426,12 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# mobile's without a data container of its own keeps its temporary files there -- Sileo, registered from
 	# the prefix with the root on the flash, downloads every package and index there, and without it each
 	# download ended in "No such file or directory"
-	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/PosterBoard\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Wallpaper\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/PaperBoard\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/DuetExpertCenter\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/ProactivePredictions\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/AppPrediction\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Assets\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/AutoAsset\n' >> root/etc/var.skel
-	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Trial\n' >> root/etc/var.skel
+	for d in /private/var/mobile/tmp /private/var/mobile/Library/PosterBoard /private/var/mobile/Library/Wallpaper \
+		/private/var/mobile/Library/PaperBoard /private/var/mobile/Library/DuetExpertCenter \
+		/private/var/mobile/Library/ProactivePredictions /private/var/mobile/Library/AppPrediction \
+		/private/var/mobile/Library/Assets /private/var/mobile/Library/AutoAsset /private/var/mobile/Library/Trial; do
+		grep -q "[[:space:]]$d\$" root/etc/var.skel 2>/dev/null || printf 'd\t755\t501\t501\t%s\n' "$d" >> root/etc/var.skel
+	done
 	# Metal's compiled shader stages (HakiosMetalCA.m: HM_CACHE_DIR): in /var/db so that var_store keeps them (it
 	# leaves tmp out), open to every user like tmp, since the window server may not be root
 	printf 'd\t1777\t0\t0\t/private/var/db/hakios-metal-cache\n' >> root/etc/var.skel

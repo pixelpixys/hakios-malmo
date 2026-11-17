@@ -943,7 +943,7 @@ mount_writable(void)
 			int mode = (int)parse_number(f[1], 8);
 
 			/* on the kept volume most of them are there from the boots before */
-			ok = (mkdir(f[4], mode) == 0 || (var_kept && errno == 17 /* EEXIST */)) && chmod(f[4], mode) == 0 &&
+			ok = (mkdir(f[4], mode) == 0 || errno == 17 /* EEXIST */) && chmod(f[4], mode) == 0 &&
 			    chown(f[4], (int)parse_number(f[2], 10), (int)parse_number(f[3], 10)) == 0;
 			if (!ok) {
 				printf("  %s: %s\n", f[4], strerror(errno));
