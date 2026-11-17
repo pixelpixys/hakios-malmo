@@ -136,7 +136,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo
+/redwood/lib/libhakios.app.dylib Sileo PosterBoard searchd
 /redwood/lib/libhakios.tweaks.dylib Preferences"}
 mkdir -p obj
 

@@ -9,6 +9,8 @@
  * which `ipsw dyld a2s <cache> <address>` turns back into names.
  */
 #include <dispatch/dispatch.h>
+#include <alloca.h>
+#include <stdbool.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <objc/message.h>
@@ -314,6 +316,171 @@ watched_copy_path(id self, SEL cmd, id from, id to, id *error)
 	return file_said("copyItemAtPath", ok, from, to, error != NULL ? *error : mine);
 }
 
+static id (*original_dict_init)(id self, SEL cmd, const id *objects, const id *keys, unsigned long count);
+
+static id
+watched_dict_init(id self, SEL cmd, const id *objects, const id *keys, unsigned long count)
+{
+	if (objects != NULL && keys != NULL && count > 0) {
+		bool has_nil = false;
+		for (unsigned long i = 0; i < count; i++) {
+			if (objects[i] == NULL || keys[i] == NULL) {
+				has_nil = true;
+				break;
+			}
+		}
+		if (has_nil) {
+			id *new_objects = alloca(sizeof(id) * count);
+			id *new_keys = alloca(sizeof(id) * count);
+			unsigned long valid_count = 0;
+
+			for (unsigned long i = 0; i < count; i++) {
+				if (objects[i] != NULL && keys[i] != NULL) {
+					new_objects[valid_count] = objects[i];
+					new_keys[valid_count] = keys[i];
+					valid_count++;
+				} else {
+					char line[512];
+					int n = snprintf(line, sizeof(line),
+					    "hakios: %s: caught nil in dictionary at index %lu of %lu (key=%s, obj=%p), dropped\n",
+					    who, i, count, text_of(keys[i]), objects[i]);
+					say(line, (size_t)(n > 0 ? n : 0));
+				}
+			}
+			return original_dict_init(self, cmd, new_objects, new_keys, valid_count);
+		}
+	}
+	return original_dict_init(self, cmd, objects, keys, count);
+}
+
+static id (*original_array_init)(id self, SEL cmd, const id *objects, unsigned long count);
+
+static id
+watched_array_init(id self, SEL cmd, const id *objects, unsigned long count)
+{
+	if (objects != NULL && count > 0) {
+		bool has_nil = false;
+		for (unsigned long i = 0; i < count; i++) {
+			if (objects[i] == NULL) {
+				has_nil = true;
+				break;
+			}
+		}
+		if (has_nil) {
+			id *new_objects = alloca(sizeof(id) * count);
+			unsigned long valid_count = 0;
+
+			for (unsigned long i = 0; i < count; i++) {
+				if (objects[i] != NULL) {
+					new_objects[valid_count++] = objects[i];
+				} else {
+					char line[256];
+					int n = snprintf(line, sizeof(line),
+					    "hakios: %s: caught nil in array at index %lu of %lu, dropped\n",
+					    who, i, count);
+					say(line, (size_t)(n > 0 ? n : 0));
+				}
+			}
+			return original_array_init(self, cmd, new_objects, valid_count);
+		}
+	}
+	return original_array_init(self, cmd, objects, count);
+}
+
+static void (*original_dict_set)(id self, SEL cmd, id object, id key);
+
+static void
+watched_dict_set(id self, SEL cmd, id object, id key)
+{
+	if (key == NULL) {
+		say("hakios: caught nil key in setObject:forKey:\n", 40);
+		return;
+	}
+	if (object == NULL) {
+		char line[256];
+		int n = snprintf(line, sizeof(line), "hakios: %s: caught nil object in setObject:forKey: (key=%s), removed\n",
+		    who, text_of(key));
+		say(line, (size_t)(n > 0 ? n : 0));
+		id (*remove)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+		remove(self, sel_registerName("removeObjectForKey:"), key);
+		return;
+	}
+	original_dict_set(self, cmd, object, key);
+}
+
+static void (*original_dict_set_subscript)(id self, SEL cmd, id object, id key);
+
+static void
+watched_dict_set_subscript(id self, SEL cmd, id object, id key)
+{
+	if (key == NULL) {
+		say("hakios: caught nil key in setObject:forKeyedSubscript:\n", 50);
+		return;
+	}
+	if (object == NULL) {
+		char line[256];
+		int n = snprintf(line, sizeof(line), "hakios: %s: caught nil object in setObject:forKeyedSubscript: (key=%s), removed\n",
+		    who, text_of(key));
+		say(line, (size_t)(n > 0 ? n : 0));
+		id (*remove)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+		remove(self, sel_registerName("removeObjectForKey:"), key);
+		return;
+	}
+	original_dict_set_subscript(self, cmd, object, key);
+}
+
+static void (*original_array_insert)(id self, SEL cmd, id object, unsigned long index);
+
+static void
+watched_array_insert(id self, SEL cmd, id object, unsigned long index)
+{
+	if (object == NULL) {
+		char line[256];
+		int n = snprintf(line, sizeof(line), "hakios: %s: caught nil in insertObject:atIndex: (%lu), ignored\n", who, index);
+		say(line, (size_t)(n > 0 ? n : 0));
+		return;
+	}
+	original_array_insert(self, cmd, object, index);
+}
+
+static void (*original_array_add)(id self, SEL cmd, id object);
+
+static void
+watched_array_add(id self, SEL cmd, id object)
+{
+	if (object == NULL) {
+		char line[256];
+		int n = snprintf(line, sizeof(line), "hakios: %s: caught nil in addObject:, ignored\n", who);
+		say(line, (size_t)(n > 0 ? n : 0));
+		return;
+	}
+	original_array_add(self, cmd, object);
+}
+
+static id (*original_url_init)(id self, SEL cmd, id path);
+
+static id
+watched_url_init(id self, SEL cmd, id path)
+{
+	if (path == NULL) {
+		say("hakios: caught nil path in initFileURLWithPath:\n", 47);
+		return NULL;
+	}
+	return original_url_init(self, cmd, path);
+}
+
+static id (*original_url_is_dir_init)(id self, SEL cmd, id path, signed char is_dir);
+
+static id
+watched_url_is_dir_init(id self, SEL cmd, id path, signed char is_dir)
+{
+	if (path == NULL) {
+		say("hakios: caught nil path in initFileURLWithPath:isDirectory:\n", 59);
+		return NULL;
+	}
+	return original_url_is_dir_init(self, cmd, path, is_dir);
+}
+
 __attribute__((used)) static struct {
 	const void *ours, *theirs;
 } spawn_interpose __attribute__((section("__DATA,__interpose"))) = {
@@ -375,6 +542,14 @@ hakios_app_init(void)
 	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
+	watch("__NSPlaceholderDictionary", "initWithObjects:forKeys:count:", (IMP)watched_dict_init, &original_dict_init);
+	watch("__NSPlaceholderArray", "initWithObjects:count:", (IMP)watched_array_init, &original_array_init);
+	watch("__NSDictionaryM", "setObject:forKey:", (IMP)watched_dict_set, &original_dict_set);
+	watch("__NSDictionaryM", "setObject:forKeyedSubscript:", (IMP)watched_dict_set_subscript, &original_dict_set_subscript);
+	watch("__NSArrayM", "insertObject:atIndex:", (IMP)watched_array_insert, &original_array_insert);
+	watch("__NSArrayM", "addObject:", (IMP)watched_array_add, &original_array_add);
+	watch("NSURL", "initFileURLWithPath:", (IMP)watched_url_init, &original_url_init);
+	watch("NSURL", "initFileURLWithPath:isDirectory:", (IMP)watched_url_is_dir_init, &original_url_is_dir_init);
 	n = snprintf(line, sizeof(line), "hakios: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));
