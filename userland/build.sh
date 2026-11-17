@@ -136,7 +136,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo PosterBoard searchd
+/redwood/lib/libhakios.app.dylib Sileo PosterBoard searchd duetexpertd
 /redwood/lib/libhakios.tweaks.dylib Preferences"}
 mkdir -p obj
 
@@ -430,6 +430,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	printf 'd\t755\t501\t501\t/private/var/mobile/Library/PosterBoard\n' >> root/etc/var.skel
 	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Wallpaper\n' >> root/etc/var.skel
 	printf 'd\t755\t501\t501\t/private/var/mobile/Library/PaperBoard\n' >> root/etc/var.skel
+	printf 'd\t755\t501\t501\t/private/var/mobile/Library/DuetExpertCenter\n' >> root/etc/var.skel
+	printf 'd\t755\t501\t501\t/private/var/mobile/Library/ProactivePredictions\n' >> root/etc/var.skel
+	printf 'd\t755\t501\t501\t/private/var/mobile/Library/AppPrediction\n' >> root/etc/var.skel
 	# Metal's compiled shader stages (HakiosMetalCA.m: HM_CACHE_DIR): in /var/db so that var_store keeps them (it
 	# leaves tmp out), open to every user like tmp, since the window server may not be root
 	printf 'd\t1777\t0\t0\t/private/var/db/hakios-metal-cache\n' >> root/etc/var.skel
