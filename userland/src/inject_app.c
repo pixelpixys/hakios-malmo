@@ -17,6 +17,7 @@
 #include <objc/runtime.h>
 #include <execinfo.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -538,7 +539,6 @@ watched_ordered_sections(id self, SEL cmd)
 	return res;
 }
 
-extern void NSSetUncaughtExceptionHandler(void (*)(id));
 extern void __assert_rtn(const char *, const char *, int, const char *) __attribute__((noreturn));
 
 static void
@@ -612,7 +612,10 @@ hakios_app_init(void)
 	for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
 		sigaction(signals[i], &action, NULL);
 	}
-	NSSetUncaughtExceptionHandler(watched_uncaught_exception);
+	void (*set_uncaught)(void (*)(id)) = (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+	if (set_uncaught != NULL) {
+		set_uncaught(watched_uncaught_exception);
+	}
 	if (strcmp(name, "Sileo") == 0) {
 		dispatch_async(dispatch_get_main_queue(), ^{ keep_to_the_repositories(); });
 	}
