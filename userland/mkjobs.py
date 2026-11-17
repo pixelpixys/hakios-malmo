@@ -294,9 +294,14 @@ if rest:
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
         if not job.get('MachServices') or not present(program):
             continue
-        for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
-                    'QueueDirectories', 'StartOnMount', 'LaunchEvents'):
-            job.pop(key, None)
+        if label == 'com.apple.PosterBoard':
+            job['RunAtLoad'] = True
+            job['KeepAlive'] = True
+            job['MachServices'] = {'com.apple.posterboardservices.services': True}
+        else:
+            for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
+                        'QueueDirectories', 'StartOnMount', 'LaunchEvents'):
+                job.pop(key, None)
         job['StandardErrorPath'] = '/dev/console'
         if label in oslog:
             job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
