@@ -481,6 +481,51 @@ watched_url_is_dir_init(id self, SEL cmd, id path, signed char is_dir)
 	return original_url_is_dir_init(self, cmd, path, is_dir);
 }
 
+static void (*original_gallery_did_load)(id self, SEL cmd);
+
+static void
+watched_gallery_did_load(id self, SEL cmd)
+{
+	say("hakios: PosterBoard: PBFGalleryViewController viewDidLoad called!\n", 67);
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	id provider = get(self, sel_registerName("dataProvider"));
+	if (provider != NULL) {
+		id sections = get(provider, sel_registerName("orderedSectionIdentifiers"));
+		char line[512];
+		int n = snprintf(line, sizeof(line), "hakios: PosterBoard: gallery sections: %s\n", text_of(sections));
+		say(line, (size_t)(n > 0 ? n : 0));
+	}
+	original_gallery_did_load(self, cmd);
+}
+
+static void (*original_gallery_appear)(id self, SEL cmd, signed char animated);
+
+static void
+watched_gallery_appear(id self, SEL cmd, signed char animated)
+{
+	say("hakios: PosterBoard: PBFGalleryViewController viewWillAppear called!\n", 69);
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	id provider = get(self, sel_registerName("dataProvider"));
+	if (provider != NULL) {
+		id sections = get(provider, sel_registerName("orderedSectionIdentifiers"));
+		char line[512];
+		int n = snprintf(line, sizeof(line), "hakios: PosterBoard: gallery sections: %s\n", text_of(sections));
+		say(line, (size_t)(n > 0 ? n : 0));
+	}
+	original_gallery_appear(self, cmd, animated);
+}
+
+static void (*original_set_ordered_sections)(id self, SEL cmd, id sections);
+
+static void
+watched_set_ordered_sections(id self, SEL cmd, id sections)
+{
+	char line[512];
+	int n = snprintf(line, sizeof(line), "hakios: PosterBoard: setOrderedSectionIdentifiers: %s\n", text_of(sections));
+	say(line, (size_t)(n > 0 ? n : 0));
+	original_set_ordered_sections(self, cmd, sections);
+}
+
 __attribute__((used)) static struct {
 	const void *ours, *theirs;
 } spawn_interpose __attribute__((section("__DATA,__interpose"))) = {
@@ -550,6 +595,9 @@ hakios_app_init(void)
 	watch("__NSArrayM", "addObject:", (IMP)watched_array_add, &original_array_add);
 	watch("NSURL", "initFileURLWithPath:", (IMP)watched_url_init, &original_url_init);
 	watch("NSURL", "initFileURLWithPath:isDirectory:", (IMP)watched_url_is_dir_init, &original_url_is_dir_init);
+	watch("PBFGalleryViewController", "viewDidLoad", (IMP)watched_gallery_did_load, &original_gallery_did_load);
+	watch("PBFGalleryViewController", "viewWillAppear:", (IMP)watched_gallery_appear, &original_gallery_appear);
+	watch("PBFPosterGalleryDataProvider", "setOrderedSectionIdentifiers:", (IMP)watched_set_ordered_sections, &original_set_ordered_sections);
 	n = snprintf(line, sizeof(line), "hakios: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));
