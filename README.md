@@ -5,7 +5,7 @@
 
 ---
 
-## 📊 Overall Porting Progress: **~94% Complete**
+## 📊 Overall Porting Progress: **~97% Complete**
 
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
@@ -16,8 +16,9 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 | Component / Subsystem | Status | Progress | Notes |
 |---|:---:|:---:|---|
 | **CPU / Multicore** | ✅ Working | 100% | 8 Kryo cores (2x Gold + 6x Silver), `bootcpu=7 cpus=7`, full SMP |
+| **Battery & Charging** | ✅ Working | 100% | Qualcomm PM7250B / SMB5 hardware fuel gauge via UEFI `ChargerExDxe` & `QcomChargerDxeLA`: real-time battery percentage, voltage (mV), charge current & charging lightning bolt in status bar/lock screen (`battery=1`) |
 | **Storage / APFS Ramdisk** | ✅ Working | 100% | Live APFS ramdisk (`root.apfs`, `system.apfs`), lz4 compressed |
-| **Display (Framebuffer)** | ✅ Working | 100% | 1080x2400 OLED, smooth 120 Hz refresh rate (`fb_hz=120`, `ca_vbl=1`) |
+| **Display (Framebuffer)** | ✅ Working | 100% | 1080x2400 OLED, smooth 120 Hz refresh rate (`fb_hz=120`, `ca_vbl=1`), brightness control in Control Center |
 | **GPU (Adreno 619)** | ✅ Working | 90% | Hardware-accelerated UI via `hakios-gl` / Mesa Freedreno, Metal translation |
 | **Touchscreen (Touch)** | ✅ Working | 95% | FocalTech FT3683G (I2C SE1), multi-touch & gesture navigation |
 | **Physical Buttons** | ✅ Working | 100% | Power and Volume (+/-) via PMIC PON driver |
@@ -26,8 +27,18 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 | **Wi-Fi** | ✅ Working | 100% | WCN3990 (SNOC) + ath10k shim: full stack operational, WLFW handshake, scanning, association & network working |
 | **Bluetooth** | 🟡 In Progress | 45% | WCN3990 UART / QCA coex (GPIO 69), driver under active development |
 | **Cellular Modem (LTE/5G) / MPSS** | 🟡 In Progress | 45% | MPSS boots (`smem_lock=0x343000`), RPM GLINK `IPA_CLK` (100 MHz) + `snoc/bimc/cnoc` votes, IPA v4.5 (`0x05840000`) & 512KB SMMU (`0x4a0..0x4a3`); debugging hang when `ipa_fw=1` + MPSS run together |
-| **PosterBoard / Wallpapers** | 🟡 Partial | 70% | Lock screen wallpaper renders; poster switcher hook returns `NO` (avoids black screen compositing bug); ExtensionKit posters load in background (~400s); home screen freeze via `wallpaper_freeze=1` |
 | **Cameras** | 🔴 Planned | 10% | Requires porting Qualcomm Spectra ISP & Sony LYT-600 sensors |
+
+---
+
+## 🎨 Userland, SpringBoard & PosterBoard
+
+| Service / Component | Status | Notes |
+|---|:---:|---|
+| **SpringBoard** | ✅ Working | Complete iOS 16.5 shell, app launch & switch, widgets, folders, dock |
+| **PosterBoard / Wallpapers** | 🟡 Partial | Lock screen wallpaper renders properly; poster switcher hook returns `NO` (prevents black screen compositing glitch); ExtensionKit posters load in background; home screen blur freeze via `wallpaper_freeze=1` |
+| **Control Center** | ✅ Working | Brightness slider, volume, connectivity buttons, flashlight, focus modes |
+| **Sileo / Package Manager** | ✅ Working | Rootless package management (`/var/jb`), repo refreshing, tweak support |
 
 ---
 
@@ -36,10 +47,11 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 The system is booted via the custom **HakiOS XNULoader v3** (`loader.efi`) chained from **Mu-Silicium UEFI**:
 
 ```bash
-XL_SECS=36000 XL_FOLLOW=10 XL_CMDLINE="touchscreen=1 buttons=1 bootcpu=7 cpus=7 gpu=1 fb_hz=120 fb_threads=6 ca_vbl=1" ./xl run
+XL_SECS=36000 XL_FOLLOW=10 XL_CMDLINE="touchscreen=1 buttons=1 bootcpu=7 cpus=7 gpu=1 battery=1 fb_hz=120 fb_threads=6 ca_vbl=1" ./xl run
 ```
 
 ### Key Kernel Arguments (`XL_CMDLINE`):
+- `battery=1`: Reads hardware battery percentage, voltage, and charging status from Qualcomm UEFI charger stack.
 - `gpu=1`: Enables the Adreno 619 GPU driver and hardware rendering pipeline.
 - `fb_hz=120`: Forces 120 Hz display refresh rate for fluid scrolling and animations.
 - `touchscreen=1`: Enables the FocalTech FT3683G touch controller (I2C SE1, GPIO 0/1).
