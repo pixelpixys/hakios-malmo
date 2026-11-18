@@ -976,6 +976,19 @@ mount_writable(void)
 		ok = fd >= 0 && chown(markers[i], 272, 272) == 0;
 		close(fd);
 	}
+
+	/* Directories required by PlugInKit (pkd) and FileProvider (fileproviderd) */
+	mkdir("/private/var/db/PlugInKit", 0755);
+	chown("/private/var/db/PlugInKit", 0, 0);
+	mkdir("/private/var/db/PlugInKit-Annotations", 0755);
+	chown("/private/var/db/PlugInKit-Annotations", 0, 0);
+	mkdir("/private/var/mobile/Library/LiveFiles", 0755);
+	chown("/private/var/mobile/Library/LiveFiles", 501, 501);
+	mkdir("/private/var/mobile/Library/Application Support", 0755);
+	chown("/private/var/mobile/Library/Application Support", 501, 501);
+	mkdir("/private/var/mobile/Library/Application Support/FileProvider", 0755);
+	chown("/private/var/mobile/Library/Application Support/FileProvider", 501, 501);
+
 	printf("  %d directories, %d files\n", made, files);
 	check(ok && made > 50, "create the directories of the data volume");
 

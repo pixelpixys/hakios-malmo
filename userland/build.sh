@@ -111,6 +111,7 @@ DARWIN_JOBS=${JOBS-"
 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
+	com.apple.FileProvider
 	com.apple.SpringBoard
 "}
 # Darwin's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
@@ -136,7 +137,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo PosterBoard searchd duetexpertd mobileassetd
+/redwood/lib/libhakios.app.dylib Sileo PosterBoard searchd duetexpertd mobileassetd TrollStore
 /redwood/lib/libhakios.tweaks.dylib Preferences"}
 mkdir -p obj
 
