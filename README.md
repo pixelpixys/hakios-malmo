@@ -11,6 +11,18 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 
 ---
 
+## 📸 Screenshots
+
+| Lock Screen | Home Screen (Widgets) | Home Screen (Apps) |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/lockscreen.jpg" width="250" alt="iOS 16.5 Lock Screen on Moto G85"/> | <img src="docs/screenshots/homescreen_widgets.jpg" width="250" alt="iOS 16.5 Home Screen Widgets"/> | <img src="docs/screenshots/homescreen_apps.jpg" width="250" alt="iOS 16.5 Home Screen Apps & Sileo"/> |
+
+| Control Center | Settings — About |
+|:---:|:---:|
+| <img src="docs/screenshots/control_center.jpg" width="250" alt="Control Center"/> | <img src="docs/screenshots/settings_about.png" width="250" alt="iOS Settings About Phone"/> |
+
+---
+
 ## ⚙️ Hardware Support & Status
 
 | Component / Subsystem | Status | Progress | Notes |
