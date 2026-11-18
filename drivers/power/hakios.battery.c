@@ -89,23 +89,48 @@ battery_snapshot(struct loader_battery *out)
 
 extern void HakiosBatteryReport(const void *state, unsigned size);     /* drivers/power/hakios.battery.cpp */
 
+static int filtered_soc_percent = -1;
+
 /* Darwin sees the same reading through the power source, or it shows no battery at all (only the DSP path used to tell it). */
 static void
 battery_tell_darwin(const struct loader_battery *sample)
 {
 	struct hakios_battery_state state;
 	bool external = (sample->flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
+	bool charging = (sample->flags & LOADER_BATTERY_CHARGING) != 0;
+	int target_soc = sample->soc_percent;
+
+	if (filtered_soc_percent < 0) {
+		filtered_soc_percent = target_soc;
+	} else if (charging) {
+		/* While charging, smooth large jumps to at most +2% per poll (5s) */
+		if (target_soc > filtered_soc_percent + 2) {
+			filtered_soc_percent += 2;
+		} else {
+			filtered_soc_percent = target_soc;
+		}
+	} else {
+		/* When discharging, filter out sudden glitch drops (> 2% in 5s) while cell voltage is healthy (> 3400 mV) */
+		if (target_soc < filtered_soc_percent - 2 && sample->voltage_mv > 3400) {
+			filtered_soc_percent--;
+		} else if (target_soc > filtered_soc_percent + 2) {
+			/* If newly calibrated higher hardware SOC arrives, step up smoothly (+2% per poll) */
+			filtered_soc_percent += 2;
+		} else {
+			filtered_soc_percent = target_soc;
+		}
+	}
 
 	bzero(&state, sizeof(state));
 	state.size = sizeof(state);
-	state.percent_hundredths = sample->soc_percent * 100;
+	state.percent_hundredths = filtered_soc_percent * 100;
 	state.voltage_uv = (sample->flags & LOADER_BATTERY_VOLTAGE_VALID) ? sample->voltage_mv * 1000 : 0;
 	state.current_ua = sample->current_ma * 1000;
 	state.temperature_hundredths = sample->temperature_c * 100;
 	state.present = (sample->flags & LOADER_BATTERY_PRESENT) != 0;
 	state.external = external;
-	state.status = (sample->flags & LOADER_BATTERY_CHARGING) ? 1 :          /* charging */
-	    external ? (sample->soc_percent >= 100 ? 4 : 3) : 2;                /* full / not charging / discharging */
+	state.status = charging ? 1 :          /* charging */
+	    external ? (filtered_soc_percent >= 100 ? 4 : 3) : 2;                /* full / not charging / discharging */
 	HakiosBatteryReport(&state, sizeof(state));
 }
 

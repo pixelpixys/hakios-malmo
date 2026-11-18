@@ -1087,15 +1087,17 @@ static void print(const char *fmt, ...);
 static void flush_log(void);
 static void put_char(char c);
 
-/* A voltage-only fallback is deliberately conservative; the real QG SOC wins whenever available. */
+/* A voltage-only fallback calibrated against Moto G85 / Redwood 5000 mAh Li-ion cell. */
 static int
 soc_from_voltage(uint32_t mv)
 {
-	if (mv <= 3300) return 0;
-	if (mv < 3700) return (int)((mv - 3300) * 10 / 400);
-	if (mv < 3900) return 10 + (int)((mv - 3700) * 40 / 200);
-	if (mv < 4200) return 50 + (int)((mv - 3900) * 40 / 300);
-	if (mv < 4400) return 90 + (int)((mv - 4200) * 10 / 200);
+	if (mv <= 3350) return 0;
+	if (mv < 3600) return (int)((mv - 3350) * 10 / 250);          /* 3350..3600 mV: 0%..10% */
+	if (mv < 3700) return 10 + (int)((mv - 3600) * 10 / 100);     /* 3600..3700 mV: 10%..20% */
+	if (mv < 3800) return 20 + (int)((mv - 3700) * 15 / 100);     /* 3700..3800 mV: 20%..35% */
+	if (mv < 3900) return 35 + (int)((mv - 3800) * 20 / 100);     /* 3800..3900 mV: 35%..55% */
+	if (mv < 4100) return 55 + (int)((mv - 3900) * 25 / 200);     /* 3900..4100 mV: 55%..80% */
+	if (mv < 4350) return 80 + (int)((mv - 4100) * 20 / 250);     /* 4100..4350 mV: 80%..100% */
 	return 100;
 }
 
@@ -1143,17 +1145,33 @@ charger_poll(void)
 			 * EXCEPT when the fuel gauge is clearly not ready yet: right after initialize()
 			 * it can report a near-empty SOC while the cell voltage says otherwise, which is
 			 * where the old "shows 1% on a half-full battery" came from. A Li-ion cell above
-			 * ~3.6 V is never under 5%, so in that case we distrust the gauge and fall back to
+			 * ~3.45 V is never under 5%, so in that case we distrust the gauge and fall back to
 			 * the voltage estimate below until it settles.
 			 */
 			if (status.state_of_charge >= 0 && status.state_of_charge <= 100) {
 				int vmv = have_voltage ? charger_shared.voltage_mv : 0;
-				if (status.state_of_charge < 5 && vmv > 3600) {
-					/* fuel gauge not settled; leave it to the voltage fallback */
+				if (status.state_of_charge < 5 && vmv > 3450) {
+					/* fuel gauge not settled or transient glitch.
+					 * If we already have a confirmed hardware SOC, preserve it. */
+					if (charger_shared.soc_percent >= 5 && !(charger_shared.flags & LOADER_BATTERY_SOC_ESTIMATED)) {
+						have_soc = 1;
+						flags |= LOADER_BATTERY_VALID;
+					}
 				} else {
-					charger_shared.soc_percent = status.state_of_charge;
-					have_soc = 1;
-					flags |= LOADER_BATTERY_VALID;
+					/* Valid hardware reading. If discharging and previous reading was valid,
+					 * filter out sudden single-poll drops > 3% while cell voltage is healthy. */
+					if (!plugged && charger_shared.soc_percent >= 0 &&
+					    (charger_shared.flags & LOADER_BATTERY_VALID) &&
+					    status.state_of_charge < charger_shared.soc_percent - 3 &&
+					    vmv > 3450) {
+						if (charger_shared.soc_percent > 0) charger_shared.soc_percent--;
+						have_soc = 1;
+						flags |= LOADER_BATTERY_VALID;
+					} else {
+						charger_shared.soc_percent = status.state_of_charge;
+						have_soc = 1;
+						flags |= LOADER_BATTERY_VALID;
+					}
 				}
 			}
 			charger_shared.current_ma = status.charge_current_ma;
