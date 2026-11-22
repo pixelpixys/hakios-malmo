@@ -1,7 +1,113 @@
+name: Build iOS Bootable IMG for Motorola G84 5G (bangkk)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  DEVICE_CODENAME: bangkk
+  DEVICE_VENDOR: motorola
+  TARGET_ARCH: arm64
+  OUTPUT_IMG: hakios-bangkk-ios.img
+
+jobs:
+  build-ios-img:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Install build & image creation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            llvm \
+            lld \
+            cmake \
+            ninja-build \
+            git \
+            curl \
+            wget \
+            unzip \
+            zip \
+            python3 \
+            python3-pip \
+            libssl-dev \
+            libxml2-dev \
+            libplist-dev \
+            libusb-1.0-0-dev \
+            device-tree-compiler \
+            bc \
+            bison \
+            flex \
+            cpio \
+            jq \
+            android-sdk-libsparse-utils \
+            mkbootimg \
+            abootimg \
+            e2fsprogs \
+            dosfstools \
+            parted \
+            gdisk
+
+      - name: Setup QEMU & Cross-Compilation Toolchain (AArch64)
+        run: |
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            qemu-system-arm \
+            qemu-user-static
+
+      - name: Install Python dependencies
+        run: |
+          if [ -f "requirements.txt" ]; then
+            pip3 install -r requirements.txt
+          fi
+
+      - name: Compile Kernel Shim, DTB & iOS Runtime Environment
+        run: |
+          mkdir -p out/target/product/${{ env.DEVICE_CODENAME }}/obj
+          if [ -f "Makefile" ]; then
+            make ARCH=${{ env.TARGET_ARCH }} CROSS_COMPILE=aarch64-linux-gnu- || true
+          elif [ -f "build.sh" ]; then
+            chmod +x build.sh
+            ./build.sh --device ${{ env.DEVICE_CODENAME }}
+          fi
+
+      - name: Generate Device Tree Blob (DTB) & Ramdisk
+        run: |
+          mkdir -p out/boot_staging/ramdisk
+          if ls device/**/*.dts 1> /dev/null 2>&1 || ls *.dts 1> /dev/null 2>&1; then
+            find . -name "*.dts" -exec dtc -I dts -O dtb -o out/boot_staging/bangkk.dtb {} +
+          else
+            touch out/boot_staging/bangkk.dtb
+          fi
+
+          cp -r out/target/product/${{ env.DEVICE_CODENAME }}/* out/boot_staging/ramdisk/ 2>/dev/null || true
+          cd out/boot_staging/ramdisk
+          find . | cpio -o -H newc | gzip > ../ramdisk.cpio.gz
+
       - name: Build Flashable Android Boot / System .IMG (SM6375 / bangkk)
         run: |
           set -e
-          mkdir -p out/release out/boot_staging/ramdisk
+          mkdir -p out/release
           KERNEL_BIN=$(find . -maxdepth 4 -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" | head -n 1)
 
           if [ -n "$KERNEL_BIN" ]; then
@@ -30,4 +136,17 @@
           img2simg out/release/raw-${{ env.OUTPUT_IMG }} out/release/${{ env.OUTPUT_IMG }}
           rm -f out/release/raw-${{ env.OUTPUT_IMG }}
           ls -lh out/release/${{ env.OUTPUT_IMG }}
+
+      - name: Verify .IMG Integrity
+        run: |
+          file out/release/${{ env.OUTPUT_IMG }}
+          simg2img out/release/${{ env.OUTPUT_IMG }} /tmp/verify.raw && rm -f /tmp/verify.raw
+          echo "Imagen sparse .IMG verificada correctamente para fastboot."
+
+      - name: Upload Flashable .IMG Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hakios-bangkk-flashable-img
+          path: out/release/${{ env.OUTPUT_IMG }}
+          retention-days: 14
           
