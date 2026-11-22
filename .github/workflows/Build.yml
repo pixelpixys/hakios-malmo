@@ -85,7 +85,7 @@ jobs:
         run: |
           mkdir -p out/target/product/${{ env.DEVICE_CODENAME }}/obj
           if [ -f "Makefile" ]; then
-            make ARCH=${{ env.TARGET_ARCH }} CROSS_COMPILE=aarch64-linux-gnu- || true
+            make qemu-open ARCH=${{ env.TARGET_ARCH }} CROSS_COMPILE=aarch64-linux-gnu- || make kernel ARCH=${{ env.TARGET_ARCH }} CROSS_COMPILE=aarch64-linux-gnu- || true
           elif [ -f "build.sh" ]; then
             chmod +x build.sh
             ./build.sh --device ${{ env.DEVICE_CODENAME }}
