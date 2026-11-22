@@ -1,11 +1,10 @@
-# HakiOS for Motorola Moto G85 5G (`malmo` / Qualcomm SM6375 Blair)
+# HakiOS for Motorola Moto G84 5G (`bangkk` / SM6375)
 
-> **Port of Apple's open-source Darwin XNU kernel (xnu-8796.121.2) and iOS 16.5 SpringBoard GUI to the Motorola Moto G85 5G**  
-> Repository: [github.com/pixelpixys/hakios-malmo](https://github.com/pixelpixys/hakios-malmo)
+> **Port of Apple's open-source Darwin XNU kernel (xnu-8796.121.2) and iOS 16.5 SpringBoard GUI to the Motorola Moto G84 5G**
 
 ---
 
-## 📊 Overall Porting Progress: **~97% Complete**
+## 📊 Overall Porting Progress: **~0% Complete**
 
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
