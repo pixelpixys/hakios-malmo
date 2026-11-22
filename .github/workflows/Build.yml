@@ -1,169 +1,147 @@
-name: Build iOS Bootable IMG for Motorola G84 5G (bangkk)
+name: Build HakiOS boot image (Moto G84 5G / bangkk)
+
+# Guardar como .github/workflows/build-bangkk-img.yml (reemplaza al Build.yml actual).
+#
+# Cadena real del repo (docs/install.md, docs/getting-started/building.md):
+#   make kernel  ->  make loader-open  ->  mkpayload.py (XNUP)  ->  mkxnuimg.py  ->  boot .img  (fastboot boot)
+#
+# El .img se arranca en RAM con `fastboot boot` (no se flashea nada). Necesita las piezas UEFI del
+# telefono (SILICIUM_UEFI.fd, BootShim.bin, device-tree.dtb, ramdisk, mkbootimg.py) en
+# devices/<dispositivo>/prebuilt/. Esas piezas llevan drivers del fabricante y NO estan en el repo:
+# se traen de un repo privado con el secret HAKIOS_SYNC_TOKEN (mismo mecanismo que ci/github-check.yml).
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      device:
+        description: "Dispositivo de mkxnuimg.py (SM6375; el G84 'bangkk' comparte SoC con el G85 'malmo')"
+        default: moto-g85
+        type: choice
+        options: [moto-g85]
+      use_prebuilt_kernel:
+        description: "Usar prebuilt/hakios-kernel en vez de compilar XNU (rapido, ~2 min)"
+        default: false
+        type: boolean
+  push:
+    tags: ["v*"]
 
 env:
-  DEVICE_CODENAME: bangkk
-  DEVICE_VENDOR: motorola
-  TARGET_ARCH: arm64
-  OUTPUT_IMG: hakios-bangkk-ios.img
+  DEVICE: ${{ inputs.device || 'moto-g85' }}
   THEOS: /home/runner/theos
+  OUT_IMG: hakios-bangkk.img
 
 jobs:
-  build-ios-img:
+  build:
     runs-on: ubuntu-22.04
-
+    timeout-minutes: 240
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
-      - name: Free up disk space
+      - name: Liberar disco
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
 
-      - name: Install build & image creation dependencies
+      - name: Dependencias del host
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            clang \
-            llvm \
-            lld \
-            cmake \
-            ninja-build \
-            git \
-            curl \
-            wget \
-            unzip \
-            zip \
-            zstd \
-            xz-utils \
-            python3 \
-            python3-pip \
-            libssl-dev \
-            libxml2-dev \
-            libplist-dev \
-            libusb-1.0-0-dev \
-            device-tree-compiler \
-            bc \
-            bison \
-            flex \
-            cpio \
-            jq \
-            android-sdk-libsparse-utils \
-            mkbootimg \
-            abootimg \
-            e2fsprogs \
-            dosfstools \
-            parted \
-            gdisk
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm flex bison m4 perl python3 autoconf automake libtool \
+            git curl xz-utils zstd cpio device-tree-compiler libssl-dev libxml2-dev \
+            qemu-system-arm
 
-      - name: Setup QEMU & Cross-Compilation Toolchain (AArch64)
-        run: |
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            qemu-system-arm \
-            qemu-user-static
+      - name: Cache de XNU y dependencias
+        if: ${{ !inputs.use_prebuilt_kernel }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            xnu-src
+            xnu-deps
+            ${{ env.THEOS }}
+          key: xnu-${{ runner.os }}-${{ hashFiles('xnu/hakios.patch', 'xnu/apply.sh', 'xnu-deps/setup.sh', 'drivers/**', 'configs/**') }}
+          restore-keys: xnu-${{ runner.os }}-
 
-      - name: Install Theos & Linux iOS Toolchain (cctools / ld64)
-        run: |
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          mkdir -p $THEOS/toolchain/linux/iphone
-          TOOLCHAIN_URL=$(curl -s https://api.github.com/repos/theos/toolchain-linux/releases/latest | jq -r '.assets[] | select(.name | test("x86_64.*\\.tar\\.(xz|zst|gz)$")) | .browser_download_url' | head -n 1)
-          echo "Descargando toolchain desde: $TOOLCHAIN_URL"
-          curl -L "$TOOLCHAIN_URL" -o /tmp/theos-toolchain.tar
-          tar -xf /tmp/theos-toolchain.tar -C $THEOS/toolchain/linux/iphone
-          rm -f /tmp/theos-toolchain.tar
-          ls -la $THEOS/toolchain/linux/iphone/bin
-
-      - name: Install Python dependencies
-        run: |
-          if [ -f "requirements.txt" ]; then
-            pip3 install -r requirements.txt
-          fi
-
-      - name: Compile Kernel Shim, DTB & iOS Runtime Environment
-        run: |
-          mkdir -p out/target/product/${{ env.DEVICE_CODENAME }}/obj
-          if [ -f "Makefile" ]; then
-            make kernel DEVICE=${{ env.DEVICE_CODENAME }}
-            make loader DEVICE=${{ env.DEVICE_CODENAME }} || true
-          elif [ -f "build.sh" ]; then
-            chmod +x build.sh
-            ./build.sh --device ${{ env.DEVICE_CODENAME }}
-          fi
-
-      - name: Generate Device Tree Blob (DTB) & Ramdisk
-        run: |
-          mkdir -p out/boot_staging/ramdisk
-          if ls device/**/*.dts 1> /dev/null 2>&1 || ls *.dts 1> /dev/null 2>&1; then
-            find . -name "*.dts" -exec dtc -I dts -O dtb -o out/boot_staging/bangkk.dtb {} +
-          else
-            touch out/boot_staging/bangkk.dtb
-          fi
-
-          cp -r out/target/product/${{ env.DEVICE_CODENAME }}/* out/boot_staging/ramdisk/ 2>/dev/null || true
-          cp -r xnu-build* out/boot_staging/ramdisk/ 2>/dev/null || true
-          cp -r xnuloader/build* out/boot_staging/ramdisk/ 2>/dev/null || true
-          cd out/boot_staging/ramdisk
-          find . | cpio -o -H newc | gzip > ../ramdisk.cpio.gz
-
-      - name: Build Flashable Android Boot / System .IMG (SM6375 / bangkk)
+      - name: Theos + cctools (ld64) + iPhoneOS16.5.sdk
+        if: ${{ !inputs.use_prebuilt_kernel }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          mkdir -p out/release
-          KERNEL_BIN=$(find . -maxdepth 4 \( -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" -o -name "mach_kernel*" -o -name "kernelcache*" \) | head -n 1)
-
-          if [ -n "$KERNEL_BIN" ]; then
-            echo "Kernel encontrado en: $KERNEL_BIN"
-            mkbootimg \
-              --kernel "$KERNEL_BIN" \
-              --ramdisk out/boot_staging/ramdisk.cpio.gz \
-              --dtb out/boot_staging/bangkk.dtb \
-              --base 0x00000000 \
-              --pagesize 4096 \
-              --kernel_offset 0x00008000 \
-              --ramdisk_offset 0x01000000 \
-              --dtb_offset 0x01f00000 \
-              --tags_offset 0x00000100 \
-              --cmdline "console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 loop.max_part=7" \
-              --header_version 2 \
-              --os_version 14.0.0 \
-              --os_patch_level 2024-01 \
-              -o out/release/raw-${{ env.OUTPUT_IMG }}
-          else
-            echo "Creando imagen ext4 raw sin loop mount para bangkk..."
-            truncate -s 2G out/release/raw-${{ env.OUTPUT_IMG }}
-            mke2fs -t ext4 -F -L "hakios_bangkk" -d out/boot_staging/ramdisk out/release/raw-${{ env.OUTPUT_IMG }}
+          if [ ! -d "$THEOS/.git" ]; then
+            git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          fi
+          if [ ! -d "$THEOS/toolchain/linux/iphone/bin" ]; then
+            mkdir -p "$THEOS/toolchain"
+            gh release download --repo L1ghtmann/llvm-project --pattern 'iOSToolchain.tar.xz' --dir /tmp --clobber
+            tar -xf /tmp/iOSToolchain.tar.xz -C "$THEOS/toolchain"
+            rm -f /tmp/iOSToolchain.tar.xz
+          fi
+          # el SDK 16.5 lo baja xnu-deps/setup.sh (theos/sdks-git) si falta; aqui se verifica el linker
+          if [ ! -x "$THEOS/toolchain/linux/iphone/bin/ld64" ] && [ ! -x "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
+            echo "::error::no hay ld64 en $THEOS/toolchain/linux/iphone/bin (cambio la estructura del toolchain de Theos)"
+            ls -R "$THEOS/toolchain" | head -40
+            exit 1
           fi
 
-          img2simg out/release/raw-${{ env.OUTPUT_IMG }} out/release/${{ env.OUTPUT_IMG }}
-          rm -f out/release/raw-${{ env.OUTPUT_IMG }}
-          ls -lh out/release/${{ env.OUTPUT_IMG }}
-
-      - name: Verify .IMG Integrity
+      - name: Kernel (XNU 8796.121.2 + parche HakiOS)
         run: |
-          file out/release/${{ env.OUTPUT_IMG }}
-          simg2img out/release/${{ env.OUTPUT_IMG }} /tmp/verify.raw && rm -f /tmp/verify.raw
-          echo "Imagen sparse .IMG verificada correctamente para fastboot."
+          set -e
+          if [ "${{ inputs.use_prebuilt_kernel }}" = "true" ]; then
+            cp prebuilt/hakios-kernel hakios-kernel
+          else
+            make defconfig                  # configuracion abierta, sin nada de Apple
+            make kernel JOBS=$(nproc)
+          fi
+          ls -lh hakios-kernel
 
-      - name: Upload Flashable .IMG Artifact
+      - name: Loader (identidad placeholder) y hello
+        run: |
+          set -e
+          if [ "${{ inputs.use_prebuilt_kernel }}" = "true" ]; then
+            cp prebuilt/loader.efi xnuloader/loader.efi
+            mkdir -p userland && cp prebuilt/userland/hello userland/hello
+          else
+            make loader-open hello
+          fi
+          ls -lh xnuloader/loader.efi userland/hello
+
+      - name: Payload XNUP
+        run: |
+          set -e
+          ARGS=$(tools/hakios-config.py args --defconfig defconfig)
+          xnuloader/mkpayload.py -o payload.bin \
+            kernel=hakios-kernel ramdisk=userland/hello --cmdline "$ARGS"
+          ls -lh payload.bin
+
+      - name: Piezas UEFI del telefono (repo privado)
+        env:
+          TOKEN: ${{ secrets.HAKIOS_SYNC_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+            python3 tools/hakios-device.py sync || true
+          else
+            echo "::warning::sin secret HAKIOS_SYNC_TOKEN: solo se usan las piezas ya presentes en devices/*/prebuilt/"
+          fi
+
+      - name: Armar el boot .img
+        run: |
+          set -e
+          mkdir -p out
+          python3 mkxnuimg.py --device "$DEVICE" -p payload.bin -o "out/$OUT_IMG"
+          ls -lh "out/$OUT_IMG"
+          sha256sum "out/$OUT_IMG" | tee "out/$OUT_IMG.sha256"
+
+      - name: Subir artefactos
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hakios-bangkk-flashable-img
-          path: out/release/${{ env.OUTPUT_IMG }}
+          name: hakios-bangkk
+          path: |
+            out/${{ env.OUT_IMG }}
+            out/${{ env.OUT_IMG }}.sha256
+            payload.bin
+            hakios-kernel
+            xnuloader/loader.efi
+          if-no-files-found: warn
           retention-days: 14
-          
