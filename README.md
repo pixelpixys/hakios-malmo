@@ -4,8 +4,6 @@
 
 ---
 
-## 📊 Overall Porting Progress: **~0% Complete**
-
 The iOS 16.5 SpringBoard user interface boots directly into live RAM without modifying your device's Android partitions. A simple reboot returns the phone completely back to stock Android.
 
 ---
