@@ -12,12 +12,12 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 
 ## 📸 Screenshots
 
-<img src="docs/screenshots/information.jpg" width="250"/>
+<img src="docs/Screenshot_20261122-174813.Ajustes.png" width="250"/>
 
 ---
 
 ## 📄 License & Credits
-
+Screenshot_20261122-174813.Ajustes.png
 - XNU Kernel: [Apple Public Source License 2.0 (APSL)](LICENSE.APSL)
 - HakiOS drivers and userland toolchain: [MIT License](LICENSE)
 - Upstream project: [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel)
