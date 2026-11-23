@@ -18,6 +18,8 @@ The iOS 16.5 SpringBoard user interface boots directly into live RAM without mod
 
 <img src="docs/image.png" width="250"/>
 
+View /docs for more photos
+
 ---
 
 ## 📄 License & Credits
