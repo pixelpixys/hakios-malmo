@@ -15,9 +15,9 @@ on:
     inputs:
       device:
         description: "Dispositivo de mkxnuimg.py (SM6375; el G84 'bangkk' comparte SoC con el G85 'malmo')"
-        default: moto-g85
+        default: moto-g84
         type: choice
-        options: [moto-g85]
+        options: [moto-g84, moto-g85]
       use_prebuilt_kernel:
         description: "Usar prebuilt/hakios-kernel en vez de compilar XNU (rapido, ~2 min)"
         default: false
@@ -26,7 +26,7 @@ on:
     tags: ["v*"]
 
 env:
-  DEVICE: ${{ inputs.device || 'moto-g85' }}
+  DEVICE: ${{ inputs.device || 'moto-g84' }}
   THEOS: /home/runner/theos
   OUT_IMG: hakios-bangkk.img
 

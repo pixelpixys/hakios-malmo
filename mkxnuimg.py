@@ -10,7 +10,7 @@ The boot shim copies the FD to its base and the payload to PAYLOAD_BASE.
 The UEFI pieces are taken from a Mu-Silicium tree built here or from
 devices/<device>/prebuilt/.
 
-usage: mkxnuimg.py [--device moto-g85|poco-x5-pro] [-p payload.bin] [-o out.img]
+usage: mkxnuimg.py [--device moto-g85|moto-g84|poco-x5-pro] [-p payload.bin] [-o out.img]
 """
 import argparse, gzip, os, subprocess, sys
 
@@ -25,6 +25,16 @@ DEVICES = {
         'header_version': 4,
         'dir': 'moto-g85',
         'default_out': 'xnu-malmo.img',
+    },
+    # Moto G84 5G (bangkk): same SoC (SM6375) as the G85, so it reuses the malmo package. fd_base/fd_size are the
+    # G85's and UNVERIFIED for the G84: check against your own UEFI build (the size is asserted below).
+    'moto-g84': {
+        'pkg': 'malmo',
+        'fd_base': 0x9FC00000,
+        'fd_size': 0x300000,
+        'header_version': 4,
+        'dir': 'moto-g84',
+        'default_out': 'xnu-bangkk.img',
     },
     'poco-x5-pro': {
         'pkg': 'redwood',
