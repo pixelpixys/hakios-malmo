@@ -1,3 +1,12 @@
+# HakiOS for Motorola Moto G85 5G (`malmo` / SM6375)
+
+This repository is the Moto G85 5G (`malmo`) fork of HakiOS, updated to the `upstream/common` (`xnu-12377.121.6`, Darwin 26/27) architecture.
+
+- **Device package:** [arch/arm64/boot/dts/malmo/](arch/arm64/boot/dts/malmo/README.md) (`board.dts`, `soc.dtsi`, `tools/boards.py status malmo`)
+- **Legacy iOS 16.5 port (`~97%` working — Adreno 619, WCN3990 Wi-Fi, FS1815, AW86927, MPSS):** preserved on branch `backup/pre-common-2026-11-24`.
+
+---
+
 # HakiOS kernel
 
 Apple's XNU kernel (`xnu-12377.121.6`, the kernel of Darwin 26 and 27) with what it takes to start Darwin on

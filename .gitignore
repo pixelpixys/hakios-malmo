@@ -26,6 +26,7 @@ darwin/userland/obj27/
 /arch/arm64/boot/dts/*/
 !/arch/arm64/boot/dts/_template/
 !/arch/arm64/boot/dts/qemu-virt/
+!/arch/arm64/boot/dts/malmo/
 /devices/
 qemu-kernel.log
 

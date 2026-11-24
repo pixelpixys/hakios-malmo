@@ -1,0 +1,80 @@
+/dts-v1/;
+
+// Motorola Moto G85 5G. Started by tools/boards.py new from malmo.dts.
+// Every value here is to be checked against the device before it is relied on (Documentation/porting.md).
+/ {
+	name = "malmo";                         // what the loader puts in /chosen/darwin-board
+	description = "Motorola Moto G85 5G";
+	soc = "sm6375";
+
+	features = "cpufreq-epss", "battery-uefi", "buttons-pmic", "haptic-aw86927";
+
+	// The panel: qcom,mdss_dsi_mot_csot_vtdr6115_gt9916_667_1080x2400_dsc_vid ("mipi_mot_vid_csot_vtdr6115_1080p_dsc_667")
+	// Software dimming (type = "soft") until dispcc/gcc display clock offsets are filled in soc.dtsi.
+	backlight {
+		type = "soft";
+		// type = "dcs";
+		// panel-mode = "video";
+		// min = <140>;
+		// max = <4095>;
+		// bytes = <2>;
+		// byte-order = "msb-first";
+	};
+
+	// The keys on the PMICs, for the feature "buttons-pmic": SPMI slave << 8 | the high byte of the
+	// peripheral's registers.
+	buttons {
+		pon = <0x208>;
+		pon-name = "the PM7250B's power-on block";
+		volume-up = <0x488>;
+		volume-up-name = "GPIO1 of the PMR735A";
+	};
+
+	// The PMIC's real-time clock, read once at boot (rtc=0 leaves it alone): SPMI slave << 8 | the high byte
+	// of its RTC_RW block's registers.
+	rtc {
+		peripheral = <0x661>;
+		name = "the PMK8350's RTC";
+	};
+
+	// The touch controller's wiring, for a feature "touch-...": its reset and its interrupt are from the tree, and the serial engine it is on;
+	// the engine's clocks and votes, the bus's pins and the supplies are yours to fill in
+	// (arch/arm64/boot/dts/_template/board.dts says where each is).
+	// touch {
+		// serial-engine = <0x04a80000>;
+		// interrupt = <22>;
+		// reset = <21>;
+		// coordinates = <17280 38400>;
+	// };
+
+	// Awinic AW86927 LRA haptic motor (I2C SE8, GPIO 19/20, reset 89, irq 88)
+	haptic {
+		sda = <19>;
+		scl = <20>;
+		reset = <89>;
+		interrupt = <88>;
+		f0-calibration = <0x2c>;
+	};
+
+	// The microphones' codec, for the feature "mic-wcd938x": its reset pin is from the tree.
+	mic {
+		codec-reset = <83>;
+	};
+
+	loader {
+		fb-base = <0x85200000>;
+		uefi-charger;
+	};
+
+	uefi {
+		fd-base = <0x9FC00000>;
+		fd-size = <0x300000>;
+		header-version = <4>;
+	};
+
+	boot {
+		fastboot-product = "malmo";
+		cpus = <8>;
+		bootargs = "cpufreq=1", "buttons=1", "battery=1", "backlight=1", "touchscreen=1";
+	};
+};
